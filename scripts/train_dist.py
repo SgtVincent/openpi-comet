@@ -32,6 +32,19 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 
+def _broadcast_str_from_primary(s: str, max_len: int = 512) -> str:
+    """Broadcast a string from process 0 to all processes."""
+    if jax.process_count() == 1:
+        return s
+    from jax.experimental.multihost_utils import broadcast_one_to_all
+    # Encode to fixed-size numpy array
+    encoded = np.zeros(max_len, dtype=np.uint8)
+    s_bytes = s.encode('utf-8')[:max_len]
+    encoded[:len(s_bytes)] = list(s_bytes)
+    # Broadcast and decode (using int(x) to avoid jax.Array.tobytes() quirks)
+    broadcasted = broadcast_one_to_all(encoded)
+    return bytes(int(x) for x in broadcasted).rstrip(b'\x00').decode('utf-8')
+
 def init_logging():
     """Custom logging format for better readability."""
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -205,6 +218,9 @@ def main(config: _config.TrainConfig):
     logging.info(f"JAX local device count: {jax.local_device_count()}")
     logging.info(f"JAX global device count: {jax.device_count()}")
 
+    config = dataclasses.replace(config, exp_name=_broadcast_str_from_primary(config.exp_name))
+    logging.info(f"[P{jax.process_index()}] checkpoint_dir: {config.checkpoint_dir}")
+
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
@@ -236,7 +252,7 @@ def main(config: _config.TrainConfig):
         sharding=data_sharding,
         shuffle=True,
         skip_norm_stats=False,
-        seed_shift=int(time.time()) if resuming else 0,
+        seed_shift=int(jax.process_index())
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
@@ -289,7 +305,8 @@ def main(config: _config.TrainConfig):
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
-    logging.info("Checkpoints saved synchronously, no need to wait")
+    checkpoint_manager.wait_until_finished()
+    checkpoint_manager.close()
 
 
 if __name__ == "__main__":

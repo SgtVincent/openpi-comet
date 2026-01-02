@@ -90,7 +90,10 @@ def create_rlds_dataloader(
 
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    if isinstance(config.data, list):
+        data_config = config.data[0].create(config.assets_dirs, config.model)
+    else:
+        data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.behavior_dataset_root:
         from omnigibson.learning.datas import BehaviorLerobotDatasetMetadata
 

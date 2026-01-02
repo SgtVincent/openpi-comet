@@ -235,15 +235,16 @@ def create_behavior_data_loader(
     skip_norm_stats: bool = False,
     seed_shift: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    data_config = config.data.create(config.assets_dirs, config.model)
-    if isinstance(data_config, list):
+    if isinstance(config.data, list):
+        data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
         dataset = create_multi_behavior_dataset(
-            data_config,
+            data_configs,
             sample_weights=config.sample_weights,
             action_horizon=config.model.action_horizon,
         )
-        data_config = data_config[0]
+        data_config = data_configs[0]
     else:
+        data_config = config.data.create(config.assets_dirs, config.model)
         dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
@@ -283,16 +284,17 @@ def create_torch_behavior_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    data_config = config.data.create(config.assets_dirs, config.model)
-    if isinstance(data_config, list):
+    if isinstance(config.data, list):
+        data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
         dataset = create_multi_behavior_dataset(
-            data_config,
+            data_configs,
             sample_weights=config.sample_weights,
-            action_horizon=action_horizon,
+            action_horizon=config.model.action_horizon,
         )
-        data_config = data_config[0]
+        data_config = data_configs[0]
     else:
-        dataset = create_behavior_dataset(data_config, action_horizon=action_horizon)
+        data_config = config.data.create(config.assets_dirs, config.model)
+        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
@@ -355,6 +357,27 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
+        from behavior.learning.datas.dataset import MultiBehaviorLeRobotDataset
+        if jax.process_count() > 1:
+            logging.info(f"Subsetting dataset for process {jax.process_index()}.")
+            if isinstance(dataset._dataset, MultiBehaviorLeRobotDataset):
+                for dataset_index in range(len(dataset._dataset.datasets)):
+                    indices = list(range(jax.process_index(), len(dataset._dataset.datasets[dataset_index]._dataset.chunks), jax.process_count()))
+                    dataset._dataset.datasets[dataset_index]._dataset.chunks = [dataset._dataset.datasets[dataset_index]._dataset.chunks[i] for i in indices]
+                total_chunks = sum(len(dataset._dataset.datasets[dataset_index]._dataset.chunks) for dataset_index in range(len(dataset._dataset.datasets)))
+                logging.info(
+                    f"[P{jax.process_index()}] After subset, Dataset has {total_chunks} chunks."
+                )
+            else:
+                indices = list(range(jax.process_index(), len(dataset._dataset._dataset.chunks), jax.process_count()))
+                dataset._dataset._dataset.chunks = [dataset._dataset._dataset.chunks[i] for i in indices]
+                logging.info(
+                    f"[P{jax.process_index()}] After subset, Dataset has {len(dataset._dataset._dataset.chunks)} chunks."
+                )
+
+        if len(dataset) < local_batch_size:
+            raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
         if sharding is None and framework == "jax":
@@ -369,8 +392,10 @@ class TorchDataLoader:
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
 
+        # For multi-process JAX training, each process should have a different seed
+        process_seed = seed + jax.process_index()
         generator = torch.Generator()
-        generator.manual_seed(seed)
+        generator.manual_seed(process_seed)
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
