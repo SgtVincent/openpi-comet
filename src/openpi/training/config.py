@@ -818,7 +818,7 @@ _CONFIGS = [
                 ),
             ),
             LeRobotB1KDataConfig(
-                repo_id="rft-debug/comet-val-v2",
+                repo_id="delinqu/comet-1.5k",
                 base_config=DataConfig(
                     prompt_from_task=True,
                     behavior_dataset_root="../DATASETS/behavior/comet-1.5k",
@@ -830,7 +830,7 @@ _CONFIGS = [
             "sunshk/openpi_comet/pi05-b1kpt50-cs32"
         ),  # hf download in advance
         num_train_steps=20_000,
-        s=_optimizer.CosineDecaySchedule(
+        lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=1e-6,
             decay_steps=20_000,
         ),
