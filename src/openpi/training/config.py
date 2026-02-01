@@ -516,6 +516,18 @@ class TrainConfig:
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    # PyTorch model selection (PI0/PI05 vs VLM2).
+    pytorch_model_name: Literal["pi0", "vlm2"] = "pi0"
+
+    # VLM2-specific PyTorch settings.
+    vlm2_geometry_dim: int = 512
+    vlm2_view_dim: int = 512
+    vlm2_working_memory_size: int = 8
+    vlm2_episodic_memory_capacity: int = 32
+    vlm2_episodic_similarity_threshold: float = 0.7
+    vlm2_episodic_fusion_alpha: float = 0.5
+    vlm2_num_frames: int = 3
+
     # Learning rate schedule to use for training.
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
 
@@ -659,12 +671,12 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                 tasks=["turning_on_radio"],
                 fine_grained_level=0,  # 0, 1, 2
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05-b1kpt50-cs32/params"),
         num_train_steps=30_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
@@ -774,6 +786,42 @@ _CONFIGS = [
         num_workers=8,
         batch_size=8 * 32,
     ),
+    TrainConfig(
+        name="vlm2_b1k-turning_on_radio_lr2.5e-6_step20k_sft",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        pytorch_model_name="vlm2",
+        vlm2_num_frames=3,
+        vlm2_geometry_dim=512,
+        vlm2_view_dim=512,
+        vlm2_working_memory_size=8,
+        vlm2_episodic_memory_capacity=32,
+        vlm2_episodic_similarity_threshold=0.7,
+        vlm2_episodic_fusion_alpha=0.5,
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
+                tasks=["turning_on_radio"],
+                fine_grained_level=0,  # 0, 1, 2
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "sunshk/openpi_comet/pi05-b1kpt50-cs32"
+        ),  # hf download in advance
+        num_train_steps=20_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-6,
+            decay_steps=20_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
     # 3. RFT Configs
     TrainConfig(
         name="pi05_b1k-turning_on_radio_lr2.5e-6_step20k_rft",
@@ -840,6 +888,37 @@ _CONFIGS = [
         checkpoint_base_dir=".",
         num_workers=8,
         batch_size=8 * 32,
+    ),
+    # 5. Debug Configs
+    TrainConfig(
+        name="vlm2_8gpu_test",
+        exp_name="vlm2_test_run",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        pytorch_model_name="vlm2",
+        vlm2_num_frames=3,
+        vlm2_geometry_dim=512,
+        vlm2_view_dim=512,
+        vlm2_working_memory_size=8,
+        vlm2_episodic_memory_capacity=32,
+        vlm2_episodic_similarity_threshold=0.7,
+        vlm2_episodic_fusion_alpha=0.5,
+        data=FakeDataConfig(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "sunshk/openpi_comet/pi05-b1kpt50-cs32"
+        ),
+        num_train_steps=10,
+        log_interval=1,
+        save_interval=5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-6,
+            decay_steps=10,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 4, # Smaller batch size for safety
     ),
 ]
 

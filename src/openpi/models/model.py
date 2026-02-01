@@ -251,7 +251,36 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        if getattr(train_config, "pytorch_model_name", "pi0") == "vlm2":
+            from openpi.models_pytorch.vlm2 import vlm2_model as _vlm2_model
+
+            model_cfg = train_config.model
+            object.__setattr__(model_cfg, "dtype", train_config.pytorch_training_precision)
+            vlm2_config = _vlm2_model.VLM2Config(
+                visual_dim=2048,
+                geometry_dim=train_config.vlm2_geometry_dim,
+                view_dim=train_config.vlm2_view_dim,
+                working_memory_size=train_config.vlm2_working_memory_size,
+                episodic_memory_capacity=train_config.vlm2_episodic_memory_capacity,
+                episodic_similarity_threshold=train_config.vlm2_episodic_similarity_threshold,
+                episodic_fusion_alpha=train_config.vlm2_episodic_fusion_alpha,
+                num_heads=8,
+                hidden_dim=1024,
+                dropout=0.0,
+                pi05=True,
+                action_dim=model_cfg.action_dim,
+                action_horizon=model_cfg.action_horizon,
+                dtype=train_config.pytorch_training_precision,
+                paligemma_variant=model_cfg.paligemma_variant,
+                action_expert_variant=model_cfg.action_expert_variant,
+                num_frames=train_config.vlm2_num_frames,
+                frame_height=224,
+                frame_width=224,
+                patch_size=16,
+            )
+            model = _vlm2_model.VLM2WithPi05(vlm2_config)
+        else:
+            model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         safetensors.torch.load_model(model, weight_path)
         return model
 

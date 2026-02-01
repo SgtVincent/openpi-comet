@@ -42,6 +42,8 @@ import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
+import openpi.models.model as _model
+import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -315,6 +317,46 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
+def _prepare_vlm2_inputs(observation, config: _config.TrainConfig, device: torch.device):
+    image_keys = _model.IMAGE_KEYS
+    frames = [observation.images[k] for k in image_keys if k in observation.images]
+    if not frames:
+        raise ValueError("No images found in observation for VLM2 inputs.")
+
+    video_frames = torch.stack(frames, dim=1)  # (b, f, c, h, w)
+    target_frames = config.vlm2_num_frames
+    if video_frames.shape[1] < target_frames:
+        pad_count = target_frames - video_frames.shape[1]
+        pad_frame = video_frames[:, -1:].repeat(1, pad_count, 1, 1, 1)
+        video_frames = torch.cat([video_frames, pad_frame], dim=1)
+    elif video_frames.shape[1] > target_frames:
+        video_frames = video_frames[:, :target_frames]
+
+    if getattr(observation, "pcd_xyz", None) is not None:
+        point_map = observation.pcd_xyz.to(torch.float32)
+        if point_map.dim() != 4:
+            raise ValueError(f"Expected pcd_xyz shape (b, s, n, 3), got {point_map.shape}")
+        point_maps = point_map[:, None].repeat(1, target_frames, 1, 1, 1)
+    else:
+        batch_size, _, _, height, width = video_frames.shape
+        point_maps = torch.zeros(
+            batch_size,
+            target_frames,
+            height,
+            width,
+            3,
+            device=device,
+            dtype=torch.float32,
+        )
+
+    language_tokens = observation.tokenized_prompt
+    language_masks = observation.tokenized_prompt_mask
+    if language_tokens is None or language_masks is None:
+        raise ValueError("tokenized_prompt and tokenized_prompt_mask are required for VLM2 training.")
+
+    return video_frames, point_maps, language_tokens, language_masks
+
+
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -415,7 +457,33 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    use_vlm2 = config.pytorch_model_name == "vlm2"
+    if use_vlm2:
+        vlm2_config = _vlm2_model.VLM2Config(
+            visual_dim=2048,
+            geometry_dim=config.vlm2_geometry_dim,
+            view_dim=config.vlm2_view_dim,
+            working_memory_size=config.vlm2_working_memory_size,
+            episodic_memory_capacity=config.vlm2_episodic_memory_capacity,
+            episodic_similarity_threshold=config.vlm2_episodic_similarity_threshold,
+            episodic_fusion_alpha=config.vlm2_episodic_fusion_alpha,
+            num_heads=8,
+            hidden_dim=1024,
+            dropout=0.0,
+            pi05=True,
+            action_dim=model_cfg.action_dim,
+            action_horizon=model_cfg.action_horizon,
+            dtype=config.pytorch_training_precision,
+            paligemma_variant=model_cfg.paligemma_variant,
+            action_expert_variant=model_cfg.action_expert_variant,
+            num_frames=config.vlm2_num_frames,
+            frame_height=224,
+            frame_width=224,
+            patch_size=16,
+        )
+        model = _vlm2_model.VLM2WithPi05(vlm2_config).to(device)
+    else:
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -535,14 +603,29 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            use_autocast = config.pytorch_training_precision == "bfloat16" and device.type == "cuda"
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_autocast):
+                if use_vlm2:
+                    video_frames, point_maps, language_tokens, language_masks = _prepare_vlm2_inputs(
+                        observation, config, device
+                    )
+                    losses = model(
+                        video_frames=video_frames,
+                        point_maps=point_maps,
+                        language_tokens=language_tokens,
+                        language_masks=language_masks,
+                        actions=actions,
+                    )
+                else:
+                    losses = model(observation, actions)
+                # Ensure losses is a tensor and handle different return types
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+                loss = losses.mean()
+            loss = loss.float()
 
             # Backward pass
             loss.backward()
