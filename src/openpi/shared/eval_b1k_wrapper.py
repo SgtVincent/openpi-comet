@@ -86,6 +86,31 @@ class B1KPolicyWrapper:
         if self.reasoner:
             self.reasoner.reset()
 
+    def spawn_session(self) -> "B1KPolicyWrapper":
+        """Create a per-connection session wrapper.
+
+        The underlying model (`self.policy`) is shared, but rollout state is isolated.
+        This enables multiple evaluators to share one websocket server without their
+        resets / action queues colliding.
+        """
+
+        # Shallow copy is enough to share large model weights while isolating mutable rollout state.
+        session = copy.copy(self)
+        session.action_queue = deque(maxlen=self.action_horizon)
+        session.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
+        session.step_counter = 0
+
+        # Ensure any optional reasoner state is not shared.
+        if self.reasoner is not None:
+            try:
+                from openpi.shared.client import Client
+
+                session.reasoner = Client(model="/workspace/model")
+            except Exception:
+                # Best-effort: disable reasoner rather than sharing mutable state.
+                session.reasoner = None
+        return session
+
     def process_obs(self, obs: dict) -> dict:
         """
         Process the observation dictionary to match the expected input format for the model.
@@ -154,7 +179,7 @@ class B1KPolicyWrapper:
                 "prompt": self.task_prompt,
             }
 
-            if self.fine_grained_level > 0:
+            if self.fine_grained_level > 0 and self.reasoner is not None:
                 reasoner_response = self.reasoner.generate_subtask(
                     high_level_task=self.task_prompt,
                     multi_modals=[batch["observation/egocentric_camera"]],
@@ -210,7 +235,7 @@ class B1KPolicyWrapper:
 
         self.step_counter += 1
 
-        return torch.from_numpy(final_action)
+        return torch.as_tensor(final_action, dtype=torch.float32)
 
     def act(self, input_obs):
         # TODO reformat data into the correct format for the model
@@ -250,7 +275,7 @@ class B1KPolicyWrapper:
             if len(self.action_queue) > 0:
                 # pop the first action in the queue
                 final_action = self.action_queue.popleft()[None]
-                return torch.from_numpy(final_action)
+                return torch.as_tensor(final_action, dtype=torch.float32)
 
         nbatch = copy.deepcopy(input_obs)
         if nbatch["observation"].shape[-1] != 3:
@@ -271,7 +296,7 @@ class B1KPolicyWrapper:
         if "observation/egocentric_depth" in nbatch:
             batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
 
-        if self.fine_grained_level > 0:
+        if self.fine_grained_level > 0 and self.reasoner is not None:
             # skill_prompt = SKILL_PROMPT.format(task_prompt=self.task_prompt, skill_prompts="\n".join(self.skill_prompts))
             reasoner_response = self.reasoner.generate_subtask(
                 high_level_task=self.task_prompt,
@@ -314,4 +339,4 @@ class B1KPolicyWrapper:
             final_action = final_action[None]
         else:
             final_action = target_joint_positions
-        return torch.from_numpy(final_action)
+        return torch.as_tensor(final_action, dtype=torch.float32)
