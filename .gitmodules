@@ -1,0 +1,6 @@
+[submodule "src/openpi/third_party/cut3r"]
+	path = src/openpi/third_party/cut3r
+	url = https://github.com/CUT3R/CUT3R
+[submodule "src/openpi/third_party/vggt"]
+	path = src/openpi/third_party/vggt
+	url = https://github.com/SgtVincent/vggt.git
