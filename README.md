@@ -280,3 +280,18 @@ If you find this work useful, please consider citing:
   url={https://arxiv.org/abs/2512.10071}, 
 }
 ```
+
+## Third-party dependencies (submodules) ⚙️
+
+This repository uses git submodules for some third-party components located under `src/openpi/third_party` (e.g., `cut3r`, `vggt`). After cloning the repo, run:
+
+```bash
+git submodule update --init --recursive
+```
+
+To update submodules to latest remote branch:
+
+```bash
+git submodule update --remote --merge
+```
+
