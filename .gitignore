@@ -173,4 +173,14 @@ experiments/
 outputs
 eval_logs/
 log
-.github/
+.github/# Local editor and project files
+.vscode/
+.specstory/
+
+# Binary / large files not tracked in repo
+*.vsix
+*.pdf
+
+# Checkpoints and large artifacts
+checkpoints/
+
