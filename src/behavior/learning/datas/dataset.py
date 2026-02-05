@@ -81,6 +81,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         modalities: Iterable[str] = None,
         cameras: Iterable[str] = None,
         local_only: bool = False,
+        check_files: bool = True,
         check_timestamp_sync: bool = True,
         chunk_streaming_using_keyframe: bool = True,
         shuffle: bool = True,
@@ -209,8 +210,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         try:
             if force_cache_sync:
                 raise FileNotFoundError
-            for fpath in self.get_episodes_file_paths():
-                assert (self.root / fpath).is_file(), f"Missing file: {self.root / fpath}"
+            if check_files:
+                for fpath in self.get_episodes_file_paths():
+                    assert (self.root / fpath).is_file(), f"Missing file: {self.root / fpath}"
             self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError) as e:
             if local_only:

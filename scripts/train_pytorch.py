@@ -24,12 +24,20 @@ Multi-Node Training:
 """
 
 import dataclasses
+import faulthandler
 import gc
 import logging
 import os
 import platform
+import signal
 import shutil
+import sys
 import time
+
+_FAULT_TIMEOUT_S = int(os.environ.get("OPENPI_FAULT_TIMEOUT_S", "1800"))
+faulthandler.enable()
+faulthandler.dump_traceback_later(_FAULT_TIMEOUT_S, repeat=True)
+faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 import jax
 import numpy as np
@@ -520,8 +528,11 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        load_strict = config.pytorch_model_name != "vlm2"
         safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+            model_path,
+            strict=load_strict,
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
@@ -716,7 +727,32 @@ def train_loop(config: _config.TrainConfig):
 
 def main():
     init_logging()
+    logging.info("Host: %s PID: %s", platform.node(), os.getpid())
+    logging.info("Python: %s (%s)", sys.version.split()[0], sys.executable)
+    logging.info("CWD: %s", os.getcwd())
+    logging.info("OPENPI_DATA_HOME=%s", os.environ.get("OPENPI_DATA_HOME"))
+    logging.info("B1K_VIDEO_BACKEND=%s", os.environ.get("B1K_VIDEO_BACKEND"))
+    logging.info("JAX_PLATFORMS=%s", os.environ.get("JAX_PLATFORMS"))
+    logging.info("CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES"))
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    vggt_dir = os.path.join(repo_root, "src", "openpi", "third_party", "vggt")
+    cut3r_dir = os.path.join(repo_root, "src", "openpi", "third_party", "cut3r")
+    if not os.path.isdir(vggt_dir) or not os.path.isdir(cut3r_dir):
+        raise FileNotFoundError(
+            "Missing third_party dependencies. Expected directories:\n"
+            f"  - {vggt_dir}\n"
+            f"  - {cut3r_dir}\n"
+            "Fix by running: git submodule update --init --recursive"
+        )
+
     config = _config.cli()
+    logging.info("Run: exp_name=%s project=%s wandb=%s num_workers=%s batch_size=%s",
+                 getattr(config, "exp_name", None),
+                 getattr(config, "project_name", None),
+                 getattr(config, "wandb_enabled", None),
+                 getattr(config, "num_workers", None),
+                 getattr(config, "batch_size", None))
     train_loop(config)
 
 

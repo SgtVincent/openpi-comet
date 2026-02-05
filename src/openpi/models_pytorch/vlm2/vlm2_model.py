@@ -15,6 +15,7 @@ Reference:
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Any, Literal, TYPE_CHECKING
 
@@ -209,15 +210,19 @@ class VLM2WithPi05(nn.Module):
         # Update config with actual dimensions
         self.visual_dim = actual_visual_dim
         
-        # Pi-0.5 backbone (PaliGemma + Gemma Expert)
+        t0 = time.perf_counter()
+        logging.info("VLM2WithPi05 init: creating PaliGemmaWithExpertModel (paligemma=%s expert=%s)",
+                     config.paligemma_variant, config.action_expert_variant)
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
             use_adarms=[False, True] if config.pi05 else [False, False],
             precision=config.dtype,
         )
+        logging.info("VLM2WithPi05 init: PaliGemmaWithExpertModel created in %.2fs", time.perf_counter() - t0)
         
-        # VLM2 Perception Module (View-Consistent 3D-Aware Representation)
+        t1 = time.perf_counter()
+        logging.info("VLM2WithPi05 init: creating VLM2PerceptionModule")
         self.perception = VLM2PerceptionModule(
             VLM2Config(
                 visual_dim=actual_visual_dim,
@@ -231,8 +236,10 @@ class VLM2WithPi05(nn.Module):
                 patch_size=config.patch_size,
             )
         )
+        logging.info("VLM2WithPi05 init: VLM2PerceptionModule created in %.2fs", time.perf_counter() - t1)
         
-        # VLM2 Dual-Memory Module
+        t2 = time.perf_counter()
+        logging.info("VLM2WithPi05 init: creating DualMemoryModule")
         self.memory = DualMemoryModule(
             feature_dim=actual_visual_dim,
             working_memory_size=config.working_memory_size,
@@ -243,6 +250,7 @@ class VLM2WithPi05(nn.Module):
             similarity_threshold=config.episodic_similarity_threshold,
             fusion_alpha=config.episodic_fusion_alpha,
         )
+        logging.info("VLM2WithPi05 init: DualMemoryModule created in %.2fs", time.perf_counter() - t2)
         
         # Pi-0.5 Action Projections (from pi0_pytorch.py)
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
@@ -482,8 +490,8 @@ class VLM2WithPi05(nn.Module):
             attention_mask=att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
             adarms_cond=[None, adarms_cond],
         )
         

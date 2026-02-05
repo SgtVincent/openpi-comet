@@ -141,6 +141,8 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         tasks=data_config.tasks,
         modalities=data_config.modalities,
         local_only=True,
+        check_files=False,
+        check_timestamp_sync=False, # 跳过时间戳同步检查，减少 I/O 和数据加载阻塞风险，提升 NAS 环境下的稳定性。
         delta_timestamps={key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys},
         episodes=data_config.episodes_index,
         chunk_streaming_using_keyframe=True,

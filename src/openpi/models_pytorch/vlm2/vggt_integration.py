@@ -10,16 +10,34 @@ def _ensure_vggt_path():
     current_file = os.path.abspath(__file__)
     # .../src/openpi/models_pytorch/vlm2/vggt_integration.py -> .../src/openpi/third_party/vggt
     src_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_file)))))
+    
+    # Add vggt path
     vggt_path = os.path.join(src_root, "src", "openpi", "third_party", "vggt")
+        
+    # Add cut3r path (vggt dependency)
+    cut3r_path = os.path.join(src_root, "src", "openpi", "third_party", "cut3r")
+    missing = [p for p in (vggt_path, cut3r_path) if not os.path.isdir(p)]
+    if missing:
+        raise ImportError(
+            "Missing VLM2 third_party dependencies:\n"
+            + "\n".join(f"  - {p}" for p in missing)
+            + "\nFix by running: git submodule update --init --recursive"
+        )
+
     if vggt_path not in sys.path:
         sys.path.append(vggt_path)
+    if cut3r_path not in sys.path:
+        sys.path.append(cut3r_path)
 
 _ensure_vggt_path()
 
+VGGT_IMPORT_ERROR = None
 try:
     from vggt.models.vggt import VGGT
-except ImportError:
+except ImportError as e:
+    print(f"Warning: Failed to import VGGT. Error: {e}")
     VGGT = None
+    VGGT_IMPORT_ERROR = e
 
 class VGGT3DEncoder(nn.Module):
     """
@@ -33,7 +51,7 @@ class VGGT3DEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         if VGGT is None:
-            raise ImportError("VGGT module not found. Please clone facebookresearch/vggt into src/openpi/third_party/vggt")
+            raise ImportError(f"VGGT module not found. Please clone facebookresearch/vggt into src/openpi/third_party/vggt. Original error: {VGGT_IMPORT_ERROR}")
             
         # Initialize VGGT
         # Note: We rely on default parameters or minimal config here.
