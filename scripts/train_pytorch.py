@@ -387,19 +387,34 @@ def train_loop(config: _config.TrainConfig):
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+    elif config.overwrite:
+        # DDP-safe overwrite:
+        # Only rank0 performs deletion of the experiment checkpoint directory,
+        # then a barrier ensures all ranks observe a consistent filesystem state.
+        # This avoids FileNotFoundError/ChildFailedError on non-main ranks.
+        if is_main and config.checkpoint_dir.exists():
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
 
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        # DDP-safe creation: rank0 creates the directory, then synchronize.
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
+        # Synchronize all ranks after resolving resume target to prevent
+        # inconsistent views of the filesystem before proceeding.
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
 
     # Initialize wandb (only on main process)
     if is_main:

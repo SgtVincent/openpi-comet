@@ -823,7 +823,7 @@ _CONFIGS = [
         ema_decay=None,
         checkpoint_base_dir="checkpoints",
         num_workers=8,
-        batch_size=8 * 32,
+        batch_size=8 * 16,
     ),
     TrainConfig(
         name="vlm2_b1k-turning_on_radio_lr2.5e-6_step20k_sft",
@@ -864,7 +864,7 @@ _CONFIGS = [
         ema_decay=None,
         checkpoint_base_dir="checkpoints",
         num_workers=8,
-        batch_size=8 * 32,
+        batch_size=8 * 16,
     ),
     # 3. RFT Configs
     TrainConfig(

@@ -394,24 +394,31 @@ class TorchDataLoader:
         mp_context = None
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
+            if framework == "pytorch":
+                mp_context = multiprocessing.get_context("forkserver")
 
         # For multi-process JAX training, each process should have a different seed
         process_seed = seed + jax.process_index()
         generator = torch.Generator()
         generator.manual_seed(process_seed)
-        self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
-            num_workers=num_workers,
-            multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
-            collate_fn=_collate_fn,
-            worker_init_fn=_worker_init_fn,
-            drop_last=True,
-            generator=generator,
-        )
+        data_loader_kwargs = {
+            "dataset": typing.cast(torch.utils.data.Dataset, dataset),
+            "batch_size": local_batch_size,
+            "shuffle": sampler is None and shuffle,
+            "sampler": sampler,
+            "num_workers": num_workers,
+            "multiprocessing_context": mp_context,
+            "persistent_workers": num_workers > 0,
+            "pin_memory": True,
+            "pin_memory_device": "cuda" if torch.cuda.is_available() else "",
+            "collate_fn": _collate_fn,
+            "worker_init_fn": _worker_init_fn,
+            "drop_last": True,
+            "generator": generator,
+        }
+        if num_workers > 0:
+            data_loader_kwargs["prefetch_factor"] = 4
+        self._data_loader = torch.utils.data.DataLoader(**data_loader_kwargs)
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:

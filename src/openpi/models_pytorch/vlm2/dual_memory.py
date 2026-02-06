@@ -504,11 +504,15 @@ class GatedMemoryFusion(nn.Module):
         working_memory_output = working_memory_output.to(target_dtype)
         episodic_memory_output = episodic_memory_output.to(target_dtype)
 
-        # Concatenate for gate computation
-        concat_features = torch.cat([working_memory_output, episodic_memory_output], dim=-1)
-
         # Compute gate: γt = σ(MLP(Concat[M_w_t; M_e_t]))
-        gate = self.gate_mlp(concat_features)  # (batch, n, feature_dim)
+        linear0 = self.gate_mlp[0]
+        w_working, w_episodic = linear0.weight.split(self.feature_dim, dim=1)
+        hidden = F.linear(working_memory_output, w_working) + F.linear(
+            episodic_memory_output, w_episodic, linear0.bias
+        )
+        hidden = self.gate_mlp[1](hidden)
+        hidden = self.gate_mlp[2](hidden)
+        gate = self.gate_mlp[3](hidden)  # (batch, n, feature_dim)
 
         # Gated fusion: Mt = γt ⊙ M_w_t + (1 - γt) ⊙ M_e_t
         fused = gate * working_memory_output + (1 - gate) * episodic_memory_output

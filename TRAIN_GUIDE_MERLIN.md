@@ -90,49 +90,15 @@ uv run scripts/compute_norm_stats.py --config-name vlm2_b1k-pt50_cs32_bs64_lr2.5
 - 基础权重：`checkpoints/openpi_comet/pi05-b1kpt50-cs32`
 - **输出目录**：`checkpoints/<exp_name>` (已在 config 中默认指定)
 
-### 3.2 单卡 smoke test（先跑通再上多卡）
-
-建议先用单卡把数据解码 + 前向 + loss + wandb 全链路跑通，再扩到 8 卡。
-**注意**：由于数据在 NAS 上，为缓解 IO 瓶颈，请充分利用 CPU 资源（110 核），设置较大的 `num_workers`。
-
-可选环境变量（排障时很有用）：
-
-```bash
-export PYTHONFAULTHANDLER=1
-export TORCH_SHOW_CPP_STACKTRACES=1
-export B1K_VIDEO_BACKEND=video_reader
-```
-
-说明：
-- `B1K_VIDEO_BACKEND` 会传给 `BehaviorLeRobotDataset(video_backend=...)`。不设置时沿用默认值（通常是 `pyav`）。
-- 如果训练只用 `rgb`（本配置默认如此），推荐优先尝试 `video_reader`；如果你训练包含 `depth`，必须使用 `pyav`。
-
-单卡启动命令（确保已激活环境）：
-
-```bash
-source .venv/bin/activate
-export OPENPI_DATA_HOME=$(pwd)/.cache/openpi
-
-python scripts/train_pytorch.py \
-  vlm2_b1k-pt50_cs32_bs64_lr2.5e-5_step50k \
-  --exp_name vlm2_vla_pretrain_smoke \
-  --num_train_steps 50 \
-  --log_interval 1 \
-  --save_interval 100000 \
-  --batch_size 2 \
-  --num_workers 16 \
-  --pytorch-training-precision bfloat16
-```
-
-成功标志：控制台持续打印 `step=... loss=...`，且 WandB 正常记录曲线。
-
-### 3.3 多卡预训练（推荐）
+### 3.2 多卡预训练（推荐）
 
 多卡训练时，每个 GPU 分配 10 个 worker（总计 80 workers），以充分利用 IO 带宽。
 
 ```bash
 source .venv/bin/activate
 export OPENPI_DATA_HOME=$(pwd)/.cache/openpi
+export B1K_VIDEO_BACKEND=video_reader
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   scripts/train_pytorch.py \
@@ -141,7 +107,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --num_train_steps 50000 \
   --log_interval 100 \
   --save_interval 5000 \
-  --num_workers 10
+  --num_workers 10 \
+  --pytorch-training-precision bfloat16 \
+  --overwrite
 ```
 
 如果出现 OOM 或不稳定，可适当回调 `num_workers`（如降至 8）。
@@ -168,6 +136,9 @@ python scripts/train_pytorch.py \
 
 ```bash
 source .venv/bin/activate
+export OPENPI_DATA_HOME=$(pwd)/.cache/openpi
+export B1K_VIDEO_BACKEND=video_reader
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   scripts/train_pytorch.py \
@@ -176,7 +147,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --num_train_steps 20000 \
   --log_interval 100 \
   --save_interval 500 \
-  --batch_size 8 \
+  --batch_size 64 \
   --num_workers 10 \
   --pytorch-training-precision bfloat16
 ```
@@ -291,7 +262,7 @@ print("mean L2 error:", float(np.mean(errors)))
 - 如果出现 `SIGSEGV (exitcode: -11)`，优先按下面顺序排查：
   1) `--num_workers 0`（先把多进程数据加载去掉）
   2) 设置 `B1K_VIDEO_BACKEND=video_reader`（只训练 rgb 时推荐）
-  3) 单卡 smoke test 跑通后再逐步扩到 2 卡、8 卡
+  3) 确认 `CUDA_VISIBLE_DEVICES` 与 `--nproc_per_node` 匹配，避免 `invalid device ordinal`
   4) 打开 `PYTHONFAULTHANDLER=1` 与 `TORCH_SHOW_CPP_STACKTRACES=1` 获取更多崩溃信息
 - 需要从断点恢复训练：在同一个 `--exp_name` 下追加 `--resume`；如需覆盖旧目录，用 `--overwrite`（不要和 `--resume` 同时用）。
 - 离线 validation 只依赖数据集与模型，不启动 server 和 simulator。
