@@ -246,9 +246,7 @@ def main(config: _config.TrainConfig):
     if jax.process_index() == 0:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    data_loader = _data_loader.create_behavior_data_loader(
-        config, sharding=data_sharding, shuffle=True, skip_norm_stats=False, seed_shift=int(jax.process_index())
-    )
+    data_loader = _data_loader.create_data_loader(config, sharding=data_sharding, shuffle=True, skip_norm_stats=False)
     data_iter = iter(data_loader)
     batch = next(data_iter)
 

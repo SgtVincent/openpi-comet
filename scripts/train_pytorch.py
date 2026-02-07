@@ -133,17 +133,7 @@ def set_seed(seed: int, local_rank: int):
 
 
 def build_datasets(config: _config.TrainConfig):
-    # Use the unified data loader with PyTorch framework
-    # data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
-    data_loader = _data_loader.create_torch_behavior_data_loader(
-        config,
-        action_horizon=config.model.action_horizon,
-        batch_size=config.batch_size,
-        skip_norm_stats=False,
-        shuffle=True,
-        num_workers=config.num_workers,
-        seed=config.seed,
-    )
+    data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
     return data_loader, data_loader.data_config()
 
 

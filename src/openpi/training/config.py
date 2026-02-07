@@ -579,6 +579,9 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # If true, only rank0 prints logs and progress bars in distributed training.
+    rank0_only_output: bool = True
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
@@ -761,7 +764,7 @@ _CONFIGS = [
         name="vlm2_b1k-pt50_cs32_bs64_lr2.5e-5_step50k",
         exp_name="openpi",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, max_token_len=256),
         pytorch_model_name="vlm2",
         vlm2_num_frames=3,
         vlm2_geometry_dim=512,
@@ -794,7 +797,7 @@ _CONFIGS = [
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="checkpoints",
         num_workers=8,
-        batch_size=8 * 32,
+        batch_size=8 * 8,
     ),
     # 2. SFT Configs
     TrainConfig(
@@ -864,7 +867,7 @@ _CONFIGS = [
         ema_decay=None,
         checkpoint_base_dir="checkpoints",
         num_workers=8,
-        batch_size=8 * 16,
+        batch_size=8 * 8,
     ),
     # 3. RFT Configs
     TrainConfig(

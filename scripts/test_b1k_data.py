@@ -47,9 +47,7 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-    data_loader = _data_loader.create_behavior_data_loader(
-        config, sharding=data_sharding, shuffle=True, skip_norm_stats=False
-    )
+    data_loader = _data_loader.create_data_loader(config, sharding=data_sharding, shuffle=True, skip_norm_stats=False)
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
