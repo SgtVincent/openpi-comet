@@ -321,6 +321,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
             max_workers=os.cpu_count() - 2,
+            local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
         )
 
     def load_hf_dataset(self) -> datasets.Dataset:

@@ -33,11 +33,15 @@ import signal
 import shutil
 import sys
 import time
+from pathlib import Path
 
-_FAULT_TIMEOUT_S = int(os.environ.get("OPENPI_FAULT_TIMEOUT_S", "1800"))
 faulthandler.enable()
-faulthandler.dump_traceback_later(_FAULT_TIMEOUT_S, repeat=True)
 faulthandler.register(signal.SIGUSR1, all_threads=True)
+
+_FAULT_TIMEOUT_S = int(os.environ.get("OPENPI_FAULT_TIMEOUT_S", "0"))
+_FAULT_REPEAT = os.environ.get("OPENPI_FAULT_REPEAT", "0") == "1"
+if _FAULT_TIMEOUT_S > 0:
+    faulthandler.dump_traceback_later(_FAULT_TIMEOUT_S, repeat=_FAULT_REPEAT)
 
 import jax
 import numpy as np
@@ -56,6 +60,8 @@ import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 
+_LOG_FORMATTER: logging.Formatter | None = None
+
 
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -65,7 +71,7 @@ def init_logging():
             record.levelname = level_mapping.get(record.levelname, record.levelname)
             return super().format(record)
 
-    formatter = CustomFormatter(
+    formatter: logging.Formatter = CustomFormatter(
         fmt="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)-80s (%(process)d:%(filename)s:%(lineno)s)",
         datefmt="%H:%M:%S",
     )
@@ -77,6 +83,83 @@ def init_logging():
         logger.addHandler(ch)
     else:
         logger.handlers[0].setFormatter(formatter)
+
+    return formatter
+
+
+def add_file_logging(log_file: str, formatter: logging.Formatter) -> None:
+    logger = logging.getLogger()
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == os.path.abspath(log_file):
+            return
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+
+def install_excepthook() -> None:
+    default_hook = sys.excepthook
+
+    def _hook(exc_type, exc, tb):
+        try:
+            logging.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+        finally:
+            default_hook(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
+def ddp_barrier(*, local_rank: int | None = None) -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if torch.cuda.is_available() and local_rank is not None:
+        try:
+            dist.barrier(device_ids=[local_rank])
+            return
+        except TypeError:
+            pass
+    dist.barrier()
+
+
+def configure_hf_cache(config: _config.TrainConfig, *, is_main: bool, use_ddp: bool) -> None:
+    offline = os.environ.get("OPENPI_OFFLINE", "1") == "1"
+    if offline:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    if os.environ.get("OPENPI_TORCH_COMPILE_SAMPLE_ACTIONS", "0") != "1":
+        os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+    checkpoints_root = Path(config.checkpoint_base_dir).expanduser().resolve()
+    hf_home = Path(os.environ.get("HF_HOME", str(checkpoints_root / "hf_home"))).expanduser()
+    hub_cache = Path(os.environ.get("HUGGINGFACE_HUB_CACHE", str(hf_home / "hub"))).expanduser()
+    transformers_cache = Path(os.environ.get("TRANSFORMERS_CACHE", str(hf_home / "transformers"))).expanduser()
+    datasets_cache = Path(
+        os.environ.get("HF_DATASETS_CACHE", str(checkpoints_root / "hf_datasets_cache"))
+    ).expanduser()
+
+    os.environ["HF_HOME"] = str(hf_home)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hub_cache)
+    os.environ["TRANSFORMERS_CACHE"] = str(transformers_cache)
+    os.environ["HF_DATASETS_CACHE"] = str(datasets_cache)
+
+    if is_main:
+        hf_home.mkdir(parents=True, exist_ok=True)
+        hub_cache.mkdir(parents=True, exist_ok=True)
+        transformers_cache.mkdir(parents=True, exist_ok=True)
+        datasets_cache.mkdir(parents=True, exist_ok=True)
+    if use_ddp:
+        ddp_barrier(local_rank=int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))))
+
+    logging.info("HF_HOME=%s", os.environ.get("HF_HOME"))
+    logging.info("HF_DATASETS_CACHE=%s", os.environ.get("HF_DATASETS_CACHE"))
+    logging.info("HUGGINGFACE_HUB_CACHE=%s", os.environ.get("HUGGINGFACE_HUB_CACHE"))
+    logging.info("TRANSFORMERS_CACHE=%s", os.environ.get("TRANSFORMERS_CACHE"))
+    logging.info("HF_HUB_OFFLINE=%s", os.environ.get("HF_HUB_OFFLINE"))
+    logging.info("HF_DATASETS_OFFLINE=%s", os.environ.get("HF_DATASETS_OFFLINE"))
+    logging.info("TRANSFORMERS_OFFLINE=%s", os.environ.get("TRANSFORMERS_OFFLINE"))
+    logging.info("TORCHDYNAMO_DISABLE=%s", os.environ.get("TORCHDYNAMO_DISABLE"))
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
@@ -121,7 +204,7 @@ def setup_ddp():
 
 def cleanup_ddp():
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        ddp_barrier(local_rank=int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))))
         torch.distributed.destroy_process_group()
 
 
@@ -133,6 +216,14 @@ def set_seed(seed: int, local_rank: int):
 
 
 def build_datasets(config: _config.TrainConfig):
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        if rank != 0:
+            ddp_barrier(local_rank=int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))))
+        data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
+        if rank == 0:
+            ddp_barrier(local_rank=int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))))
+        return data_loader, data_loader.data_config()
     data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
     return data_loader, data_loader.data_config()
 
@@ -405,6 +496,21 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
         if use_ddp:
             dist.barrier()
+
+    global _LOG_FORMATTER
+    if _LOG_FORMATTER is None:
+        _LOG_FORMATTER = init_logging()
+
+    rank = dist.get_rank() if use_ddp else 0
+    log_dir = config.checkpoint_dir / "logs"
+    if is_main:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    if use_ddp:
+        dist.barrier()
+    add_file_logging(str(log_dir / f"rank{rank}.log"), _LOG_FORMATTER)
+    install_excepthook()
+
+    configure_hf_cache(config, is_main=is_main, use_ddp=use_ddp)
 
     # Initialize wandb (only on main process)
     if is_main:
@@ -731,7 +837,8 @@ def train_loop(config: _config.TrainConfig):
 
 
 def main():
-    init_logging()
+    global _LOG_FORMATTER
+    _LOG_FORMATTER = init_logging()
     logging.info("Host: %s PID: %s", platform.node(), os.getpid())
     logging.info("Python: %s (%s)", sys.version.split()[0], sys.executable)
     logging.info("CWD: %s", os.getcwd())

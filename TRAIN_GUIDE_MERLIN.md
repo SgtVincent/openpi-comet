@@ -99,8 +99,15 @@ source .venv/bin/activate
 export OPENPI_DATA_HOME=$(pwd)/.cache/openpi
 export B1K_VIDEO_BACKEND=video_reader
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export OPENPI_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
-torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+mkdir -p checkpoints/torchrun_logs/vlm2_vla_pretrain
+mkdir -p checkpoints/console_logs
+
+torchrun --standalone --nnodes=1 --nproc_per_node=8 --master_port 29501 \
   scripts/train_pytorch.py \
   vlm2_b1k-pt50_cs32_bs64_lr2.5e-5_step50k \
   --exp_name vlm2_vla_pretrain \
@@ -109,8 +116,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --save_interval 5000 \
   --num_workers 10 \
   --pytorch-training-precision bfloat16 \
-  --overwrite
+  --overwrite 2>&1 | tee -a checkpoints/console_logs/vlm2_vla_pretrain.log
 ```
+
+每个 rank 的落盘日志在 `checkpoints/<exp_name>/logs/rank*.log`，比 wandb 的 `output.log` 更全。
 
 如果出现 OOM 或不稳定，可适当回调 `num_workers`（如降至 8）。
 
@@ -139,6 +148,10 @@ source .venv/bin/activate
 export OPENPI_DATA_HOME=$(pwd)/.cache/openpi
 export B1K_VIDEO_BACKEND=video_reader
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export OPENPI_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   scripts/train_pytorch.py \
@@ -149,7 +162,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --save_interval 500 \
   --batch_size 64 \
   --num_workers 10 \
-  --pytorch-training-precision bfloat16
+  --pytorch-training-precision bfloat16 2>&1 | tee checkpoints/vlm2_sft_run/console.log
 ```
 
 ### 4.3 训练产物位置
