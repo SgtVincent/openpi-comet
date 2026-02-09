@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 from typing import Tuple, Optional
 
 # Helper to add path
@@ -64,7 +65,7 @@ class VGGT3DEncoder(nn.Module):
             enable_camera=True,
             enable_point=True,
             enable_depth=True, # We might use depth later
-            enable_track=False # Track head not needed for basic VLM2 perception
+            enable_track=getattr(config, "vggt_enable_track", False)
         )
         
         # Dimensions
@@ -80,6 +81,62 @@ class VGGT3DEncoder(nn.Module):
         self.view_proj = nn.Linear(camera_dim, config.view_dim)
         
         self.patch_size = config.patch_size
+
+        vggt_pretrained = getattr(config, "vggt_pretrained", None)
+        if vggt_pretrained:
+            self._load_pretrained(vggt_pretrained, strict=getattr(config, "vggt_load_strict", False))
+
+        if getattr(config, "freeze_vggt_backbone", False):
+            for p in self.model.parameters():
+                p.requires_grad = False
+
+    def _load_pretrained(self, source: str, *, strict: bool) -> None:
+        if source.startswith("http://") or source.startswith("https://"):
+            state = torch.hub.load_state_dict_from_url(source, map_location="cpu")
+            self._load_state_dict_safely(state, strict=strict, source=source)
+            return
+
+        if os.path.isfile(source):
+            ckpt = torch.load(source, map_location="cpu", weights_only=False)
+            if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+                state = ckpt["model"]
+            elif isinstance(ckpt, dict):
+                state = ckpt
+            else:
+                raise ValueError(f"Unsupported VGGT checkpoint format at: {source}")
+            self._load_state_dict_safely(state, strict=strict, source=source)
+            return
+        if (os.path.sep in source) or source.endswith(".pt") or source.endswith(".pth") or source.endswith(".bin"):
+            logging.warning("VGGT checkpoint not found at %s; skip loading.", source)
+            return
+
+        if hasattr(VGGT, "from_pretrained"):
+            try:
+                pretrained_model = VGGT.from_pretrained(source)
+                self.model.load_state_dict(pretrained_model.state_dict(), strict=False)
+                return
+            except Exception as e:
+                raise RuntimeError(f"Failed to load VGGT from hub id '{source}': {e}") from e
+
+        raise ValueError(f"Unsupported VGGT pretrained source: {source}")
+
+    def _load_state_dict_safely(self, state_dict: dict, *, strict: bool, source: str) -> None:
+        current = self.model.state_dict()
+        filtered = {k: v for k, v in state_dict.items() if k in current and getattr(v, "shape", None) == current[k].shape}
+        dropped = len(state_dict) - len(filtered)
+        missing, unexpected = self.model.load_state_dict(filtered, strict=False)
+        if strict and (missing or unexpected or dropped > 0):
+            raise RuntimeError(
+                f"VGGT strict load failed: missing={len(missing)} unexpected={len(unexpected)} dropped_by_shape={dropped}"
+            )
+        logging.info(
+            "Loaded VGGT weights: source=%s matched=%s dropped_by_shape=%s missing=%s unexpected=%s",
+            source,
+            len(filtered),
+            dropped,
+            len(missing),
+            len(unexpected),
+        )
 
     def forward(
         self, 

@@ -238,7 +238,8 @@ def create_data_loader(
         )
 
     data_config = config.data.create(config.assets_dirs, config.model)
-    logging.info(f"data_config: {data_config}")
+    # logging.info(f"data_config: {data_config}")
+    logging.info(f"data_config repo_id: {data_config.repo_id}")
     if data_config.rlds_data_dir is not None:
         raise NotImplementedError("RLDS data loader is not supported in this fork.")
     return create_torch_data_loader(

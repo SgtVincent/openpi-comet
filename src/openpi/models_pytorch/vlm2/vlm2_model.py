@@ -92,6 +92,12 @@ class VLM2Config:
     frame_width: int = 224
     patch_size: int = 16
 
+    vggt_pretrained: str | None = None
+    vggt_load_strict: bool = False
+    vggt_enable_track: bool = False
+    freeze_vggt_backbone: bool = False
+    freeze_image_encoder: bool = False
+
 
 from openpi.models_pytorch.vlm2.vggt_integration import VGGT3DEncoder
 
@@ -220,6 +226,10 @@ class VLM2WithPi05(nn.Module):
             precision=config.dtype,
         )
         logging.info("VLM2WithPi05 init: PaliGemmaWithExpertModel created in %.2fs", time.perf_counter() - t0)
+
+        if config.freeze_image_encoder:
+            for p in self.paligemma_with_expert.paligemma.vision_tower.parameters():
+                p.requires_grad = False
         
         t1 = time.perf_counter()
         logging.info("VLM2WithPi05 init: creating VLM2PerceptionModule")
@@ -234,6 +244,10 @@ class VLM2WithPi05(nn.Module):
                 frame_height=config.frame_height,
                 frame_width=config.frame_width,
                 patch_size=config.patch_size,
+                vggt_pretrained=config.vggt_pretrained,
+                vggt_load_strict=config.vggt_load_strict,
+                vggt_enable_track=config.vggt_enable_track,
+                freeze_vggt_backbone=config.freeze_vggt_backbone,
             )
         )
         logging.info("VLM2WithPi05 init: VLM2PerceptionModule created in %.2fs", time.perf_counter() - t1)
@@ -313,6 +327,8 @@ class VLM2WithPi05(nn.Module):
         for t in range(num_frames):
             # Get current frame
             frame = video_frames[:, t]  # (batch, C, H, W)
+            if frame.dim() == 4 and frame.shape[-1] == 3 and frame.shape[1] != 3:
+                frame = frame.permute(0, 3, 1, 2).contiguous()
             
             # Get visual tokens from vision encoder
             visual_tokens = self.paligemma_with_expert.embed_image(frame)  # (batch, n, dim)

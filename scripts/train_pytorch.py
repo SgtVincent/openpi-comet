@@ -53,6 +53,7 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
+import openpi.models.vlm2_vla_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.models.model as _model
 import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
@@ -560,7 +561,10 @@ def train_loop(config: _config.TrainConfig):
     #     logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+    if isinstance(config.model, openpi.models.vlm2_vla_config.VLM2VLAConfig):
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+    elif not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
@@ -599,6 +603,11 @@ def train_loop(config: _config.TrainConfig):
             frame_height=224,
             frame_width=224,
             patch_size=16,
+            vggt_pretrained=getattr(model_cfg, "vggt_pretrained", None),
+            vggt_load_strict=getattr(model_cfg, "vggt_load_strict", False),
+            vggt_enable_track=getattr(model_cfg, "vggt_enable_track", False),
+            freeze_vggt_backbone=getattr(model_cfg, "freeze_vggt_backbone", False),
+            freeze_image_encoder=getattr(model_cfg, "freeze_image_encoder", False),
         )
         model = _vlm2_model.VLM2WithPi05(vlm2_config).to(device)
     else:
@@ -639,13 +648,19 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        load_strict = config.pytorch_model_name != "vlm2"
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
-            model_path,
-            strict=load_strict,
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        if not os.path.exists(model_path):
+            logging.warning(
+                f"Model checkpoint not found at {model_path}. "
+                "Skipping weight loading. Model will be randomly initialized."
+            )
+        else:
+            load_strict = config.pytorch_model_name != "vlm2"
+            safetensors.torch.load_model(
+                (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+                model_path,
+                strict=load_strict,
+            )
+            logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -653,9 +668,13 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
+    optim_params = [p for p in model.parameters() if p.requires_grad]
+    if len(optim_params) == 0:
+        raise RuntimeError("No trainable parameters found (all parameters are frozen).")
+
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        model.parameters(),
+        optim_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -757,14 +776,14 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(optim_params, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
-            for param in model.parameters():
+            for param in optim_params:
                 if param.grad is not None:
                     param.grad.detach_()
                     param.grad = None

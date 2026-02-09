@@ -277,6 +277,11 @@ class BaseModelConfig(abc.ABC):
                 frame_height=224,
                 frame_width=224,
                 patch_size=16,
+                vggt_pretrained=getattr(model_cfg, "vggt_pretrained", None),
+                vggt_load_strict=getattr(model_cfg, "vggt_load_strict", False),
+                vggt_enable_track=getattr(model_cfg, "vggt_enable_track", False),
+                freeze_vggt_backbone=getattr(model_cfg, "freeze_vggt_backbone", False),
+                freeze_image_encoder=getattr(model_cfg, "freeze_image_encoder", False),
             )
             model = _vlm2_model.VLM2WithPi05(vlm2_config)
         else:
