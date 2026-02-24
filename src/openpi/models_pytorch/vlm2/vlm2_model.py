@@ -278,8 +278,21 @@ class VLM2WithPi05(nn.Module):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         
-        # Projection to align 3D representation with language model dimension
-        self.repr_to_llm = nn.Linear(actual_visual_dim, paligemma_config.width)
+        # Projection to align 3D representation with language model dimension.
+        # If dimensions already match, use identity to avoid perturbing pretrained features.
+        if actual_visual_dim == paligemma_config.width:
+            self.repr_to_llm: nn.Module = nn.Identity()
+            logging.info(
+                "VLM2WithPi05 init: using identity repr_to_llm projection (dim=%s)",
+                actual_visual_dim,
+            )
+        else:
+            self.repr_to_llm = nn.Linear(actual_visual_dim, paligemma_config.width)
+
+        # Learnable residual gates to warm-start from PI0.5 behavior and gradually
+        # introduce VLM2-specific perception/memory deltas.
+        self.perception_delta_scale = nn.Parameter(torch.tensor(0.0))
+        self.memory_delta_scale = nn.Parameter(torch.tensor(0.0))
         
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -341,6 +354,13 @@ class VLM2WithPi05(nn.Module):
             # Apply VLM2 perception (3D-aware representation)
             # Passes frame images to perception module which uses VGGT
             representation = self.perception(visual_tokens_spatial, frame)
+
+            # Warm-start: keep close to base PI0.5 image tokens at initialization.
+            # perception_delta_scale starts at 0.0; gate is unconstrained (ReZero-style)
+            # so gradients never saturate and the model can grow the gate freely.
+            base_representation = rearrange(visual_tokens_spatial, 'b h w c -> b (h w) c')
+            perception_gate = self.perception_delta_scale
+            representation = base_representation + perception_gate * (representation - base_representation)
             
             # Apply VLM2 memory with text query
             memory_enhanced = self.memory(
@@ -349,6 +369,10 @@ class VLM2WithPi05(nn.Module):
                 text_mask=text_mask,
                 update_memory=True
             )
+
+            # Warm-start memory path as residual delta (ReZero-style, unconstrained).
+            memory_gate = self.memory_delta_scale
+            memory_enhanced = representation + memory_gate * (memory_enhanced - representation)
             
             all_representations.append(memory_enhanced)
         
@@ -462,11 +486,13 @@ class VLM2WithPi05(nn.Module):
             text_mask=language_masks
         )
         
-        # Aggregate temporal representations (use last frame or mean)
-        aggregated_repr = memory_enhanced_repr[:, -1]  # Use last frame: (batch, n, dim)
+        # Preserve all frame/camera tokens instead of only the last frame.
+        # This keeps prefix token coverage closer to the PI0.5 baseline.
+        aggregated_repr = rearrange(memory_enhanced_repr, 'b t n d -> b (t n) d')
         
         # Project to language model dimension
-        proj_dtype = self.repr_to_llm.weight.dtype
+        proj_weight = getattr(self.repr_to_llm, "weight", None)
+        proj_dtype = proj_weight.dtype if proj_weight is not None else aggregated_repr.dtype
         prefix_embs = self.repr_to_llm(aggregated_repr.to(proj_dtype))
         
         # Language embeddings are already computed
@@ -477,7 +503,7 @@ class VLM2WithPi05(nn.Module):
         prefix_embs = torch.cat([prefix_embs, lang_emb], dim=1)
         
         # Create prefix masks
-        n_visual = memory_enhanced_repr.shape[2]
+        n_visual = aggregated_repr.shape[1]
         prefix_pad_masks = torch.cat([
             torch.ones(batch_size, n_visual, dtype=torch.bool, device=device),
             language_masks,
@@ -625,11 +651,12 @@ class VLM2WithPi05(nn.Module):
             text_mask=language_masks
         )
         
-        # Aggregate temporal representations
-        aggregated_repr = memory_enhanced_repr[:, -1]
+        # Aggregate all camera-view tokens (must match training aggregation).
+        aggregated_repr = rearrange(memory_enhanced_repr, 'b t n d -> b (t n) d')
         
         # Project to language model dimension
-        proj_dtype = self.repr_to_llm.weight.dtype
+        proj_weight = getattr(self.repr_to_llm, "weight", None)
+        proj_dtype = proj_weight.dtype if proj_weight is not None else aggregated_repr.dtype
         prefix_embs = self.repr_to_llm(aggregated_repr.to(proj_dtype))
         
         # Reuse language embeddings
@@ -640,7 +667,7 @@ class VLM2WithPi05(nn.Module):
         prefix_embs = torch.cat([prefix_embs, lang_emb], dim=1)
         
         # Create prefix masks
-        n_visual = memory_enhanced_repr.shape[2]
+        n_visual = aggregated_repr.shape[1]
         prefix_pad_masks = torch.cat([
             torch.ones(batch_size, n_visual, dtype=torch.bool, device=device),
             language_masks,

@@ -24,6 +24,7 @@ Multi-Node Training:
 """
 
 import dataclasses
+import datetime
 import faulthandler
 import gc
 import logging
@@ -60,8 +61,6 @@ import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
-
-_LOG_FORMATTER: logging.Formatter | None = None
 
 
 def init_logging():
@@ -145,6 +144,15 @@ def configure_hf_cache(config: _config.TrainConfig, *, is_main: bool, use_ddp: b
     os.environ["TRANSFORMERS_CACHE"] = str(transformers_cache)
     os.environ["HF_DATASETS_CACHE"] = str(datasets_cache)
 
+    if use_ddp:
+        # Per-node caching (node{k} subdirs) avoids filelock races across nodes while sharing
+        # one Arrow copy per physical node instead of one per global rank.
+        os.environ.setdefault("OPENPI_HF_DATASETS_CACHE_PER_RANK", "1")
+        # Cap datasets parquet conversion workers in large DDP runs to reduce process storms.
+        os.environ.setdefault("OPENPI_LOAD_DATASET_NUM_PROC_CAP", "32")
+        os.environ.setdefault("OPENPI_HF_LOAD_DATASET_RETRIES", "5")
+        os.environ.setdefault("OPENPI_HF_LOAD_DATASET_RETRY_SLEEP_S", "2")
+
     if is_main:
         hf_home.mkdir(parents=True, exist_ok=True)
         hub_cache.mkdir(parents=True, exist_ok=True)
@@ -161,6 +169,8 @@ def configure_hf_cache(config: _config.TrainConfig, *, is_main: bool, use_ddp: b
     logging.info("HF_DATASETS_OFFLINE=%s", os.environ.get("HF_DATASETS_OFFLINE"))
     logging.info("TRANSFORMERS_OFFLINE=%s", os.environ.get("TRANSFORMERS_OFFLINE"))
     logging.info("TORCHDYNAMO_DISABLE=%s", os.environ.get("TORCHDYNAMO_DISABLE"))
+    logging.info("OPENPI_HF_DATASETS_CACHE_PER_RANK=%s", os.environ.get("OPENPI_HF_DATASETS_CACHE_PER_RANK"))
+    logging.info("OPENPI_LOAD_DATASET_NUM_PROC_CAP=%s", os.environ.get("OPENPI_LOAD_DATASET_NUM_PROC_CAP"))
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
@@ -187,19 +197,35 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     use_ddp = world_size > 1
-    if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
 
-        # Set up debugging environment variables for DDP issues
+    if use_ddp and not torch.distributed.is_initialized():
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
+        backend = "nccl" if device.type == "cuda" else "gloo"
+        # Large datasets can make startup synchronization exceed the default 10-minute timeout.
+        ddp_timeout_min = int(os.environ.get("OPENPI_DDP_TIMEOUT_MIN", "120"))
+        init_kwargs = {
+            "backend": backend,
+            "init_method": "env://",
+            "timeout": datetime.timedelta(minutes=ddp_timeout_min),
+        }
+        # device_id is not strictly required if set_device is called, and can cause issues in some versions
+        # if backend == "nccl":
+        #    init_kwargs["device_id"] = device
+        torch.distributed.init_process_group(**init_kwargs)
+        if backend == "nccl":
+            try:
+                torch.distributed.barrier(device_ids=[local_rank])
+            except TypeError:
+                torch.distributed.barrier()
     return use_ddp, local_rank, device
 
 
@@ -217,16 +243,26 @@ def set_seed(seed: int, local_rank: int):
 
 
 def build_datasets(config: _config.TrainConfig):
-    if dist.is_available() and dist.is_initialized():
-        rank = dist.get_rank()
-        if rank != 0:
-            ddp_barrier(local_rank=int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))))
-        data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
-        if rank == 0:
-            ddp_barrier(local_rank=int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))))
-        return data_loader, data_loader.data_config()
-    data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
-    return data_loader, data_loader.data_config()
+    # Use the unified data loader with PyTorch framework.
+    retries = max(1, int(os.environ.get("OPENPI_BUILD_DATASET_RETRIES", "3")))
+    rank = int(os.environ.get("RANK", "0"))
+    for attempt in range(1, retries + 1):
+        try:
+            data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
+            return data_loader, data_loader.data_config()
+        except FileNotFoundError as exc:
+            transient_lock_race = exc.filename is None and int(os.environ.get("WORLD_SIZE", "1")) > 1
+            if (not transient_lock_race) or attempt >= retries:
+                raise
+            delay_s = float(os.environ.get("OPENPI_BUILD_DATASET_RETRY_SLEEP_S", "2")) * attempt
+            logging.warning(
+                "Rank %s hit transient ENOENT during dataset init (attempt %s/%s). Retrying in %.1fs",
+                rank,
+                attempt,
+                retries,
+                delay_s,
+            )
+            time.sleep(delay_s)
 
 
 def get_model_state_dict(model):
@@ -249,50 +285,52 @@ def get_model_parameters(model):
 
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
-    if not is_main:
-        return
-
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
-        # Create temporary directory for atomic checkpoint saving
-        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+        if is_main:
+            # Create temporary directory for atomic checkpoint saving
+            final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+            tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
 
-        # Remove any existing temp directory and create new one
-        if tmp_ckpt_dir.exists():
-            shutil.rmtree(tmp_ckpt_dir)
-        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+            # Remove any existing temp directory and create new one
+            if tmp_ckpt_dir.exists():
+                shutil.rmtree(tmp_ckpt_dir)
+            tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save model state using safetensors (handle shared tensors)
-        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+            # Save model state using safetensors (handle shared tensors)
+            model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
-        # Save optimizer state using PyTorch format
-        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+            # Save optimizer state using PyTorch format
+            torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
-        # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
-        metadata = {
-            "global_step": global_step,
-            "config": dataclasses.asdict(config),
-            "timestamp": time.time(),
-        }
-        torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+            # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
+            metadata = {
+                "global_step": global_step,
+                "config": dataclasses.asdict(config),
+                "timestamp": time.time(),
+            }
+            torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
-        # save norm stats
-        norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+            # save norm stats
+            norm_stats = data_config.norm_stats
+            if norm_stats is not None and data_config.asset_id is not None:
+                _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
 
-        # Atomically move temp directory to final location
-        if final_ckpt_dir.exists():
-            shutil.rmtree(final_ckpt_dir)
-        tmp_ckpt_dir.rename(final_ckpt_dir)
+            # Atomically move temp directory to final location
+            if final_ckpt_dir.exists():
+                shutil.rmtree(final_ckpt_dir)
+            tmp_ckpt_dir.rename(final_ckpt_dir)
 
-        logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+            logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
-        # Log checkpoint to wandb
-        if config.wandb_enabled:
-            wandb.log({"checkpoint_step": global_step}, step=global_step)
+            # Log checkpoint to wandb
+            if config.wandb_enabled:
+                wandb.log({"checkpoint_step": global_step}, step=global_step)
+        
+        # Synchronize all ranks after saving to prevent timeout on other ranks
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -447,7 +485,7 @@ def _prepare_vlm2_inputs(observation, config: _config.TrainConfig, device: torch
     return video_frames, point_maps, language_tokens, language_masks
 
 
-def train_loop(config: _config.TrainConfig):
+def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
@@ -498,36 +536,78 @@ def train_loop(config: _config.TrainConfig):
         if use_ddp:
             dist.barrier()
 
-    global _LOG_FORMATTER
-    if _LOG_FORMATTER is None:
-        _LOG_FORMATTER = init_logging()
-
     rank = dist.get_rank() if use_ddp else 0
     log_dir = config.checkpoint_dir / "logs"
     if is_main:
         log_dir.mkdir(parents=True, exist_ok=True)
     if use_ddp:
         dist.barrier()
-    add_file_logging(str(log_dir / f"rank{rank}.log"), _LOG_FORMATTER)
+    add_file_logging(str(log_dir / f"rank{rank}.log"), formatter)
     install_excepthook()
 
     configure_hf_cache(config, is_main=is_main, use_ddp=use_ddp)
 
-    # Initialize wandb (only on main process)
+    # Pass strict cache-loading mode to the dataset layer via environment variable.
+    os.environ["OPENPI_FORCE_LOAD_CACHE"] = "1" if config.force_load_cache else "0"
     if is_main:
+        logging.info("prepare_hf_cache_only=%s", config.prepare_hf_cache_only)
+        logging.info("force_load_cache=%s", config.force_load_cache)
+
+    # Initialize wandb (only on main process)
+    if is_main and not config.prepare_hf_cache_only:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
-    effective_batch_size = config.batch_size // world_size
+    if config.batch_size_per_gpu is not None:
+        per_gpu = int(config.batch_size_per_gpu)
+        if per_gpu <= 0:
+            raise ValueError("--batch_size_per_gpu must be a positive integer when provided.")
+        object.__setattr__(config, "batch_size", per_gpu * world_size)
+        effective_batch_size = per_gpu
+    else:
+        effective_batch_size = config.batch_size // world_size
     logging.info(
         f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
+
+    if config.prepare_hf_cache_only:
+        if is_main:
+            logging.info("Offline HF cache preparation completed; exiting as requested.")
+        cleanup_ddp()
+        return
+
+    steps_per_epoch = len(loader)
+    if steps_per_epoch <= 0:
+        raise RuntimeError(f"Computed steps_per_epoch={steps_per_epoch}, expected a positive value.")
+    if config.num_train_epochs is not None:
+        if config.num_train_epochs <= 0:
+            raise ValueError("--num_train_epochs must be a positive integer when provided.")
+        if steps_per_epoch <= 0:
+            raise RuntimeError(f"Computed steps_per_epoch={steps_per_epoch}, expected a positive value.")
+        computed_steps = int(config.num_train_epochs) * steps_per_epoch
+        provided_steps = int(config.num_train_steps)
+        if provided_steps <= 0:
+            target_steps = computed_steps
+        else:
+            target_steps = min(provided_steps, computed_steps)
+        object.__setattr__(config, "num_train_steps", target_steps)
+        logging.info(
+            "Computed num_train_steps=%s (epochs_target=%s, provided_steps=%s) from num_train_epochs=%s and steps_per_epoch=%s",
+            target_steps,
+            computed_steps,
+            provided_steps,
+            config.num_train_epochs,
+            steps_per_epoch,
+        )
+        if config.save_at_epoch_end_only:
+            object.__setattr__(config, "save_interval", target_steps)
+            logging.info("save_at_epoch_end_only enabled: save_interval=%s", target_steps)
 
     # # Log sample images to wandb on first batch
     # if is_main and config.wandb_enabled and not resuming:
@@ -724,11 +804,8 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    last_epoch_logged = None
     while global_step < config.num_train_steps:
-        # Set epoch for distributed training
-        if use_ddp and hasattr(loader, "set_epoch"):
-            loader.set_epoch(global_step // len(loader))
-
         for observation, actions in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
@@ -800,6 +877,15 @@ def train_loop(config: _config.TrainConfig):
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
+                epoch_idx = global_step // steps_per_epoch
+                epoch = epoch_idx + 1
+                epoch_step = (global_step % steps_per_epoch) + 1
+                if last_epoch_logged != epoch:
+                    if config.num_train_epochs is not None:
+                        logging.info("epoch=%s/%s", epoch, config.num_train_epochs)
+                    else:
+                        logging.info("epoch=%s", epoch)
+                    last_epoch_logged = epoch
 
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
@@ -813,9 +899,11 @@ def train_loop(config: _config.TrainConfig):
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    f"step={global_step} epoch={epoch} epoch_step={epoch_step}/{steps_per_epoch} "
+                    f"loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    else f"step={global_step} epoch={epoch} epoch_step={epoch_step}/{steps_per_epoch} "
+                    f"loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
                 # Log to wandb
@@ -824,6 +912,9 @@ def train_loop(config: _config.TrainConfig):
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
                         "step": global_step,
+                        "epoch": epoch,
+                        "epoch_step": epoch_step,
+                        "steps_per_epoch": steps_per_epoch,
                         "time_per_step": elapsed / config.log_interval,
                     }
                     if avg_grad_norm is not None:
@@ -856,8 +947,7 @@ def train_loop(config: _config.TrainConfig):
 
 
 def main():
-    global _LOG_FORMATTER
-    _LOG_FORMATTER = init_logging()
+    formatter = init_logging()
     logging.info("Host: %s PID: %s", platform.node(), os.getpid())
     logging.info("Python: %s (%s)", sys.version.split()[0], sys.executable)
     logging.info("CWD: %s", os.getcwd())
@@ -884,7 +974,7 @@ def main():
                  getattr(config, "wandb_enabled", None),
                  getattr(config, "num_workers", None),
                  getattr(config, "batch_size", None))
-    train_loop(config)
+    train_loop(config, formatter=formatter)
 
 
 if __name__ == "__main__":

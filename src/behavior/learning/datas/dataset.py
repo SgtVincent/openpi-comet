@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import random
+import time
 
 import datasets
 from datasets import load_dataset
@@ -326,12 +327,112 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
-        if self.episodes is None:
-            path = str(self.root / "data")
-            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+        # Calculate num_proc carefully to avoid oversubscribing the system when running with DDP.
+        total_cpus = os.cpu_count() or 1
+        nproc_per_node = max(1, int(os.environ.get("NPROC_PER_NODE", "1")))
+        num_proc = max(1, total_cpus // nproc_per_node)
+
+        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        rank = max(0, int(os.environ.get("RANK", "0")))
+        local_rank = max(0, int(os.environ.get("LOCAL_RANK", "0")))
+        default_num_proc_cap = "32" if world_size > 1 else "0"
+        num_proc_cap = int(os.environ.get("OPENPI_LOAD_DATASET_NUM_PROC_CAP", default_num_proc_cap))
+        if num_proc_cap > 0:
+            num_proc = min(num_proc, num_proc_cap)
+
+        cache_dir = None
+        hf_datasets_cache = os.environ.get("HF_DATASETS_CACHE")
+        if hf_datasets_cache:
+            cache_root = Path(hf_datasets_cache).expanduser()
+            per_rank_cache = world_size > 1 and os.environ.get("OPENPI_HF_DATASETS_CACHE_PER_RANK", "1") == "1"
+            if per_rank_cache:
+                # Per-node cache dir: all LOCAL_RANKs on the same node share one Arrow cache copy.
+                # Different nodes get independent dirs (node0/, node1/, ...) to avoid cross-node
+                # filelock races and reduce duplicate Arrow cache copies on NAS.
+                local_world_size = max(
+                    1,
+                    int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("NPROC_PER_NODE", "1"))),
+                )
+                node_rank = rank // local_world_size
+                cache_dir_path = cache_root / f"node{node_rank}"
+            else:
+                cache_dir_path = cache_root
+            cache_dir_path.mkdir(parents=True, exist_ok=True)
+            cache_dir = str(cache_dir_path)
+
+        logger.info(
+            "Loading dataset with %s processes (world_size=%s, rank=%s, local_rank=%s, cache_dir=%s)",
+            num_proc,
+            world_size,
+            rank,
+            local_rank,
+            cache_dir,
+        )
+
+        load_kwargs: dict[str, object] = {"split": "train", "num_proc": num_proc}
+        if cache_dir is not None:
+            load_kwargs["cache_dir"] = cache_dir
+
+        def _do_load() -> datasets.Dataset:
+            max_retries = max(1, int(os.environ.get("OPENPI_HF_LOAD_DATASET_RETRIES", "5")))
+            retry_sleep_s = float(os.environ.get("OPENPI_HF_LOAD_DATASET_RETRY_SLEEP_S", "2"))
+            for attempt in range(1, max_retries + 1):
+                try:
+                    if self.episodes is None:
+                        path = str(self.root / "data")
+                        return load_dataset("parquet", data_dir=path, **load_kwargs)
+                    files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
+                    return load_dataset("parquet", data_files=files, **load_kwargs)
+                except FileNotFoundError as exc:
+                    # filelock can sporadically raise ENOENT on shared filesystems under contention.
+                    lock_race = exc.filename is None and world_size > 1
+                    if (not lock_race) or attempt >= max_retries:
+                        raise
+                    delay = retry_sleep_s * attempt
+                    logger.warning(
+                        "Transient filelock ENOENT while loading dataset (attempt %s/%s). Retrying in %.1fs.",
+                        attempt,
+                        max_retries,
+                        delay,
+                    )
+                    time.sleep(delay)
+
+        # Two-phase loading strategy with global barrier in multi-node DDP:
+        # 1) LOCAL_RANK=0 on each node builds/validates the node-local Arrow cache and writes
+        #    a ready marker file.
+        # 2) Global barrier synchronizes all ranks.
+        # 3) LOCAL_RANK!=0 loads from the prepared cache.
+        #
+        # When OPENPI_FORCE_LOAD_CACHE=1 is set, cache building is disallowed. In this mode,
+        # an existing ready marker is required; otherwise we fail fast immediately.
+        is_distributed = th.distributed.is_available() and th.distributed.is_initialized()
+        force_load_cache = os.environ.get("OPENPI_FORCE_LOAD_CACHE", "0") == "1"
+        ready_file: Path | None = None
+        if cache_dir is not None:
+            ready_file = Path(cache_dir) / ".hf_cache_ready"
+
+        if force_load_cache:
+            if ready_file is None or not ready_file.exists():
+                raise FileNotFoundError(
+                    "--force_load_cache is enabled, but no prepared cache marker was found at "
+                    f"{ready_file}. Please run an offline cache-prep pass first."
+                )
+            hf_dataset = _do_load()
         else:
-            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+            if local_rank == 0:
+                if ready_file is not None and ready_file.exists():
+                    ready_file.unlink()
+                hf_dataset = _do_load()
+                if ready_file is not None:
+                    tmp_ready_file = ready_file.with_name(f"{ready_file.name}.{os.getpid()}.tmp")
+                    tmp_ready_file.write_text("ready\n")
+                    os.replace(tmp_ready_file, ready_file)
+
+            if is_distributed:
+                th.distributed.barrier()
+
+            if local_rank != 0:
+                hf_dataset = _do_load()
 
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset

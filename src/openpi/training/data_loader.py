@@ -350,6 +350,7 @@ class TorchDataLoader:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
         self._sharding = sharding
+        self._sampler = sampler
         if sharding is None and framework == "jax":
             self._sharding = jax.sharding.NamedSharding(
                 jax.sharding.Mesh(jax.devices(), ("B",)),
@@ -396,9 +397,15 @@ class TorchDataLoader:
     def torch_loader(self) -> torch.utils.data.DataLoader:
         return self._data_loader
 
+    def __len__(self) -> int:
+        return len(self._data_loader)
+
     def __iter__(self):
         num_items = 0
+        epoch = 0
         while True:
+            if hasattr(self, "_sampler") and self._sampler is not None and hasattr(self._sampler, "set_epoch"):
+                self._sampler.set_epoch(epoch)
             data_iter = iter(self._data_loader)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
@@ -415,6 +422,7 @@ class TorchDataLoader:
                     )
                 else:
                     yield jax.tree.map(lambda x: None if x is None else torch.as_tensor(x), batch)
+            epoch += 1
 
 
 def _collate_fn(items):
@@ -444,6 +452,9 @@ class DataLoaderImpl(DataLoader):
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    def __len__(self) -> int:
+        return len(self._data_loader)
 
     def __iter__(self):
         for batch in self._data_loader:

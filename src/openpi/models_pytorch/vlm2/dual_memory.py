@@ -281,8 +281,8 @@ class WorkingMemory(nn.Module):
         memory = self.get_memory()
 
         if memory is None:
-            # Return query as-is if memory is empty
-            return query
+            # Empty working memory should contribute no retrieval signal.
+            return torch.zeros_like(query)
 
         # Flatten memory tokens across time: (batch, window*n_tokens, feature_dim)
         batch_size, num_steps, num_tokens, dim = memory.shape
@@ -444,8 +444,8 @@ class EpisodicMemory(nn.Module):
         memory = self.get_memory()
 
         if memory is None:
-            # Return query as-is if memory is empty
-            return query
+            # Empty episodic memory should contribute no retrieval signal.
+            return torch.zeros_like(query)
 
         batch_size, num_entries, num_tokens, dim = memory.shape
         memory_flat = memory.reshape(batch_size, num_entries * num_tokens, dim)
@@ -622,6 +622,15 @@ class DualMemoryModule(nn.Module):
         # Initialize memory if needed
         if self.working_memory.memory_buffer is None:
             self.reset(batch_size, device)
+
+        # If both memories are empty, keep identity behavior and only write memory.
+        # Apply layer_norm for consistency with the non-empty path.
+        if self.working_memory.memory_count.item() == 0 and self.episodic_memory.memory_count.item() == 0:
+            if update_memory:
+                self.working_memory.add(current_representation)
+                self.episodic_memory.add(current_representation)
+            original_dtype = current_representation.dtype
+            return self.layer_norm(current_representation.to(self.layer_norm.weight.dtype)).to(original_dtype)
             
         # Form retrieval query
         if text_query is not None:
@@ -653,20 +662,15 @@ class DualMemoryModule(nn.Module):
         
         if update_memory:
             # 4. Update Working Memory (FIFO sliding window)
-            # Store the original representation? Or memory-enhanced?
-            # VLM2 paper: store Ht (3D-aware representation)
+            # Paper Algorithm 1 line 10/13: W_{t+1} ← W_t ∪ {H_t}
+            # current_representation here is H_t cast to target_dtype.
             self.working_memory.add(current_representation)
             
             # 5. Update Episodic Memory (similarity-based replacement)
-            # Paper says store "salient observations".
-            # "We store Ht in episodic memory"
-            self.episodic_memory.add(current_representation)
-            
-            # Note: The original code stored 'output' (memory enhanced) in episodic memory.
-            # "self.episodic_memory.add(output)" was line 571.
-            # Storing enhanced representation might lead to drift?
-            # Storing raw 3D-aware representation (current_representation) seems safer and cleaner.
-            # Changed to current_representation.
+            # Paper Algorithm 1 line 17/23: E_{t+1} ← E_t ∪ {M_t}
+            # M_t is the gated fusion output (fused_output), NOT H_t.
+            # Cast back to original dtype for storage consistency.
+            self.episodic_memory.add(fused_output.to(original_dtype))
         
         return output
     

@@ -123,6 +123,45 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 --master_port 29501 \
 
 如果出现 OOM 或不稳定，可适当回调 `num_workers`（如降至 8）。
 
+### 3.3 多节点多卡预训练（Multi-Node DDP）
+
+PyTorch 多节点训练使用 `torchrun` 注入的环境变量进行 rendezvous，`scripts/train_pytorch.py` 内部通过 `init_method="env://"` 初始化 DDP。
+
+**约定：**
+- 选择一个节点作为 master（通常 node_rank=0），记录其内网 IP 作为 `--master_addr`
+- `--master_port` 需要在所有节点可达（确保防火墙/安全组放通）
+- 所有节点需使用相同代码版本，且训练数据路径对每个节点都可访问（例如 NAS 同一路径）
+
+**示例：16 节点 × 8 GPU（总 128 GPU）**
+
+在 **每个节点** 都运行同一条命令，仅 `--node_rank` 不同（0~15）：
+
+```bash
+source .venv/bin/activate
+export OPENPI_DATA_HOME=$(pwd)/.cache/openpi
+export B1K_VIDEO_BACKEND=video_reader
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export OPENPI_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+torchrun \
+  --nnodes=16 --nproc_per_node=8 --node_rank=<0-15> \
+  --master_addr=<master_ip> --master_port=29501 \
+  scripts/train_pytorch.py \
+  vlm2_b1k-pt50_cs32_bs64_lr2.5e-5_step50k \
+  --exp_name vlm2_vla_pretrain_16x8 \
+  --num_train_steps 50000 \
+  --log_interval 100 \
+  --save_interval 5000 \
+  --num_workers 10 \
+  --pytorch-training-precision bfloat16 \
+  --overwrite
+```
+
+提示：多节点时不要使用 `--standalone`；`--standalone` 仅适用于单节点自建 rendezvous。
+
 ## 4. 启动 VLM2 微调训练（SFT）
 
 ### 4.1 单卡训练
@@ -165,7 +204,23 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --pytorch-training-precision bfloat16 2>&1 | tee checkpoints/vlm2_sft_run/console.log
 ```
 
-### 4.3 训练产物位置
+### 4.3 make_pizza：对比 VLM2-VLA vs PI0.5（Fine-tune 5 epoch）
+
+已在 [src/openpi/training/config.py](src/openpi/training/config.py) 中新增两个配置（均会加载基础 checkpoint，并在 make_pizza 上跑 5 个 epoch）：
+- `vlm2_b1k-make_pizza_lr2.5e-6_5ep_sft`（VLM2-VLA 架构）
+- `pi05_b1k-make_pizza_lr2.5e-6_5ep_sft`（PI0.5 原始架构）
+
+两者默认 batch_size 都设置为 `4 * 12`（4 卡时每卡 12），并开启 `save_at_epoch_end_only=True`。
+
+单节点 8 卡启动（推荐直接用脚本）：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_vlm2_sft_make_pizza_5ep.sh
+bash scripts/run_pi05_sft_make_pizza_5ep.sh
+```
+
+### 4.4 训练产物位置
 
 已修改配置默认输出到 `checkpoints` 目录，产物结构如下：
 
