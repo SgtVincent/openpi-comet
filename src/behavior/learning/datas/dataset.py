@@ -449,13 +449,23 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             worker_info = get_worker_info()
             worker_id = 0 if worker_info is None else worker_info.id
             num_workers = 1 if worker_info is None else worker_info.num_workers
+            # Incorporate DDP rank so that different GPUs process different chunks.
+            ddp_rank = int(os.environ.get("RANK", "0"))
+            world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+            global_num_workers = max(1, num_workers * world_size)
+            global_worker_id = ddp_rank * num_workers + worker_id
             if not hasattr(self, "_active_chunks") or self._active_chunks is None:
-                indices = list(range(worker_id, len(self.chunks), num_workers))
+                # Use a global worker id across all ranks so chunk ownership is
+                # partitioned across GPUs instead of duplicated per-rank.
+                indices = list(range(global_worker_id, len(self.chunks), global_num_workers))
+                if len(indices) == 0:
+                    # Fallback for extreme settings where workers exceed chunk count.
+                    indices = list(range(worker_id, len(self.chunks), num_workers))
                 worker_chunks = [self.chunks[i] for i in indices]
-                rng = np.random.default_rng(self.seed + worker_id)
+                rng = np.random.default_rng(self.seed + global_worker_id)
                 rng.shuffle(worker_chunks)
                 self._active_chunks = worker_chunks
-            rng = np.random.default_rng(self.seed + worker_id)
+            rng = np.random.default_rng(self.seed + global_worker_id)
             self.current_streaming_chunk_idx = rng.integers(0, len(self._active_chunks)).item()
             self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
         # Current chunk iterated, move to next chunk

@@ -40,27 +40,27 @@ NNODES=${ARNOLD_WORKER_NUM}
 NODE_RANK=${ARNOLD_ID}
 WORLD_SIZE="$((NNODES * NPROC_PER_NODE))"
 
-CONFIG_NAME="${CONFIG_NAME:-vlm2_b1k-pt50_cs32_bs64_lr2.5e-5_5ep}"
+CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-pt50_cs32_bs64_lr2.5e-5_5ep}"
 NUM_EPOCHS="${NUM_EPOCHS:-5}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
-KEEP_PERIOD="${KEEP_PERIOD:-100000}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"
+KEEP_PERIOD="${KEEP_PERIOD:-5000}"
 FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-1}"
 PREPARE_HF_CACHE_ONLY="${PREPARE_HF_CACHE_ONLY:-0}"
 
 PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
 
-LOG_INTERVAL="${LOG_INTERVAL:-1000}"
+LOG_INTERVAL="${LOG_INTERVAL:-100}"
 PRECISION="${PRECISION:-bfloat16}"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 CHECKPOINTS_ROOT="${CHECKPOINTS_ROOT:-${REPO_ROOT}/checkpoints}"
 # 多节点场景下各机器本地时间可能不一致，直接用 TIMESTAMP 拼 EXP_NAME 会导致每个节点的 EXP_NAME 不同，
-# 从而写到不同目录（或互相覆盖）。这里通过“共享文件”由 node0 统一生成，再同步给其他节点。
+# 从而写到不同目录（或互相覆盖）。这里通过"共享文件"由 node0 统一生成，再同步给其他节点。
 EXP_NAME_SYNC_DIR="${CHECKPOINTS_ROOT}/_exp_name_sync"
 
 if [[ -z "${EXP_NAME:-}" ]]; then
-  # RUN_KEY 用于标识“同一次训练作业”（同一组节点的同一次启动）
+  # RUN_KEY 用于标识"同一次训练作业"（同一组节点的同一次启动）
   # 优先使用调度系统提供的 job/task id；否则退化为 master_addr/port + 规模信息
   RUN_KEY="${ARNOLD_JOB_ID:-${ARNOLD_TASK_ID:-}}"
   if [[ -z "${RUN_KEY}" ]]; then
@@ -70,15 +70,15 @@ if [[ -z "${EXP_NAME:-}" ]]; then
   RUN_KEY="${RUN_KEY//:/_}"
   RUN_KEY="${RUN_KEY// /_}"
 
-  EXP_NAME_FILE="${EXP_NAME_SYNC_DIR}/vlm2_vla_pretrain_${RUN_KEY}.txt"
+  EXP_NAME_FILE="${EXP_NAME_SYNC_DIR}/pi05_pretrain_${RUN_KEY}.txt"
   if [[ "${NODE_RANK}" == "0" ]]; then
     mkdir -p "${EXP_NAME_SYNC_DIR}"
-    # RESUME=1 时优先复用已有 EXP_NAME_FILE，避免“恢复训练却写到新目录”
+    # RESUME=1 时优先复用已有 EXP_NAME_FILE，避免"恢复训练却写到新目录"
     if [[ "${RESUME:-0}" == "1" && -s "${EXP_NAME_FILE}" ]]; then
       EXP_NAME="$(cat "${EXP_NAME_FILE}")"
     else
       # 由 node0 生成本次训练的 EXP_NAME，并写入共享文件（原子 mv），其他节点读取同一个名字
-      EXP_NAME="vlm2_vla_pretrain_${NNODES}x${NPROC_PER_NODE}_${TIMESTAMP}"
+      EXP_NAME="pi05_pretrain_${NNODES}x${NPROC_PER_NODE}_${TIMESTAMP}"
       _tmp_exp_name_file="${EXP_NAME_FILE}.$$.$RANDOM.tmp"
       printf "%s\n" "${EXP_NAME}" > "${_tmp_exp_name_file}"
       mv -f "${_tmp_exp_name_file}" "${EXP_NAME_FILE}"
@@ -124,7 +124,6 @@ mkdir -p "${TORCHRUN_LOG_DIR}"
 # 每个 node 写到自己独立目录下，避免跨节点写同一个 console 文件
 CONSOLE_LOG="${TORCHRUN_LOG_DIR}/console.log"
 if [[ "${NODE_RANK}" == "0" ]]; then
-  # 你指定的要求：只有 node_rank=0 才运行 mkdir -p "$(dirname "${CONSOLE_LOG}")"
   mkdir -p "$(dirname "${CONSOLE_LOG}")"
 fi
 
@@ -132,9 +131,6 @@ EXTRA_ARGS=()
 if [[ "${WANDB_DISABLED:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--no-wandb-enabled)
 fi
-# if [[ "${OVERWRITE:-0}" == "1" ]]; then
-#   EXTRA_ARGS+=(--overwrite)
-# fi
 # By default overwrite config
 EXTRA_ARGS+=(--overwrite)
 if [[ "${RESUME:-0}" == "1" ]]; then
@@ -147,7 +143,7 @@ if [[ "${PREPARE_HF_CACHE_ONLY}" == "1" ]]; then
   EXTRA_ARGS+=(--prepare-hf-cache-only)
 fi
 
-echo "Starting VLM2 pretrain (Arnold multi-node)"
+echo "Starting PI05 pretrain (Arnold multi-node)"
 echo "CONFIG_NAME: ${CONFIG_NAME}"
 echo "EXP_NAME: ${EXP_NAME}"
 echo "MASTER_ADDR: ${MASTER_ADDR}"

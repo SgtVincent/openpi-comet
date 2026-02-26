@@ -219,17 +219,33 @@ def create_data_loader(
         data_config = data_configs[0]
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotItem()])
         dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+        sampler = None
+        if framework == "pytorch" and torch.distributed.is_initialized():
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=torch.distributed.get_world_size(),
+                rank=torch.distributed.get_rank(),
+                shuffle=shuffle,
+                drop_last=True,
+            )
+
+        if framework == "pytorch":
+            if torch.distributed.is_initialized():
+                local_batch_size = config.batch_size // torch.distributed.get_world_size()
+            else:
+                local_batch_size = config.batch_size
+        else:
+            local_batch_size = config.batch_size // jax.process_count()
+
         return DataLoaderImpl(
             data_config,
             TorchDataLoader(
                 dataset,
-                local_batch_size=(
-                    config.batch_size // torch.distributed.get_world_size()
-                    if framework == "pytorch" and torch.distributed.is_initialized()
-                    else config.batch_size // jax.process_count()
-                ),
+                local_batch_size=local_batch_size,
                 sharding=None if framework == "pytorch" else sharding,
-                shuffle=shuffle,
+                shuffle=(sampler is None and shuffle),
+                sampler=sampler,
                 num_batches=num_batches,
                 num_workers=config.num_workers,
                 seed=config.seed,
@@ -368,6 +384,11 @@ class TorchDataLoader:
         persistent_workers = os.environ.get("OPENPI_PERSISTENT_WORKERS", "1") == "1"
         timeout_s = int(os.environ.get("OPENPI_DATALOADER_TIMEOUT_S", "0"))
         prefetch_factor = int(os.environ.get("OPENPI_DATALOADER_PREFETCH_FACTOR", "2"))
+        pin_memory = (
+            framework == "pytorch"
+            and torch.cuda.is_available()
+            and os.environ.get("OPENPI_DATALOADER_PIN_MEMORY", "1") == "1"
+        )
         if num_workers <= 0:
             timeout_s = 0
             persistent_workers = False
@@ -386,6 +407,7 @@ class TorchDataLoader:
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=persistent_workers,
+            pin_memory=pin_memory,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
             drop_last=True,
@@ -437,12 +459,26 @@ def _collate_fn(items):
 
 
 def _worker_init_fn(worker_id: int) -> None:
-    """Tell JAX inside the worker process not to preallocate the GPU memory."""
-    # NOTE: This is called after jax is imported inside the worker process. This
-    # means that this approach will not work for selecting the backend.
+    """Seed each DataLoader worker uniquely per (rank, worker_id) for DDP correctness,
+    and tell JAX inside the worker process not to preallocate the GPU memory."""
+    # Prevent JAX from grabbing GPU memory inside data workers.
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+    # In DDP each rank spawns its own set of DataLoader workers.  Without
+    # rank-aware seeding every rank's worker-k ends up with the same numpy /
+    # random state, causing all GPUs to produce identical data streams when
+    # __getitem__ uses np.random (e.g. MultiBehaviorLeRobotDataset.choice,
+    # BehaviorLeRobotDataset chunk shuffling).
+    import random as _random
+
+    rank = int(os.environ.get("RANK", "0"))
+    info = torch.utils.data.get_worker_info()
+    base_seed = info.seed if info is not None else 0
+    worker_seed = base_seed + rank * 10000 + worker_id
+    np.random.seed(worker_seed % (2**32))
+    _random.seed(worker_seed)
 
 
 class DataLoaderImpl(DataLoader):

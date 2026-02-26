@@ -582,7 +582,13 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         cleanup_ddp()
         return
 
+    # len(loader) already returns the per-rank batch count because
+    # DistributedSampler splits the dataset across ranks and the DataLoader
+    # uses local_batch_size = batch_size // world_size.  Do NOT divide by
+    # world_size again — that was the double-division bug causing training
+    # to run 1/world_size of the intended steps.
     steps_per_epoch = len(loader)
+    
     if steps_per_epoch <= 0:
         raise RuntimeError(f"Computed steps_per_epoch={steps_per_epoch}, expected a positive value.")
     if config.num_train_epochs is not None:
@@ -797,6 +803,18 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         logging.info("EMA is not supported for PyTorch training")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
+    # ── Pre-training barrier ──────────────────────────────────────────
+    # Dataset loading, model building, weight loading, and optimizer creation
+    # run independently per rank.  On multi-node, these can take wildly
+    # different amounts of time (e.g. warm vs cold HF cache).  Without a
+    # barrier here, fast ranks enter the DDP forward/backward (which issues
+    # NCCL allreduce) while slow ranks are still initializing, triggering
+    # the NCCL heartbeat watchdog (480 s) → SIGABRT on all ranks.
+    if use_ddp:
+        logging.info("Rank %d ready, waiting at pre-training barrier...", rank)
+        ddp_barrier(local_rank=local_rank)
+        logging.info("All ranks synchronized, starting training loop.")
+
     # Training loop - iterate until we reach num_train_steps
     pbar = (
         tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
@@ -812,9 +830,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 break
 
             # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            observation = jax.tree.map(  # noqa: PLW2901
+                lambda x: x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
+                observation,
+            )
+            actions = actions.to(device=device, dtype=torch.float32, non_blocking=True)  # noqa: PLW2901
 
             # Update LR
             for pg in optim.param_groups:
