@@ -724,7 +724,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
+            find_unused_parameters=False,  # Disable for memory efficiency
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )

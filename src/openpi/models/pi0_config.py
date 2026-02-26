@@ -39,7 +39,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     def __post_init__(self):
         if self.max_token_len is None:
-            object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+            object.__setattr__(self, "max_token_len", 512 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
 
