@@ -44,8 +44,7 @@ def _broadcast_str_from_primary(s: str, max_len: int = 512) -> str:
     return bytes(int(x) for x in broadcasted).rstrip(b"\x00").decode("utf-8")
 
 
-def init_logging():
-    """Custom logging format for better readability."""
+def init_logging(config: _config.TrainConfig):
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
 
     class CustomFormatter(logging.Formatter):
@@ -60,7 +59,17 @@ def init_logging():
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    logger.handlers[0].setFormatter(formatter)
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+    else:
+        logger.handlers[0].setFormatter(formatter)
+
+    config.log_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(config.log_dir / f"rank{jax.process_index()}.log")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
@@ -203,7 +212,6 @@ def train_step(
 
 
 def main(config: _config.TrainConfig):
-    init_logging()
     num_local_devices = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
     jax.distributed.initialize(
         coordinator_address=f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
@@ -211,13 +219,13 @@ def main(config: _config.TrainConfig):
         num_processes=int(os.environ["WORLD_SIZE"]),
         local_device_ids=list(range(num_local_devices)),
     )
+    config = dataclasses.replace(config, exp_name=_broadcast_str_from_primary(config.exp_name))
+    init_logging(config)
     logging.info(f"Running on: {platform.node()}")
     logging.info(f"JAX process index: {jax.process_index()}")
     logging.info(f"JAX process count: {jax.process_count()}")
     logging.info(f"JAX local device count: {jax.local_device_count()}")
     logging.info(f"JAX global device count: {jax.device_count()}")
-
-    config = dataclasses.replace(config, exp_name=_broadcast_str_from_primary(config.exp_name))
     logging.info(f"[P{jax.process_index()}] checkpoint_dir: {config.checkpoint_dir}")
 
     if config.batch_size % jax.device_count() != 0:

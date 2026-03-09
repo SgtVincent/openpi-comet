@@ -1,7 +1,7 @@
 import logging
 import os
 import pathlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
 
@@ -9,12 +9,14 @@ import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
-from openpi.training import config as _config
 import openpi.transforms as transforms
+
+if TYPE_CHECKING:
+    from openpi.training import config as _config
 
 
 def create_trained_policy(
-    train_config: _config.TrainConfig,
+    train_config: "_config.TrainConfig",
     checkpoint_dir: pathlib.Path | str,
     *,
     repack_transforms: transforms.Group | None = None,
@@ -72,7 +74,7 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    policy = _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
@@ -92,3 +94,4 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
+    return policy

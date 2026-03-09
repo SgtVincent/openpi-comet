@@ -26,8 +26,7 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 
-def init_logging():
-    """Custom logging format for better readability."""
+def init_logging(config: _config.TrainConfig):
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
 
     class CustomFormatter(logging.Formatter):
@@ -42,7 +41,17 @@ def init_logging():
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    logger.handlers[0].setFormatter(formatter)
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+    else:
+        logger.handlers[0].setFormatter(formatter)
+
+    config.log_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(config.log_dir / f"rank{jax.process_index()}.log")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
@@ -196,7 +205,7 @@ def train_step(
 
 
 def main(config: _config.TrainConfig):
-    init_logging()
+    init_logging(config)
     logging.info(f"Running on: {platform.node()}")
     logging.info(f"JAX process index: {jax.process_index()}")
     logging.info(f"JAX process count: {jax.process_count()}")

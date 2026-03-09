@@ -31,7 +31,7 @@ _TEST_CONFIGS = [
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
-        checkpoint_base_dir="checkpoints",
+        checkpoint_base_dir="./outputs/checkpoints",
         num_workers=8,
         batch_size=8 * 4,
     ),
