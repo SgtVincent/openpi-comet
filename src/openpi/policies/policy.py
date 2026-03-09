@@ -54,6 +54,9 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._cached_subtask_prompt: str | None = None
+        self._cached_subtask_tokens = None
+        self._cached_subtask_text: str | None = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -66,6 +69,10 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        raw_prompt = obs.get("prompt")
+        if raw_prompt is not None and not isinstance(raw_prompt, str):
+            raw_prompt = str(raw_prompt)
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -87,6 +94,27 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
         observation = _model.Observation.from_dict(inputs)
+
+        generated_subtask = None
+        if (
+            self._is_pytorch_model
+            and hasattr(self._model, "predict_subtask_tokens")
+            and hasattr(self._model, "build_hierarchical_observation")
+            and getattr(observation, "subtask_mask", None) is not None
+            and not bool(torch.any(observation.subtask_mask).item())
+        ):
+            if self._cached_subtask_prompt == raw_prompt and self._cached_subtask_tokens is not None:
+                subtask_tokens = self._cached_subtask_tokens
+                generated_subtask = self._cached_subtask_text
+            else:
+                subtask_tokens = self._model.predict_subtask_tokens(observation)
+                generated_texts = self._model.decode_subtask_tokens(subtask_tokens)
+                generated_subtask = generated_texts[0] if generated_texts else None
+                self._cached_subtask_prompt = raw_prompt
+                self._cached_subtask_tokens = subtask_tokens
+                self._cached_subtask_text = generated_subtask
+            observation = self._model.build_hierarchical_observation(observation, subtask_tokens)
+
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
@@ -102,6 +130,8 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if generated_subtask is not None:
+            outputs["generated_subtask"] = generated_subtask
         return outputs
 
     @property

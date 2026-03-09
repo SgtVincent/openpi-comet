@@ -196,4 +196,9 @@ def preprocess_observation_pytorch(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        subtask_tokens=getattr(observation, "subtask_tokens", None),
+        subtask_mask=getattr(observation, "subtask_mask", None),
+        subtask_loss_mask=getattr(observation, "subtask_loss_mask", None),
+        subtask_ar_mask=getattr(observation, "subtask_ar_mask", None),
+        pcd_xyz=getattr(observation, "pcd_xyz", None),
     )

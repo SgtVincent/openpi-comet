@@ -51,16 +51,28 @@ import torch
 import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
-import wandb
 
 import openpi.models.pi0_config
 import openpi.models.vlm2_vla_config
+import openpi.models.pi05_hybrid_config
 import openpi.models_pytorch.pi0_pytorch
+import openpi.models_pytorch.pi05_hybrid
 import openpi.models.model as _model
-import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+
+
+_WANDB = None
+
+
+def _get_wandb():
+    global _WANDB
+    if _WANDB is None:
+        import wandb
+
+        _WANDB = wandb
+    return _WANDB
 
 
 def init_logging():
@@ -176,21 +188,25 @@ def configure_hf_cache(config: _config.TrainConfig, *, is_main: bool, use_ddp: b
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
     """Initialize wandb logging."""
     if not enabled:
-        wandb.init(mode="disabled")
+        logging.info("wandb logging disabled")
         return
+
+    wandb = _get_wandb()
 
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
 
+    settings = wandb.Settings(init_timeout=120)
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, settings=settings)
     else:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            settings=settings,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
@@ -326,6 +342,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
             # Log checkpoint to wandb
             if config.wandb_enabled:
+                wandb = _get_wandb()
                 wandb.log({"checkpoint_step": global_step}, step=global_step)
         
         # Synchronize all ranks after saving to prevent timeout on other ranks
@@ -537,7 +554,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             dist.barrier()
 
     rank = dist.get_rank() if use_ddp else 0
-    log_dir = config.checkpoint_dir / "logs"
+    log_dir = config.log_dir
     if is_main:
         log_dir.mkdir(parents=True, exist_ok=True)
     if use_ddp:
@@ -650,6 +667,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
     if isinstance(config.model, openpi.models.vlm2_vla_config.VLM2VLAConfig):
         model_cfg = config.model
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+    elif isinstance(config.model, openpi.models.pi05_hybrid_config.Pi05HybridConfig):
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
     elif not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
@@ -668,6 +688,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
 
     use_vlm2 = config.pytorch_model_name == "vlm2"
     if use_vlm2:
+        import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
+
         vlm2_config = _vlm2_model.VLM2Config(
             visual_dim=2048,
             geometry_dim=config.vlm2_geometry_dim,
@@ -698,6 +720,13 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             freeze_image_encoder=getattr(model_cfg, "freeze_image_encoder", False),
         )
         model = _vlm2_model.VLM2WithPi05(vlm2_config).to(device)
+    elif config.pytorch_model_name == "hybrid":
+        alpha = getattr(model_cfg, "alpha", 10.0)
+        model = openpi.models_pytorch.pi05_hybrid.PI05HybridPytorch(
+            model_cfg,
+            alpha=alpha,
+            action_expert_name="hybrid",
+        ).to(device)
     else:
         model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
@@ -742,7 +771,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 "Skipping weight loading. Model will be randomly initialized."
             )
         else:
-            load_strict = config.pytorch_model_name != "vlm2"
+            load_strict = config.pytorch_model_name not in ("vlm2", "hybrid")
             safetensors.torch.load_model(
                 (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
                 model_path,
@@ -876,12 +905,18 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 else:
                     losses = model(observation, actions)
                 # Ensure losses is a tensor and handle different return types
-                if isinstance(losses, list | tuple):
+                extra_metrics = {}
+                if isinstance(losses, dict):
+                    # Hybrid model returns dict with 'loss', 'flow_loss', 'ce_loss'
+                    extra_metrics = {k: v.item() for k, v in losses.items() if k != "loss" and isinstance(v, torch.Tensor)}
+                    loss = losses["loss"]
+                elif isinstance(losses, list | tuple):
                     losses = torch.stack(losses)
+                    loss = losses.mean()
                 elif not isinstance(losses, torch.Tensor):
-                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
-
-                loss = losses.mean()
+                    loss = torch.tensor(losses, device=device, dtype=torch.float32)
+                else:
+                    loss = losses.mean()
             loss = loss.float()
 
             # Backward pass
@@ -911,6 +946,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                         "loss": loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        **extra_metrics,
                     }
                 )
 
@@ -947,6 +983,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
+                    wandb = _get_wandb()
                     log_payload = {
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
@@ -973,6 +1010,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                         gate_val = torch.tanh(_m.memory.memory_gate).item()
                         log_payload["vlm2/memory_gate"] = gate_val
 
+                    # Log hybrid model component losses if present
+                    for metric_key in ("flow_loss", "ce_loss"):
+                        vals = [info[metric_key] for info in infos if metric_key in info]
+                        if vals:
+                            log_payload[f"hybrid/{metric_key}"] = sum(vals) / len(vals)
+
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
@@ -995,6 +1038,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
 
     # Finish wandb run
     if is_main and config.wandb_enabled:
+        wandb = _get_wandb()
         wandb.finish()
 
     cleanup_ddp()

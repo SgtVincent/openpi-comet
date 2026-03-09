@@ -2,10 +2,23 @@ import dataclasses
 
 import einops
 import numpy as np
-from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
 
 from openpi import transforms
 from openpi.models import model as _model
+
+
+# Keep the minimal R1Pro proprio layout locally so B1K policy setup does not
+# import the full OmniGibson package during training/config startup.
+PROPRIOCEPTION_INDICES = {
+    "R1Pro": {
+        "arm_left_qpos": np.s_[158:165],
+        "gripper_left_qpos": np.s_[193:195],
+        "arm_right_qpos": np.s_[197:204],
+        "gripper_right_qpos": np.s_[232:234],
+        "trunk_qpos": np.s_[236:240],
+        "base_qvel": np.s_[253:256],
+    }
+}
 
 MAX_DEPTH = 10.0
 
@@ -132,7 +145,7 @@ class B1kInputs(transforms.DataTransformFn):
             meta_image_names.append("base_0_seg")
 
         match self.model_type:
-            case _model.ModelType.PI0 | _model.ModelType.PI05:
+            case _model.ModelType.PI0 | _model.ModelType.PI05 | _model.ModelType.PI05_HYBRID:
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
                 images = (base_image, wrist_image_left, wrist_image_right)
                 image_masks = (np.True_, np.True_, np.True_)
@@ -159,6 +172,9 @@ class B1kInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        if "subtask_text" in data:
+            inputs["subtask_text"] = data["subtask_text"]
 
         if self.depth_as_pcd:
             inputs["pcd_xyz"] = pcd_xyz

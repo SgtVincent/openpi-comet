@@ -5,7 +5,6 @@ import jax
 import numpy as np
 import orbax.checkpoint as ocp
 import sentencepiece
-from transformers import AutoProcessor
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
@@ -51,6 +50,9 @@ class PaligemmaTokenizer:
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len
+
+        # Import transformers lazily so non-FAST code paths do not pay its startup cost.
+        from transformers import AutoProcessor
 
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
@@ -369,3 +371,95 @@ class FSQTokenizer:
         if isinstance(tokens, list):
             tokens = np.array(tokens)
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+
+class HybridTokenizer:
+    """Tokenizer for PI05_HYBRID model.
+
+    Produces both:
+    1. A prefix prompt+state token sequence (like PI05's PaligemmaTokenizer)
+    2. A subtask token sequence with AR/loss masks (for text CE loss)
+
+    The prefix is used in the shared VLM backbone forward pass.
+    The subtask tokens provide the ground truth for the text logits CE loss.
+    """
+
+    def __init__(self, prompt_max_len: int = 512, subtask_max_len: int = 128):
+        self._prompt_max_len = prompt_max_len
+        self._subtask_max_len = subtask_max_len
+
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+    @property
+    def vocab_size(self) -> int:
+        return self._tokenizer.vocab_size()
+
+    def tokenize_prompt(self, prompt: str, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize the task prompt + discretized state (same as PI05 PaligemmaTokenizer).
+
+        Returns (tokens, mask) for the prefix.
+        """
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        full_prompt = f"Task: {cleaned_text}, State: {state_str};\nSubtask: "
+        tokens = self._tokenizer.encode(full_prompt, add_bos=True)
+        tokens_len = len(tokens)
+
+        if tokens_len < self._prompt_max_len:
+            padding = [False] * (self._prompt_max_len - tokens_len)
+            mask = [True] * tokens_len + padding
+            tokens = tokens + padding
+        else:
+            if tokens_len > self._prompt_max_len:
+                logging.warning(
+                    f"Prompt token length ({tokens_len}) exceeds max ({self._prompt_max_len}), truncating."
+                )
+            tokens = tokens[: self._prompt_max_len]
+            mask = [True] * self._prompt_max_len
+
+        return np.asarray(tokens), np.asarray(mask)
+
+    def tokenize_subtask(
+        self, subtask_text: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Tokenize the subtask text for CE loss supervision.
+
+        The subtask tokens form a causal sequence: the model predicts each next token.
+
+        Returns (tokens, mask, ar_mask, loss_mask).
+        """
+        cleaned = subtask_text.strip().replace("_", " ").replace("\n", " ")
+        # Prepend BOS so the first real subtask token is supervised by next-token CE.
+        subtask_tokens = [self._tokenizer.bos_id()] + self._tokenizer.encode(cleaned) + [self._tokenizer.eos_id()]
+        subtask_len = len(subtask_tokens)
+
+        tokens = subtask_tokens
+        mask = [True] * subtask_len
+        ar_mask = [1] * subtask_len
+        loss_mask = [False] + [True] * (subtask_len - 1)
+
+        if subtask_len < self._subtask_max_len:
+            padding_len = self._subtask_max_len - subtask_len
+            tokens = tokens + [0] * padding_len
+            mask = mask + [False] * padding_len
+            ar_mask = ar_mask + [0] * padding_len
+            loss_mask = loss_mask + [False] * padding_len
+        else:
+            if subtask_len > self._subtask_max_len:
+                logging.warning(
+                    f"Subtask token length ({subtask_len}) exceeds max ({self._subtask_max_len}), truncating."
+                )
+            tokens = tokens[: self._subtask_max_len]
+            mask = mask[: self._subtask_max_len]
+            ar_mask = ar_mask[: self._subtask_max_len]
+            loss_mask = loss_mask[: self._subtask_max_len]
+
+        return (
+            np.asarray(tokens, dtype=np.int32),
+            np.asarray(mask, dtype=np.bool_),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask, dtype=np.bool_),
+        )

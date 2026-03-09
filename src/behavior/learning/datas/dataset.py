@@ -441,6 +441,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
             item["task"] = self._get_fine_grained_task(item)
+            # Always include skill description (level 1) for hybrid training
+            subtask_text = self._get_task_at_level(item, 1)
+            if subtask_text is not None:
+                item["subtask_text"] = subtask_text
             return item
 
         # Streaming mode: we will load the episode at the current streaming index, and then increment the index for next call
@@ -567,6 +571,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # Add task as a string
         item["task"] = self._get_fine_grained_task(item)
+        # Always include skill description (level 1) for hybrid training
+        subtask_text = self._get_task_at_level(item, 1)
+        if subtask_text is not None:
+            item["subtask_text"] = subtask_text
         self.current_streaming_frame_idx += 1
 
         return item
@@ -590,6 +598,20 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             print(f"[warn] {self.repo_id} failed to get subtask {item}: {e}")
             task_text = self.meta.tasks[task_idx]
         return task_text
+
+    def _get_task_at_level(self, item: dict, level: int) -> str | None:
+        """Get the task description at a specific orchestrator level.
+
+        Returns None if the level is not available.
+        """
+        ep_idx = item["episode_index"].item()
+        task_idx = item["task_index"].item()
+        frame_index = round(item["timestamp"].item() * self.fps)
+        try:
+            sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
+            return self.meta.orchestrators[ep_idx][level][sub_idx]["task"]
+        except Exception:
+            return None
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
         ep_idx = self.episode_data_index_pos[ep_idx]

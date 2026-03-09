@@ -3,6 +3,7 @@ from collections.abc import Sequence
 import dataclasses
 import enum
 import logging
+import os
 import pathlib
 from typing import Generic, TypeVar
 
@@ -17,7 +18,6 @@ import orbax.checkpoint as ocp
 import safetensors
 import torch
 
-from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    PI05_HYBRID = "pi05_hybrid"
 
 
 # The model always expects these images
@@ -110,6 +111,20 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # pi05-hybrid model specific fields.
+
+    # Tokenized subtask text (ground truth for CE loss in hybrid model).
+    subtask_tokens: at.Int[ArrayT, "*b sl"] | None = None
+
+    # Subtask token mask.
+    subtask_mask: at.Bool[ArrayT, "*b sl"] | None = None
+
+    # Subtask loss mask (which tokens contribute to CE loss).
+    subtask_loss_mask: at.Bool[ArrayT, "*b sl"] | None = None
+
+    # Subtask AR mask (autoregressive mask for subtask tokens).
+    subtask_ar_mask: at.Int[ArrayT, "*b sl"] | None = None
+
     # Point cloud.
     pcd_xyz: at.Float[ArrayT, "*b pc_s n 3"] | None = None
 
@@ -133,6 +148,10 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            subtask_tokens=data.get("subtask_tokens"),
+            subtask_mask=data.get("subtask_mask"),
+            subtask_loss_mask=data.get("subtask_loss_mask"),
+            subtask_ar_mask=data.get("subtask_ar_mask"),
             pcd_xyz=data.get("pcd_xyz"),
         )
 
@@ -213,6 +232,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        subtask_tokens=observation.subtask_tokens,
+        subtask_mask=observation.subtask_mask,
+        subtask_loss_mask=observation.subtask_loss_mask,
+        subtask_ar_mask=observation.subtask_ar_mask,
         pcd_xyz=observation.pcd_xyz,
     )
 
@@ -250,8 +273,21 @@ class BaseModelConfig(abc.ABC):
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
+        trace_path = os.environ.get("OPENPI_POLICY_TRACE_FILE")
+
+        def _trace(message: str) -> None:
+            if not trace_path:
+                return
+            trace_file = pathlib.Path(trace_path)
+            trace_file.parent.mkdir(parents=True, exist_ok=True)
+            with trace_file.open("a", encoding="utf-8") as handle:
+                handle.write(f"{message}\n")
+
         logger.info(f"train_config: {train_config}")
-        if getattr(train_config, "pytorch_model_name", "pi0") == "vlm2":
+        pytorch_model_name = getattr(train_config, "pytorch_model_name", "pi0")
+        _trace(f"model_load:model_name:{pytorch_model_name}")
+        _trace("model_load:build_model_start")
+        if pytorch_model_name == "vlm2":
             from openpi.models_pytorch.vlm2 import vlm2_model as _vlm2_model
 
             model_cfg = train_config.model
@@ -293,7 +329,17 @@ class BaseModelConfig(abc.ABC):
                     else None
                 ),
             )
+        elif pytorch_model_name == "hybrid":
+            from openpi.models_pytorch import pi05_hybrid as _pi05_hybrid
+
+            model = _pi05_hybrid.PI05HybridPytorch(
+                config=train_config.model,
+                alpha=getattr(train_config.model, "alpha", 10.0),
+                action_expert_name="hybrid",
+            )
         else:
+            from openpi.models_pytorch import pi0_pytorch
+
             model = pi0_pytorch.PI0Pytorch(
                 config=train_config.model,
                 action_expert_name=getattr(getattr(train_config.model, "pytorch_action_expert", None), "name", "gemma_token"),
@@ -304,7 +350,10 @@ class BaseModelConfig(abc.ABC):
                     else None
                 ),
             )
+        _trace("model_load:build_model_done")
+        _trace("model_load:safetensors_start")
         safetensors.torch.load_model(model, weight_path)
+        _trace("model_load:safetensors_done")
         return model
 
     @abc.abstractmethod

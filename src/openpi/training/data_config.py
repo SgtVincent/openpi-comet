@@ -218,6 +218,25 @@ class ModelTransformFactory(GroupFactory):
                         ),
                     ],
                 )
+            case _model.ModelType.PI05_HYBRID:
+                subtask_max_len = getattr(model_config, "subtask_max_len", 128)
+                return _transforms.Group(
+                    inputs=[
+                        *meta_input_transforms,
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizeHybridInputs(
+                            _tokenizer.HybridTokenizer(
+                                prompt_max_len=model_config.max_token_len,
+                                subtask_max_len=subtask_max_len,
+                            ),
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                    outputs=[
+                        *meta_output_transforms[::-1],  # inverse
+                    ],
+                )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -292,6 +311,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "subtask_text": "subtask_text",
                     }
                 )
             ]
@@ -359,6 +379,7 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "subtask_text": "subtask_text",
                     }
                 )
             ]
@@ -434,6 +455,7 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "subtask_text": "subtask_text",
                     }
                 )
             ]

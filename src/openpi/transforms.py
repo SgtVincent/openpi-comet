@@ -388,7 +388,61 @@ class PromptFromLeRobotItem(DataTransformFn):
     """Extracts a prompt from the current LeRobot dataset task."""
 
     def __call__(self, data: DataDict) -> DataDict:
-        return {**data, "prompt": data.pop("task")}
+        result = {**data, "prompt": data.pop("task")}
+        # Pass through subtask_text if present (used by PI05_HYBRID)
+        if "subtask_text" in data:
+            result["subtask_text"] = data["subtask_text"]
+        return result
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeHybridInputs(DataTransformFn):
+    """Tokenize inputs for PI05_HYBRID model.
+
+    Produces:
+    - tokenized_prompt + tokenized_prompt_mask: prefix tokens (task + state)
+    - subtask_tokens + subtask_mask + subtask_ar_mask + subtask_loss_mask: subtask CE targets
+    - actions: continuous actions preserved for flow matching loss
+    """
+
+    tokenizer: _tokenizer.HybridTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (prompt := data.pop("prompt", None)) is None:
+            raise ValueError("Prompt is required")
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+
+        state = data.get("state")
+        if state is None:
+            raise ValueError("State is required for hybrid tokenization.")
+
+        # Tokenize the task prompt + state for the prefix
+        prompt_tokens, prompt_mask = self.tokenizer.tokenize_prompt(prompt, state)
+
+        # Tokenize the subtask text for CE loss
+        subtask_text = data.pop("subtask_text", None)
+        if subtask_text is not None:
+            if not isinstance(subtask_text, str):
+                subtask_text = subtask_text.item()
+            st_tokens, st_mask, st_ar_mask, st_loss_mask = self.tokenizer.tokenize_subtask(subtask_text)
+        else:
+            # If no subtask text available, create zero-length subtask (no CE loss)
+            sl = self.tokenizer._subtask_max_len
+            st_tokens = np.zeros(sl, dtype=np.int32)
+            st_mask = np.zeros(sl, dtype=bool)
+            st_ar_mask = np.zeros(sl, dtype=np.int32)
+            st_loss_mask = np.zeros(sl, dtype=bool)
+
+        return {
+            **data,
+            "tokenized_prompt": prompt_tokens,
+            "tokenized_prompt_mask": prompt_mask,
+            "subtask_tokens": st_tokens,
+            "subtask_mask": st_mask,
+            "subtask_ar_mask": st_ar_mask,
+            "subtask_loss_mask": st_loss_mask,
+        }
 
 
 @dataclasses.dataclass(frozen=True)

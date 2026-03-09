@@ -35,7 +35,7 @@ class TrainConfig:
 
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
-    pytorch_model_name: Literal["pi0", "vlm2"] = "pi0"
+    pytorch_model_name: Literal["pi0", "vlm2", "hybrid"] = "pi0"
 
     vlm2_geometry_dim: int = 512
     vlm2_view_dim: int = 512
@@ -61,7 +61,9 @@ class TrainConfig:
 
     assets_base_dir: str = "./outputs/assets/train"
 
-    checkpoint_base_dir: str = "./checkpoints"
+    checkpoint_base_dir: str = "./outputs/checkpoints"
+
+    log_base_dir: str = "./outputs/logs"
 
     seed: int = 42
     batch_size: int = 32
@@ -104,6 +106,13 @@ class TrainConfig:
             raise ValueError("--exp_name must be set")
 
         return (pathlib.Path(self.checkpoint_base_dir) / self.exp_name).resolve()
+
+    @property
+    def log_dir(self) -> pathlib.Path:
+        if not self.exp_name:
+            raise ValueError("--exp_name must be set")
+
+        return (pathlib.Path(self.log_base_dir) / self.exp_name).resolve()
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:

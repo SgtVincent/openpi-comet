@@ -1,4 +1,5 @@
 import openpi.models.pi0_config as pi0_config
+import openpi.models.pi05_hybrid_config as pi05_hybrid_config
 from openpi.models.vlm2_vla_config import VLM2VLAConfig
 import openpi.training.optimizer as _optimizer
 from openpi.training.data_config import AssetsConfig, DataConfig, LeRobotB1KDataConfig
@@ -52,7 +53,7 @@ _SFT_MAKE_PIZZA_CONFIGS = [
             ),
             freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, max_token_len=512).get_freeze_filter(),
             ema_decay=None,
-            checkpoint_base_dir="checkpoints",
+            checkpoint_base_dir="./outputs/checkpoints",
             num_workers=10,
             # batch_size=4 * 12,
             batch_size_per_gpu=12,
@@ -92,9 +93,50 @@ _SFT_MAKE_PIZZA_CONFIGS = [
             ),
             freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, max_token_len=512).get_freeze_filter(),
             ema_decay=None,
-            checkpoint_base_dir="checkpoints",
+            checkpoint_base_dir="./outputs/checkpoints",
             num_workers=10,
             # batch_size=4 * 12,
+            batch_size_per_gpu=12,
+        ),
+        TrainConfig(
+            name="pi05_hybrid_b1k-make_pizza_lr2.5e-6_5ep_sft",
+            exp_name="openpi",
+            project_name="B1K",
+            model=pi05_hybrid_config.Pi05HybridConfig(
+                alpha=10.0,
+                subtask_max_len=128,
+                action_horizon=32,
+                max_token_len=512,
+            ),
+            pytorch_model_name="hybrid",
+            data=LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="checkpoints/openpi_comet/pi05-b1kpt50-cs32/assets",
+                    asset_id="behavior-1k/2025-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    tasks=["make_pizza"],
+                    fine_grained_level=0,
+                ),
+            ),
+            pytorch_weight_path="checkpoints/openpi_comet/pi05-b1kpt50-cs32",
+            weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/openpi_comet/pi05-b1kpt50-cs32"),
+            num_train_steps=0,
+            num_train_epochs=5,
+            save_interval=10000,
+            keep_period=100000,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                peak_lr=2.5e-6,
+                decay_steps=0,
+                decay_lr=2.5e-7,
+            ),
+            freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, max_token_len=512).get_freeze_filter(),
+            ema_decay=None,
+            checkpoint_base_dir="./outputs/checkpoints",
+            num_workers=10,
             batch_size_per_gpu=12,
         ),
 ]
