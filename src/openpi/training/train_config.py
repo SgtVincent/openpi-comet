@@ -27,7 +27,7 @@ class TrainConfig:
     project_name: str = "openpi"
     exp_name: str = tyro.MISSING
 
-    model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
+    model: _model.BaseModelConfig = dataclasses.field(default_factory=lambda: pi0_config.Pi0Config())
 
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
@@ -35,7 +35,7 @@ class TrainConfig:
 
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
-    pytorch_model_name: Literal["pi0", "vlm2", "hybrid"] = "pi0"
+    pytorch_model_name: Literal["pi0", "vlm2", "subtask"] = "pi0"
 
     vlm2_geometry_dim: int = 512
     vlm2_view_dim: int = 512

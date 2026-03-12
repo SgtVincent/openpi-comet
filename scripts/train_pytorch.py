@@ -54,9 +54,9 @@ import tqdm
 
 import openpi.models.pi0_config
 import openpi.models.vlm2_vla_config
-import openpi.models.pi05_hybrid_config
+import openpi.models.pi05_subtask_config
 import openpi.models_pytorch.pi0_pytorch
-import openpi.models_pytorch.pi05_hybrid
+import openpi.models_pytorch.pi05_subtask
 import openpi.models.model as _model
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
@@ -667,7 +667,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
     if isinstance(config.model, openpi.models.vlm2_vla_config.VLM2VLAConfig):
         model_cfg = config.model
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
-    elif isinstance(config.model, openpi.models.pi05_hybrid_config.Pi05HybridConfig):
+    elif isinstance(config.model, openpi.models.pi05_subtask_config.Pi05SubtaskConfig):
         model_cfg = config.model
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
     elif not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
@@ -720,12 +720,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             freeze_image_encoder=getattr(model_cfg, "freeze_image_encoder", False),
         )
         model = _vlm2_model.VLM2WithPi05(vlm2_config).to(device)
-    elif config.pytorch_model_name == "hybrid":
+    elif config.pytorch_model_name == "subtask":
         alpha = getattr(model_cfg, "alpha", 10.0)
-        model = openpi.models_pytorch.pi05_hybrid.PI05HybridPytorch(
+        model = openpi.models_pytorch.pi05_subtask.PI05SubtaskPytorch(
             model_cfg,
             alpha=alpha,
-            action_expert_name="hybrid",
+            action_expert_name="subtask",
         ).to(device)
     else:
         model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
@@ -771,7 +771,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 "Skipping weight loading. Model will be randomly initialized."
             )
         else:
-            load_strict = config.pytorch_model_name not in ("vlm2", "hybrid")
+            load_strict = config.pytorch_model_name not in ("vlm2", "subtask")
             safetensors.torch.load_model(
                 (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
                 model_path,
@@ -907,7 +907,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 # Ensure losses is a tensor and handle different return types
                 extra_metrics = {}
                 if isinstance(losses, dict):
-                    # Hybrid model returns dict with 'loss', 'flow_loss', 'ce_loss'
+                    # Subtask model returns dict with 'loss', 'flow_loss', 'ce_loss'.
                     extra_metrics = {k: v.item() for k, v in losses.items() if k != "loss" and isinstance(v, torch.Tensor)}
                     loss = losses["loss"]
                 elif isinstance(losses, list | tuple):
@@ -1010,11 +1010,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                         gate_val = torch.tanh(_m.memory.memory_gate).item()
                         log_payload["vlm2/memory_gate"] = gate_val
 
-                    # Log hybrid model component losses if present
+                    # Log subtask model component losses if present.
                     for metric_key in ("flow_loss", "ce_loss"):
                         vals = [info[metric_key] for info in infos if metric_key in info]
                         if vals:
-                            log_payload[f"hybrid/{metric_key}"] = sum(vals) / len(vals)
+                            log_payload[f"subtask/{metric_key}"] = sum(vals) / len(vals)
 
                     wandb.log(log_payload, step=global_step)
 

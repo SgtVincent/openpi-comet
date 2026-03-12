@@ -1,4 +1,4 @@
-"""Hybrid action expert for PI05_HYBRID.
+"""Subtask action expert for PI05_SUBTASK.
 
 Extends GemmaTokenExpert to compute BOTH:
 1. Flow matching velocity field (continuous actions) via the action expert
@@ -19,7 +19,7 @@ from openpi.models_pytorch.action_experts.base import ActionExpert
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 
 
-class HybridActionExpert(ActionExpert):
+class SubtaskActionExpert(ActionExpert):
     """Action expert that returns both flow matching velocity and text logits."""
 
     def _embed_conditioning_subtask(
@@ -133,7 +133,7 @@ class HybridActionExpert(ActionExpert):
         suffix_out = suffix_out.to(dtype=torch.float32)
         return model.action_out_proj(suffix_out)
 
-    def compute_hybrid_loss_train(
+    def compute_subtask_loss_train(
         self,
         *,
         model: nn.Module,

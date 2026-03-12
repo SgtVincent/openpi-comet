@@ -387,17 +387,19 @@ class PromptFromLeRobotTask(DataTransformFn):
 class PromptFromLeRobotItem(DataTransformFn):
     """Extracts a prompt from the current LeRobot dataset task."""
 
+    include_subtask_text: bool = False
+
     def __call__(self, data: DataDict) -> DataDict:
-        result = {**data, "prompt": data.pop("task")}
-        # Pass through subtask_text if present (used by PI05_HYBRID)
-        if "subtask_text" in data:
-            result["subtask_text"] = data["subtask_text"]
+        result = {**data}
+        result["prompt"] = result.pop("task")
+        if not self.include_subtask_text:
+            result.pop("subtask_text", None)
         return result
 
 
 @dataclasses.dataclass(frozen=True)
-class TokenizeHybridInputs(DataTransformFn):
-    """Tokenize inputs for PI05_HYBRID model.
+class TokenizeSubtaskInputs(DataTransformFn):
+    """Tokenize inputs for the PI05_SUBTASK model.
 
     Produces:
     - tokenized_prompt + tokenized_prompt_mask: prefix tokens (task + state)
@@ -405,7 +407,7 @@ class TokenizeHybridInputs(DataTransformFn):
     - actions: continuous actions preserved for flow matching loss
     """
 
-    tokenizer: _tokenizer.HybridTokenizer
+    tokenizer: _tokenizer.SubtaskTokenizer
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -415,7 +417,7 @@ class TokenizeHybridInputs(DataTransformFn):
 
         state = data.get("state")
         if state is None:
-            raise ValueError("State is required for hybrid tokenization.")
+            raise ValueError("State is required for subtask tokenization.")
 
         # Tokenize the task prompt + state for the prefix
         prompt_tokens, prompt_mask = self.tokenizer.tokenize_prompt(prompt, state)

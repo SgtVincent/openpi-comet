@@ -373,8 +373,8 @@ class FSQTokenizer:
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
 
 
-class HybridTokenizer:
-    """Tokenizer for PI05_HYBRID model.
+class SubtaskTokenizer:
+    """Tokenizer for the PI05_SUBTASK model.
 
     Produces both:
     1. A prefix prompt+state token sequence (like PI05's PaligemmaTokenizer)

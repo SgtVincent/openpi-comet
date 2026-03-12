@@ -20,6 +20,10 @@ import openpi.transforms as _transforms
 T_co = TypeVar("T_co", covariant=True)
 
 
+def _include_subtask_text(model_config: _model.BaseModelConfig) -> bool:
+    return model_config.model_type == _model.ModelType.PI05_SUBTASK
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -128,7 +132,10 @@ def create_torch_dataset(
 
     if _behavior_dataset.is_behavior_dataset(data_config):
         dataset = _behavior_dataset.create_behavior_dataset(data_config, action_horizon=action_horizon)
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotItem()])
+        dataset = TransformedDataset(
+            dataset,
+            [_transforms.PromptFromLeRobotItem(include_subtask_text=_include_subtask_text(model_config))],
+        )
         return dataset
 
     try:
@@ -217,7 +224,10 @@ def create_data_loader(
             data_configs, sample_weights=config.sample_weights, action_horizon=config.model.action_horizon
         )
         data_config = data_configs[0]
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotItem()])
+        dataset = TransformedDataset(
+            dataset,
+            [_transforms.PromptFromLeRobotItem(include_subtask_text=_include_subtask_text(config.model))],
+        )
         dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
         sampler = None

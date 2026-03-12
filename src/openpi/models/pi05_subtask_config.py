@@ -1,6 +1,6 @@
-"""Configuration for the PI05 Hybrid model.
+"""Configuration for the PI05 subtask model.
 
-This config extends Pi0Config to support the combined loss from the π0.5 paper (Equation 1):
+This config extends the existing PI0.5 PyTorch path to support the combined loss:
     L = CE(text_logits, subtask_tokens) + alpha * flow_matching_loss
 
 The model produces both:
@@ -9,7 +9,6 @@ The model produces both:
 """
 
 import dataclasses
-from typing import TYPE_CHECKING
 
 import flax.nnx as nnx
 import jax
@@ -21,15 +20,12 @@ import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
-if TYPE_CHECKING:
-    pass
-
 
 PALIGEMMA_VOCAB_SIZE = 257_152
 
 
 @dataclasses.dataclass(frozen=True)
-class Pi05HybridConfig(_model.BaseModelConfig):
+class Pi05SubtaskConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
@@ -39,30 +35,28 @@ class Pi05HybridConfig(_model.BaseModelConfig):
     action_horizon: int = 50
     max_token_len: int = 512
 
-    # Subtask token sequence max length
+    # Subtask token sequence max length.
     subtask_max_len: int = 128
 
-    # Combined loss trade-off parameter (alpha in Eq. 1)
-    # Paper uses alpha=10.0 during post-training
+    # Combined loss trade-off parameter (alpha in Eq. 1).
     alpha: float = 10.0
 
-    # Pi05 settings (always True for hybrid)
+    # Pi05 settings.
     pi05: bool = True
     discrete_state_input: bool = True
 
-    # Vocab size for text logits head
+    # Vocab size for text logits head.
     vocab_size: int = PALIGEMMA_VOCAB_SIZE
 
     @property
     @override
     def model_type(self) -> _model.ModelType:
-        return _model.ModelType.PI05_HYBRID
+        return _model.ModelType.PI05_SUBTASK
 
     @override
     def create(self, rng: at.KeyArrayLike):
-        # JAX model creation - not implemented for hybrid (PyTorch only)
         raise NotImplementedError(
-            "PI05_HYBRID JAX model is not implemented. Use the PyTorch model via train_pytorch.py."
+            "PI05_SUBTASK JAX model is not implemented. Use the PyTorch model via train_pytorch.py."
         )
 
     @override
@@ -95,7 +89,6 @@ class Pi05HybridConfig(_model.BaseModelConfig):
         return observation_spec, action_spec
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
-        """Returns the freeze filter based on the model config."""
         filters = []
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
         action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")

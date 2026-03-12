@@ -1,4 +1,4 @@
-"""PI05 Hybrid PyTorch model."""
+"""PI05 subtask PyTorch model."""
 
 import dataclasses
 import logging
@@ -17,8 +17,8 @@ import sentencepiece
 logger = logging.getLogger("openpi")
 
 
-class PI05HybridPytorch(PI0Pytorch):
-    """PI05 Hybrid model with combined text CE + flow matching loss.
+class PI05SubtaskPytorch(PI0Pytorch):
+    """PI05 subtask model with combined text CE + flow matching loss.
 
     Inherits from PI0Pytorch and adds:
     - Subtask token embedding and processing in the VLM backbone
@@ -31,7 +31,7 @@ class PI05HybridPytorch(PI0Pytorch):
         config,
         *,
         alpha: float = 10.0,
-        action_expert_name: str = "hybrid",
+        action_expert_name: str = "subtask",
         action_expert_kwargs: dict[str, Any] | None = None,
     ):
         super().__init__(
@@ -135,8 +135,8 @@ class PI05HybridPytorch(PI0Pytorch):
         )
 
         if has_subtask:
-            # Use hybrid expert for combined forward pass
-            result = self.action_expert.compute_hybrid_loss_train(
+            # Use the subtask expert for the combined forward pass.
+            result = self.action_expert.compute_subtask_loss_train(
                 model=self,
                 images=images,
                 img_masks=img_masks,

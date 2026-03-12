@@ -441,7 +441,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
             item["task"] = self._get_fine_grained_task(item)
-            # Always include skill description (level 1) for hybrid training
+            # Always include skill description (level 1) for subtask training
             subtask_text = self._get_task_at_level(item, 1)
             if subtask_text is not None:
                 item["subtask_text"] = subtask_text
@@ -571,7 +571,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # Add task as a string
         item["task"] = self._get_fine_grained_task(item)
-        # Always include skill description (level 1) for hybrid training
+        # Always include skill description (level 1) for subtask training
         subtask_text = self._get_task_at_level(item, 1)
         if subtask_text is not None:
             item["subtask_text"] = subtask_text

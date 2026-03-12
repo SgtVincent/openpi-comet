@@ -1,5 +1,5 @@
 import openpi.models.pi0_config as pi0_config
-import openpi.models.pi05_hybrid_config
+import openpi.models.pi05_subtask_config
 from openpi.models.vlm2_vla_config import VLM2VLAConfig
 import openpi.training.optimizer as _optimizer
 from openpi.training.data_config import AssetsConfig, DataConfig, LeRobotB1KDataConfig
@@ -250,13 +250,13 @@ _PRETRAIN_CONFIGS = [
         num_workers=8,
         batch_size=8 * 32,
     ),
-    # --- PI05_HYBRID configs ---
+    # --- PI05_SUBTASK configs ---
     TrainConfig(
-        name="pi05_hybrid_b1k-pt50_cs32_bs64_lr2.5e-5_5ep",
+        name="pi05_subtask_b1k-pt50_cs32_bs64_lr2.5e-5_5ep",
         exp_name="openpi",
         project_name="B1K",
-        pytorch_model_name="hybrid",
-        model=openpi.models.pi05_hybrid_config.Pi05HybridConfig(
+        pytorch_model_name="subtask",
+        model=openpi.models.pi05_subtask_config.Pi05SubtaskConfig(
             alpha=10.0,
             subtask_max_len=128,
             action_horizon=32,

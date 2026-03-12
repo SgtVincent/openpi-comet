@@ -1,5 +1,5 @@
 import openpi.models.pi0_config as pi0_config
-import openpi.models.pi05_hybrid_config as pi05_hybrid_config
+import openpi.models.pi05_subtask_config as pi05_subtask_config
 from openpi.models.vlm2_vla_config import VLM2VLAConfig
 import openpi.training.optimizer as _optimizer
 from openpi.training.data_config import AssetsConfig, DataConfig, LeRobotB1KDataConfig
@@ -99,16 +99,16 @@ _SFT_MAKE_PIZZA_CONFIGS = [
             batch_size_per_gpu=12,
         ),
         TrainConfig(
-            name="pi05_hybrid_b1k-make_pizza_lr2.5e-6_5ep_sft",
+            name="pi05_subtask_b1k-make_pizza_lr2.5e-6_5ep_sft",
             exp_name="openpi",
             project_name="B1K",
-            model=pi05_hybrid_config.Pi05HybridConfig(
+            model=pi05_subtask_config.Pi05SubtaskConfig(
                 alpha=10.0,
                 subtask_max_len=128,
                 action_horizon=32,
                 max_token_len=512,
             ),
-            pytorch_model_name="hybrid",
+            pytorch_model_name="subtask",
             data=LeRobotB1KDataConfig(
                 repo_id="behavior-1k/2025-challenge-demos",
                 assets=AssetsConfig(

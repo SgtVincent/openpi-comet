@@ -3,6 +3,7 @@ import jax
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+import openpi.transforms as _transforms
 
 
 def test_torch_data_loader():
@@ -93,3 +94,34 @@ def test_create_data_loader_fake_jax_single_process():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_prompt_from_lerobot_item_drops_subtask_text_by_default():
+    transform = _transforms.PromptFromLeRobotItem()
+
+    data = transform({"task": "make_pizza", "subtask_text": "pick_up_dough", "state": 1})
+
+    assert data["prompt"] == "make_pizza"
+    assert "subtask_text" not in data
+    assert data["state"] == 1
+
+
+def test_prompt_from_lerobot_item_keeps_subtask_text_when_enabled():
+    transform = _transforms.PromptFromLeRobotItem(include_subtask_text=True)
+
+    data = transform({"task": "make_pizza", "subtask_text": "pick_up_dough"})
+
+    assert data["prompt"] == "make_pizza"
+    assert data["subtask_text"] == "pick_up_dough"
+
+
+def test_subtask_text_routing_matches_model_type():
+    baseline = _config.get_config("pi05_b1k-make_pizza_lr2.5e-6_5ep_sft")
+    subtask = _config.get_config("pi05_subtask_b1k-make_pizza_lr2.5e-6_5ep_sft")
+
+    assert baseline.model.model_type.name == "PI05"
+    assert not _data_loader._include_subtask_text(baseline.model)
+
+    assert subtask.model.model_type.name == "PI05_SUBTASK"
+    assert _data_loader._include_subtask_text(subtask.model)
+    assert subtask.pytorch_model_name == "subtask"

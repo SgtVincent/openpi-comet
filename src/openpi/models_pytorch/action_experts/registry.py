@@ -15,10 +15,10 @@ def create_action_expert(
     kwargs = {} if kwargs is None else dict(kwargs)
     if name == "gemma_token":
         return GemmaTokenExpert()
-    if name == "hybrid":
-        from openpi.models_pytorch.action_experts.hybrid_expert import HybridActionExpert
+    if name == "subtask":
+        from openpi.models_pytorch.action_experts.subtask_expert import SubtaskActionExpert
 
-        return HybridActionExpert()
+        return SubtaskActionExpert()
     if name == "il_moe_velocity":
         from openpi.models_pytorch.action_experts.il_moe_velocity_expert import IllibMoeVelocityFieldExpert
 

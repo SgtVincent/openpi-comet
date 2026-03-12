@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Smoke-test PI05_HYBRID data wiring and hierarchical inference.
+"""Smoke-test PI05_SUBTASK data wiring and hierarchical inference.
 
 This script validates two paths:
 1. Training-side sample/tokenization wiring: B1K sample -> subtask_text -> subtask token fields.
@@ -26,7 +26,7 @@ if str(SRC_ROOT) not in sys.path:
 import numpy as np
 import torch
 
-LOGGER = logging.getLogger("pi05_hybrid_test")
+LOGGER = logging.getLogger("pi05_subtask_test")
 
 
 def _trace(trace_file: pathlib.Path | None, message: str) -> None:
@@ -113,7 +113,7 @@ def _trace_model_load(message: str) -> None:
 
 
 @dataclasses.dataclass(frozen=True)
-class _HybridValidationDataConfig:
+class _SubtaskValidationDataConfig:
     asset_id: str
     norm_stats: dict[str, Any] | None
     repack_transforms: Any
@@ -123,7 +123,7 @@ class _HybridValidationDataConfig:
 
 
 @dataclasses.dataclass(frozen=True)
-class _HybridValidationDataFactory:
+class _SubtaskValidationDataFactory:
     repo_id: str
     behavior_dataset_root: str
     assets_dir: str
@@ -163,7 +163,7 @@ class _HybridValidationDataFactory:
             ),
         )
 
-    def create(self, assets_dirs: pathlib.Path, model_config) -> _HybridValidationDataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config) -> _SubtaskValidationDataConfig:
         from openpi.policies import b1k_policy
         import openpi.shared.download as _download
         import openpi.shared.normalize as _normalize
@@ -200,8 +200,8 @@ class _HybridValidationDataFactory:
             inputs=[
                 _transforms.InjectDefaultPrompt(None),
                 _transforms.ResizeImages(224, 224),
-                _transforms.TokenizeHybridInputs(
-                    _tokenizer.HybridTokenizer(
+                _transforms.TokenizeSubtaskInputs(
+                    _tokenizer.SubtaskTokenizer(
                         prompt_max_len=model_config.max_token_len,
                         subtask_max_len=model_config.subtask_max_len,
                     )
@@ -210,7 +210,7 @@ class _HybridValidationDataFactory:
             ],
             outputs=[],
         )
-        return _HybridValidationDataConfig(
+        return _SubtaskValidationDataConfig(
             asset_id=self.asset_id,
             norm_stats=norm_stats,
             repack_transforms=repack_transforms,
@@ -221,7 +221,7 @@ class _HybridValidationDataFactory:
 
 
 @dataclasses.dataclass(frozen=True)
-class _HybridValidationModelConfig:
+class _SubtaskValidationModelConfig:
     action_dim: int = 32
     action_horizon: int = 32
     max_token_len: int = 512
@@ -237,21 +237,21 @@ class _HybridValidationModelConfig:
     def model_type(self):
         from openpi.models import model as _model
 
-        return _model.ModelType.PI05_HYBRID
+        return _model.ModelType.PI05_SUBTASK
 
     def load_pytorch(self, train_config, weights_path: str):
         import safetensors.torch
 
         _trace_model_load("model_load:module_import_start")
-        from openpi.models_pytorch.pi05_hybrid import PI05HybridPytorch
+        from openpi.models_pytorch.pi05_subtask import PI05SubtaskPytorch
         _trace_model_load("model_load:module_import_done")
 
-        _trace_model_load("model_load:model_name:hybrid")
+        _trace_model_load("model_load:model_name:subtask")
         _trace_model_load("model_load:construct_start")
-        model = PI05HybridPytorch(
+        model = PI05SubtaskPytorch(
             self,
             alpha=self.alpha,
-            action_expert_name="hybrid",
+            action_expert_name="subtask",
         )
         _trace_model_load("model_load:construct_done")
         _trace_model_load("model_load:safetensors_start")
@@ -261,7 +261,7 @@ class _HybridValidationModelConfig:
 
 
 def _load_train_config(config_name: str):
-    if config_name != "pi05_hybrid_b1k-pt50_cs32_bs64_lr2.5e-5_5ep":
+    if config_name != "pi05_subtask_b1k-pt50_cs32_bs64_lr2.5e-5_5ep":
         from openpi.training import config as _config
 
         return _config.get_config(config_name)
@@ -281,8 +281,8 @@ def _load_train_config(config_name: str):
 
     return _LightweightTrainConfig(
         name=config_name,
-        model=_HybridValidationModelConfig(),
-        data=_HybridValidationDataFactory(
+        model=_SubtaskValidationModelConfig(),
+        data=_SubtaskValidationDataFactory(
             repo_id="behavior-1k/2025-challenge-demos",
             behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
             assets_dir="checkpoints/openpi_comet/pi05-b1kpt50-cs32/assets",
@@ -475,9 +475,9 @@ def _validate_training_wiring(train_config, raw_sample: dict[str, Any]) -> dict[
         raise AssertionError(f"Training pipeline missing keys: {missing}")
 
     if not np.any(transformed["subtask_mask"]):
-        raise AssertionError("subtask_mask is empty; hybrid CE supervision is not wired in.")
+        raise AssertionError("subtask_mask is empty; subtask CE supervision is not wired in.")
     if not np.any(transformed["subtask_loss_mask"]):
-        raise AssertionError("subtask_loss_mask is empty; hybrid CE loss would be disabled.")
+        raise AssertionError("subtask_loss_mask is empty; subtask CE loss would be disabled.")
 
     LOGGER.info(
         "Training wiring OK: prompt_tokens=%s subtask_tokens=%s state=%s",
@@ -558,14 +558,14 @@ def _run_training_smoke(
     _trace(trace_file, "train_smoke:forward_done")
 
     if not isinstance(losses, dict):
-        raise AssertionError(f"Expected hybrid training smoke to return a dict, got {type(losses)}")
+        raise AssertionError(f"Expected subtask training smoke to return a dict, got {type(losses)}")
     for key in ("loss", "flow_loss", "ce_loss"):
         if key not in losses:
-            raise AssertionError(f"Hybrid training smoke missing loss component: {key}")
+            raise AssertionError(f"Subtask training smoke missing loss component: {key}")
 
     loss = losses["loss"].float()
     if not torch.isfinite(loss):
-        raise AssertionError("Hybrid training smoke produced a non-finite total loss.")
+        raise AssertionError("Subtask training smoke produced a non-finite total loss.")
 
     loss.backward()
     _trace(trace_file, "train_smoke:backward_done")
@@ -694,8 +694,8 @@ def _resolve_inference_modes(args: argparse.Namespace) -> list[str]:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate PI05_HYBRID data wiring and hierarchical inference")
-    parser.add_argument("--config", type=str, default="pi05_hybrid_b1k-pt50_cs32_bs64_lr2.5e-5_5ep")
+    parser = argparse.ArgumentParser(description="Validate PI05_SUBTASK data wiring and hierarchical inference")
+    parser.add_argument("--config", type=str, default="pi05_subtask_b1k-pt50_cs32_bs64_lr2.5e-5_5ep")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--source", choices=("auto", "dataset", "dummy"), default="auto")
@@ -731,8 +731,8 @@ if __name__ == "__main__":
         train_config = _load_train_config(args.config)
         _trace(trace_file, f"config_loaded:{train_config.name}")
         model_type_name = getattr(train_config.model.model_type, "name", str(train_config.model.model_type))
-        if model_type_name != "PI05_HYBRID":
-            raise ValueError(f"Config {args.config!r} is not a PI05_HYBRID config.")
+        if model_type_name != "PI05_SUBTASK":
+            raise ValueError(f"Config {args.config!r} is not a PI05_SUBTASK config.")
 
         device = _resolve_device(args.device)
         checkpoint_dir = _resolve_checkpoint_dir(train_config, args.checkpoint)
@@ -763,7 +763,7 @@ if __name__ == "__main__":
             _trace(trace_file, "train_smoke_ok")
 
         if args.skip_infer:
-            LOGGER.info("PI05_HYBRID validation finished successfully.")
+            LOGGER.info("PI05_SUBTASK validation finished successfully.")
             _trace(trace_file, "validation_success")
             raise SystemExit(0)
 
@@ -793,7 +793,7 @@ if __name__ == "__main__":
             )
             _trace(trace_file, f"inference_ok:{inference_mode}")
 
-        LOGGER.info("PI05_HYBRID validation finished successfully.")
+        LOGGER.info("PI05_SUBTASK validation finished successfully.")
         _trace(trace_file, "validation_success")
     except Exception as exc:
         _trace(trace_file, f"validation_error:{type(exc).__name__}:{exc}")

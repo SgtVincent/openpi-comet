@@ -33,7 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
-    PI05_HYBRID = "pi05_hybrid"
+    PI05_SUBTASK = "pi05_subtask"
 
 
 # The model always expects these images
@@ -111,9 +111,9 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
-    # pi05-hybrid model specific fields.
+    # pi05-subtask model specific fields.
 
-    # Tokenized subtask text (ground truth for CE loss in hybrid model).
+    # Tokenized subtask text (ground truth for CE loss in subtask model).
     subtask_tokens: at.Int[ArrayT, "*b sl"] | None = None
 
     # Subtask token mask.
@@ -329,13 +329,13 @@ class BaseModelConfig(abc.ABC):
                     else None
                 ),
             )
-        elif pytorch_model_name == "hybrid":
-            from openpi.models_pytorch import pi05_hybrid as _pi05_hybrid
+        elif pytorch_model_name == "subtask":
+            from openpi.models_pytorch import pi05_subtask as _pi05_subtask
 
-            model = _pi05_hybrid.PI05HybridPytorch(
+            model = _pi05_subtask.PI05SubtaskPytorch(
                 config=train_config.model,
                 alpha=getattr(train_config.model, "alpha", 10.0),
-                action_expert_name="hybrid",
+                action_expert_name="subtask",
             )
         else:
             from openpi.models_pytorch import pi0_pytorch

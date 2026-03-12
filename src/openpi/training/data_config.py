@@ -24,6 +24,10 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 
 
+def _uses_subtask_text(model_type: _model.ModelType) -> bool:
+    return model_type == _model.ModelType.PI05_SUBTASK
+
+
 class DroidActionSpace(Enum):
     """Action space for DROID dataset."""
 
@@ -218,15 +222,15 @@ class ModelTransformFactory(GroupFactory):
                         ),
                     ],
                 )
-            case _model.ModelType.PI05_HYBRID:
+            case _model.ModelType.PI05_SUBTASK:
                 subtask_max_len = getattr(model_config, "subtask_max_len", 128)
                 return _transforms.Group(
                     inputs=[
                         *meta_input_transforms,
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizeHybridInputs(
-                            _tokenizer.HybridTokenizer(
+                        _transforms.TokenizeSubtaskInputs(
+                            _tokenizer.SubtaskTokenizer(
                                 prompt_max_len=model_config.max_token_len,
                                 subtask_max_len=subtask_max_len,
                             ),
@@ -301,18 +305,21 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_patterns = {
+            "observation/egocentric_camera": "observation.images.rgb.head",
+            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if _uses_subtask_text(model_config.model_type):
+            repack_patterns["subtask_text"] = "subtask_text"
+
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
-                    {
-                        "observation/egocentric_camera": "observation.images.rgb.head",
-                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                        "subtask_text": "subtask_text",
-                    }
+                    repack_patterns
                 )
             ]
         )
@@ -368,19 +375,22 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_patterns = {
+            "observation/egocentric_camera": "observation.images.rgb.head",
+            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/egocentric_depth": "observation.images.depth.head",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if _uses_subtask_text(model_config.model_type):
+            repack_patterns["subtask_text"] = "subtask_text"
+
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
-                    {
-                        "observation/egocentric_camera": "observation.images.rgb.head",
-                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
-                        "observation/egocentric_depth": "observation.images.depth.head",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                        "subtask_text": "subtask_text",
-                    }
+                    repack_patterns
                 )
             ]
         )
@@ -444,19 +454,22 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_patterns = {
+            "observation/egocentric_camera": "observation.images.rgb.head",
+            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/egocentric_seg": "observation.images.seg.head",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if _uses_subtask_text(model_config.model_type):
+            repack_patterns["subtask_text"] = "subtask_text"
+
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
-                    {
-                        "observation/egocentric_camera": "observation.images.rgb.head",
-                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
-                        "observation/egocentric_seg": "observation.images.seg.head",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                        "subtask_text": "subtask_text",
-                    }
+                    repack_patterns
                 )
             ]
         )
