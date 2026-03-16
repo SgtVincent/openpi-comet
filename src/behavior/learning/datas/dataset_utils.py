@@ -352,6 +352,47 @@ def _convert_episode(
     return out
 
 
+def convert_episode_annotation_to_subtasks(
+    *,
+    episode_ann: dict[str, Any],
+    episode_index: int | None,
+    subtask_template_path: str,
+    subtask_object_name_mapping_path: str,
+    subtask_joiner: str = " then ",
+) -> dict[str, Any]:
+    out: dict[str, Any] = {"episode_index": int(episode_index) if episode_index is not None else None}
+    for subtask_source, key in [("annotations_skill", "skill"), ("annotations_primitive", "primitive")]:
+        conv = SubtaskPhraseConverter(
+            subtask_source=subtask_source,
+            subtask_template_path=subtask_template_path,
+            subtask_object_name_mapping_path=subtask_object_name_mapping_path,
+            subtask_joiner=subtask_joiner,
+        )
+        items = []
+        anns = episode_ann.get("skill_annotation", []) if subtask_source == "annotations_skill" else episode_ann.get("primitive_annotation", [])
+        anns = anns or []
+        for i, a in enumerate(anns):
+            if not isinstance(a, dict):
+                continue
+            phrase = conv.phrase_from_skill_ann(a) if subtask_source == "annotations_skill" else conv.phrase_from_primitive_ann(a)
+            segs = [{"start_frame": int(s), "end_frame": int(e)} for s, e in _duration_to_segments(a.get("frame_duration"))]
+            items.append(
+                {
+                    "index": int(i),
+                    "phrase": phrase,
+                    "frame_duration": a.get("frame_duration"),
+                    "segments": segs,
+                    "skill_description": a.get("skill_description"),
+                    "primitive_description": a.get("primitive_description"),
+                    "object_id": a.get("object_id"),
+                    "manipulating_object_id": a.get("manipulating_object_id"),
+                }
+            )
+        merged, _ = conv.build_subtask_segments_for_episode(episode_ann)
+        out[key] = {"items": items, "merged_segments": [{"start_frame": s, "end_frame": e, "phrase": t} for s, e, t in merged]}
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", type=str, default=None)
