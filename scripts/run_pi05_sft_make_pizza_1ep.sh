@@ -35,7 +35,7 @@ else
 fi
 
 TASK_NAME="${TASK_NAME:-make_pizza}"
-CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-make_pizza_lr2.5e-6_5ep_sft}"
+CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-make_pizza_lr1e-4_5ep_sft}"
 MASTER_PORT="${MASTER_PORT:-29513}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 BASE_PI05_CKPT="${BASE_PI05_CKPT:-${REPO_ROOT}/checkpoints/pi05_base_pytorch}"

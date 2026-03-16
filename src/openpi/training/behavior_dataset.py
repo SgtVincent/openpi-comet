@@ -17,6 +17,11 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     args = {}
     if data_config.skill_list != ["all"]:
         args["skill_list"] = data_config.skill_list
+    if getattr(data_config, "subtask_source", "orchestrator") != "orchestrator":
+        args["subtask_source"] = data_config.subtask_source
+        args["subtask_template_path"] = data_config.subtask_template_path
+        args["subtask_object_name_mapping_path"] = data_config.subtask_object_name_mapping_path
+        args["subtask_joiner"] = data_config.subtask_joiner
 
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,

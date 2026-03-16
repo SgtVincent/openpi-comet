@@ -1,0 +1,398 @@
+{
+  "primitive": {
+    "attach": {
+      "fields": [
+        "obj"
+      ],
+      "template": "attach the {obj}"
+    },
+    "chop": {
+      "fields": [
+        "obj"
+      ],
+      "template": "chop the {obj}"
+    },
+    "close door": {
+      "fields": [
+        "target"
+      ],
+      "template": "close the {target}"
+    },
+    "close drawer": {
+      "fields": [
+        "target"
+      ],
+      "template": "close the {target}"
+    },
+    "close lid": {
+      "fields": [
+        "target"
+      ],
+      "template": "close the {target}"
+    },
+    "hand over": {
+      "fields": [
+        "obj"
+      ],
+      "template": "hand over the {obj}"
+    },
+    "hang": {
+      "fields": [
+        "obj"
+      ],
+      "template": "hang the {obj}"
+    },
+    "ignite": {
+      "fields": [
+        "obj"
+      ],
+      "template": "ignite the {obj}"
+    },
+    "insert": {
+      "fields": [
+        "obj"
+      ],
+      "template": "insert the {obj}"
+    },
+    "move to": {
+      "fields": [
+        "target"
+      ],
+      "template": "move to the {target}"
+    },
+    "open door": {
+      "fields": [
+        "target"
+      ],
+      "template": "open the {target}"
+    },
+    "open drawer": {
+      "fields": [
+        "target"
+      ],
+      "template": "open the {target}"
+    },
+    "open lid": {
+      "fields": [
+        "target"
+      ],
+      "template": "open the {target}"
+    },
+    "pick up from": {
+      "fields": [
+        "obj",
+        "src"
+      ],
+      "template": "pick up the {obj} from the {src}"
+    },
+    "place in": {
+      "fields": [
+        "obj",
+        "dst"
+      ],
+      "template": "place the {obj} in the {dst}"
+    },
+    "place in next to": {
+      "fields": [
+        "obj"
+      ],
+      "template": "place next to the {obj}"
+    },
+    "place on": {
+      "fields": [
+        "obj",
+        "dst"
+      ],
+      "template": "place the {obj} on the {dst}"
+    },
+    "place on next to": {
+      "fields": [
+        "obj"
+      ],
+      "template": "place next to the {obj}"
+    },
+    "place under": {
+      "fields": [
+        "obj"
+      ],
+      "template": "place under the {obj}"
+    },
+    "pour": {
+      "fields": [
+        "obj",
+        "dst"
+      ],
+      "template": "pour the {obj} onto the {dst}"
+    },
+    "press": {
+      "fields": [
+        "obj"
+      ],
+      "template": "press the {obj}"
+    },
+    "pull tray": {
+      "fields": [
+        "obj"
+      ],
+      "template": "pull out the {obj} tray"
+    },
+    "push to": {
+      "fields": [
+        "obj"
+      ],
+      "template": "push to the {obj}"
+    },
+    "spray": {
+      "fields": [
+        "dst"
+      ],
+      "template": "spray the {dst}"
+    },
+    "sweep surface": {
+      "fields": [
+        "obj"
+      ],
+      "template": "sweep the surface of the {obj}"
+    },
+    "tip over": {
+      "fields": [
+        "obj"
+      ],
+      "template": "tip over the {obj}"
+    },
+    "turn off switch": {
+      "fields": [
+        "obj"
+      ],
+      "template": "turn off the {obj}"
+    },
+    "turn on switch": {
+      "fields": [
+        "obj"
+      ],
+      "template": "turn on the {obj}"
+    },
+    "turn to": {
+      "fields": [
+        "obj"
+      ],
+      "template": "turn to the {obj}"
+    },
+    "wipe hard": {
+      "fields": [
+        "obj"
+      ],
+      "template": "wipe the {obj} firmly"
+    }
+  },
+  "skill": {
+    "attach": {
+      "fields": [
+        "obj"
+      ],
+      "template": "attach the {obj}"
+    },
+    "chop": {
+      "fields": [
+        "obj"
+      ],
+      "template": "chop the {obj}"
+    },
+    "close door": {
+      "fields": [
+        "target"
+      ],
+      "template": "close the {target}"
+    },
+    "close drawer": {
+      "fields": [
+        "target"
+      ],
+      "template": "close the {target}"
+    },
+    "close lid": {
+      "fields": [
+        "target"
+      ],
+      "template": "close the {target}"
+    },
+    "hand over": {
+      "fields": [
+        "obj"
+      ],
+      "template": "hand over the {obj}"
+    },
+    "hang": {
+      "fields": [
+        "obj"
+      ],
+      "template": "hang the {obj}"
+    },
+    "hold": {
+      "fields": [
+        "obj"
+      ],
+      "template": "hold the {obj}"
+    },
+    "ignite": {
+      "fields": [
+        "obj"
+      ],
+      "template": "ignite the {obj}"
+    },
+    "insert": {
+      "fields": [
+        "obj"
+      ],
+      "template": "insert the {obj}"
+    },
+    "move to": {
+      "fields": [
+        "target"
+      ],
+      "template": "move to the {target}"
+    },
+    "open door": {
+      "fields": [
+        "target"
+      ],
+      "template": "open the {target}"
+    },
+    "open drawer": {
+      "fields": [
+        "target"
+      ],
+      "template": "open the {target}"
+    },
+    "open lid": {
+      "fields": [
+        "target"
+      ],
+      "template": "open the {target}"
+    },
+    "pick up from": {
+      "fields": [
+        "obj",
+        "src"
+      ],
+      "template": "pick up the {obj} from the {src}"
+    },
+    "place in": {
+      "fields": [
+        "obj",
+        "dst"
+      ],
+      "template": "place the {obj} in the {dst}"
+    },
+    "place in next to": {
+      "fields": [
+        "obj"
+      ],
+      "template": "place next to the {obj}"
+    },
+    "place on": {
+      "fields": [
+        "obj",
+        "dst"
+      ],
+      "template": "place the {obj} on the {dst}"
+    },
+    "place on next to": {
+      "fields": [
+        "obj"
+      ],
+      "template": "place next to the {obj}"
+    },
+    "place under": {
+      "fields": [
+        "obj"
+      ],
+      "template": "place under the {obj}"
+    },
+    "pour": {
+      "fields": [
+        "obj",
+        "dst"
+      ],
+      "template": "pour the {obj} onto the {dst}"
+    },
+    "press": {
+      "fields": [
+        "obj"
+      ],
+      "template": "press the {obj}"
+    },
+    "pull tray": {
+      "fields": [
+        "obj"
+      ],
+      "template": "pull out the {obj} tray"
+    },
+    "push to": {
+      "fields": [
+        "obj"
+      ],
+      "template": "push to the {obj}"
+    },
+    "push tray": {
+      "fields": [
+        "obj"
+      ],
+      "template": "push in the {obj} tray"
+    },
+    "release": {
+      "fields": [
+        "obj"
+      ],
+      "template": "release the {obj}"
+    },
+    "spray": {
+      "fields": [
+        "dst"
+      ],
+      "template": "spray the {dst}"
+    },
+    "sweep off": {
+      "fields": [
+        "obj"
+      ],
+      "template": "sweep off the {obj}"
+    },
+    "sweep surface": {
+      "fields": [
+        "obj"
+      ],
+      "template": "sweep the surface of the {obj}"
+    },
+    "tip over": {
+      "fields": [
+        "obj"
+      ],
+      "template": "tip over the {obj}"
+    },
+    "turn off switch": {
+      "fields": [
+        "obj"
+      ],
+      "template": "turn off the {obj}"
+    },
+    "turn on switch": {
+      "fields": [
+        "obj"
+      ],
+      "template": "turn on the {obj}"
+    },
+    "turn to": {
+      "fields": [
+        "obj"
+      ],
+      "template": "turn to the {obj}"
+    },
+    "wipe hard": {
+      "fields": [
+        "obj"
+      ],
+      "template": "wipe the {obj} firmly"
+    }
+  }
+}

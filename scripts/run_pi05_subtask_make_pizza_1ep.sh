@@ -30,7 +30,7 @@ else
   NPROC_PER_NODE="${NPROC_PER_NODE:-$(nvidia-smi -L | wc -l)}"
 fi
 
-CONFIG_NAME="${CONFIG_NAME:-pi05_subtask_b1k-make_pizza_lr2.5e-6_5ep_sft}"
+CONFIG_NAME="${CONFIG_NAME:-pi05_subtask_b1k-make_pizza_lr1e-4_5ep_sft}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 LOG_INTERVAL="${LOG_INTERVAL:-20}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"

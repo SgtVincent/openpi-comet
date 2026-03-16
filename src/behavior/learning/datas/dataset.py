@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import time
 
 import datasets
@@ -44,6 +45,8 @@ import packaging.version
 import torch as th
 from torch.utils.data import Dataset
 from torch.utils.data import get_worker_info
+
+from behavior.learning.datas.dataset_utils import SubtaskPhraseConverter
 
 ANNOTATIONS_PATH = "annotations"
 ORCHESTRATORS_PATH = "orchestrators"
@@ -91,6 +94,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        subtask_source: str = "orchestrator",  # orchestrator | annotations_primitive | annotations_skill
+        subtask_template_path: str | Path | None = None,
+        subtask_object_name_mapping_path: str | Path | None = None,
+        subtask_joiner: str = " then ",
     ):
         """
         Custom args:
@@ -135,6 +142,16 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self.subtask_source = subtask_source
+        self.subtask_template_path = Path(subtask_template_path) if subtask_template_path is not None else None
+        self.subtask_object_name_mapping_path = (
+            Path(subtask_object_name_mapping_path) if subtask_object_name_mapping_path is not None else None
+        )
+        self.subtask_joiner = subtask_joiner
+        self._subtask_templates = None
+        self._subtask_object_name_mapping = None
+        self._subtask_segments = {}
+        self._subtask_segment_ends = {}
 
         # Unused attributes
         self.image_writer = None
@@ -239,6 +256,165 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.prepare_task(fine_grained_level)
 
         self.omnigibson_mapping = {ep_idx: defaultdict(dict) for ep_idx in self.episodes}
+        self._init_subtask_assets()
+
+    def _init_subtask_assets(self):
+        self._subtask_phrase_converter = None
+        if self.subtask_source == "orchestrator":
+            return
+        if self.subtask_template_path is None:
+            raise ValueError("subtask_template_path is required when subtask_source is not orchestrator")
+        if self.subtask_object_name_mapping_path is None:
+            raise ValueError("subtask_object_name_mapping_path is required when subtask_source is not orchestrator")
+        with open(self.subtask_template_path, "r", encoding="utf-8") as f:
+            self._subtask_templates = json.load(f)
+        with open(self.subtask_object_name_mapping_path, "r", encoding="utf-8") as f:
+            self._subtask_object_name_mapping = json.load(f)
+        self._subtask_phrase_converter = SubtaskPhraseConverter(
+            subtask_source=self.subtask_source,
+            subtask_template_path=None,
+            subtask_object_name_mapping_path=None,
+            subtask_templates=self._subtask_templates,
+            object_name_mapping=self._subtask_object_name_mapping,
+            subtask_joiner=self.subtask_joiner,
+        )
+
+    def _subtask_obj_name(self, raw_id: str | None) -> str | None:
+        if raw_id is None:
+            return None
+        s = str(raw_id).strip()
+        if not s:
+            return None
+        if self._subtask_object_name_mapping is not None and s in self._subtask_object_name_mapping:
+            v = self._subtask_object_name_mapping.get(s)
+            if v is None:
+                return None
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return self._canonicalize_object_id_fallback(s)
+
+    def _canonicalize_object_id_fallback(self, obj_id: str) -> str | None:
+        s = str(obj_id).strip()
+        if not s:
+            return None
+        if s.lower() in {"left", "right"}:
+            return None
+        if s.startswith("[") and s.endswith("]"):
+            return None
+        s = s.replace("-", "_")
+        parts = [p for p in s.split("_") if p]
+        if not parts:
+            return None
+        while parts and re.fullmatch(r"\d+", parts[-1]):
+            parts.pop()
+        phrase = " ".join(parts).strip().lower()
+        phrase = re.sub(r"\s+", " ", phrase)
+        return phrase if phrase else None
+
+    def _subtask_flatten(self, x):
+        if x is None:
+            return []
+        if isinstance(x, (list, tuple)):
+            out = []
+            for y in x:
+                out.extend(self._subtask_flatten(y))
+            return out
+        return [x]
+
+    def _subtask_first_text(self, x) -> str | None:
+        for y in self._subtask_flatten(x):
+            if y is None:
+                continue
+            s = str(y).strip()
+            if s:
+                return s
+        return None
+
+    def _duration_to_segments(self, dur):
+        if isinstance(dur, list) and len(dur) == 2 and all(isinstance(z, (int, np.integer)) for z in dur):
+            return [(int(dur[0]), int(dur[1]))]
+        if isinstance(dur, list) and dur and all(isinstance(z, list) and len(z) == 2 for z in dur):
+            out = []
+            for z in dur:
+                if all(isinstance(t, (int, np.integer)) for t in z):
+                    out.append((int(z[0]), int(z[1])))
+            return out
+        ints = [int(z) for z in self._subtask_flatten(dur) if isinstance(z, (int, np.integer))]
+        if len(ints) >= 2:
+            return [(min(ints), max(ints))]
+        return []
+
+    def _extract_main_target(self, object_id_val):
+        if isinstance(object_id_val, list) and object_id_val and isinstance(object_id_val[0], list):
+            g = object_id_val[0]
+            if isinstance(g, list) and len(g) >= 2:
+                if len(g) >= 3:
+                    return self._subtask_first_text(g[0]), self._subtask_first_text(g[-1])
+                return self._subtask_first_text(g[0]), self._subtask_first_text(g[1])
+            if isinstance(g, list) and len(g) == 1:
+                return self._subtask_first_text(g[0]), None
+        flat = [self._subtask_first_text(object_id_val)] if object_id_val is not None else []
+        flat = [x for x in flat if x]
+        if not flat:
+            return None, None
+        if len(flat) == 1:
+            return flat[0], None
+        return flat[0], flat[-1]
+
+    def _apply_template(self, template: dict, **kwargs) -> str:
+        s = template.get("template", "")
+        if not s:
+            return ""
+        for k, v in kwargs.items():
+            s = s.replace("{" + k + "}", v or "")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _phrase_for_action(self, action: str, obj: str | None, src: str | None, dst: str | None, target: str | None):
+        if self._subtask_templates is None:
+            return ""
+        tpl = self._subtask_templates.get("skill", {}).get(action) or self._subtask_templates.get("primitive", {}).get(
+            action
+        )
+        if tpl is None:
+            return ""
+        return self._apply_template(tpl, obj=obj, src=src, dst=dst, target=target, verb=action.lower())
+
+    def _phrase_from_skill_ann(self, ann: dict) -> str | None:
+        if self._subtask_phrase_converter is None:
+            return None
+        return self._subtask_phrase_converter.phrase_from_skill_ann(ann)
+
+    def _phrase_from_primitive_ann(self, ann: dict) -> str | None:
+        if self._subtask_phrase_converter is None:
+            return None
+        return self._subtask_phrase_converter.phrase_from_primitive_ann(ann)
+
+    def _build_subtask_segments_for_episode(self, ep_idx: int):
+        ann = self.meta.annotations.get(ep_idx)
+        if not isinstance(ann, dict) or self._subtask_phrase_converter is None:
+            return [], []
+        return self._subtask_phrase_converter.build_subtask_segments_for_episode(ann)
+
+    def _get_subtask_text(self, item: dict) -> str | None:
+        if self.subtask_source == "orchestrator":
+            return self._get_task_at_level(item, 1)
+        ep_idx = item["episode_index"].item()
+        frame_index = round(item["timestamp"].item() * self.fps)
+        if ep_idx not in self._subtask_segments:
+            segs, ends = self._build_subtask_segments_for_episode(ep_idx)
+            self._subtask_segments[ep_idx] = segs
+            self._subtask_segment_ends[ep_idx] = ends
+        segs = self._subtask_segments[ep_idx]
+        ends = self._subtask_segment_ends[ep_idx]
+        if not segs:
+            return self._get_task_at_level(item, 1)
+        i = bisect.bisect_left(ends, frame_index)
+        if 0 <= i < len(segs):
+            s, e, t = segs[i]
+            if s <= frame_index <= e:
+                return t
+        return self._get_task_at_level(item, 1)
 
     def prepare_task(self, fine_grained_level: int):
         """set train subtask mode for lerobot dataset"""
@@ -441,8 +617,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
             item["task"] = self._get_fine_grained_task(item)
-            # Always include skill description (level 1) for subtask training
-            subtask_text = self._get_task_at_level(item, 1)
+            subtask_text = self._get_subtask_text(item)
             if subtask_text is not None:
                 item["subtask_text"] = subtask_text
             return item
@@ -571,8 +746,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # Add task as a string
         item["task"] = self._get_fine_grained_task(item)
-        # Always include skill description (level 1) for subtask training
-        subtask_text = self._get_task_at_level(item, 1)
+        subtask_text = self._get_subtask_text(item)
         if subtask_text is not None:
             item["subtask_text"] = subtask_text
         self.current_streaming_frame_idx += 1

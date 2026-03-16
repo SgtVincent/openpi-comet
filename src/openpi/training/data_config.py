@@ -132,6 +132,11 @@ class DataConfig:
     # skill list to use for training
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
 
+    subtask_source: str = "orchestrator"
+    subtask_template_path: str | None = None
+    subtask_object_name_mapping_path: str | None = None
+    subtask_joiner: str = " then "
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
