@@ -17,6 +17,10 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     args = {}
     if data_config.skill_list != ["all"]:
         args["skill_list"] = data_config.skill_list
+    if getattr(data_config, "resample_group_by", None) is not None:
+        args["resample_group_by"] = data_config.resample_group_by
+        args["resample_weights"] = getattr(data_config, "resample_weights", None)
+        args["resample_default_weight"] = float(getattr(data_config, "resample_default_weight", 1.0))
     if getattr(data_config, "subtask_source", "orchestrator") != "orchestrator":
         args["subtask_source"] = data_config.subtask_source
         args["subtask_template_path"] = data_config.subtask_template_path

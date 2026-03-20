@@ -287,7 +287,7 @@ class BaseModelConfig(abc.ABC):
         pytorch_model_name = getattr(train_config, "pytorch_model_name", "pi0")
         _trace(f"model_load:model_name:{pytorch_model_name}")
         _trace("model_load:build_model_start")
-        if pytorch_model_name == "vlm2":
+        if pytorch_model_name in ("vlm2", "vlm2_subtask"):
             from openpi.models_pytorch.vlm2 import vlm2_model as _vlm2_model
 
             model_cfg = train_config.model
@@ -320,15 +320,21 @@ class BaseModelConfig(abc.ABC):
                 freeze_vggt_backbone=getattr(model_cfg, "freeze_vggt_backbone", False),
                 freeze_image_encoder=getattr(model_cfg, "freeze_image_encoder", False),
             )
-            model = _vlm2_model.VLM2WithPi05(
-                vlm2_config,
-                action_expert_name=getattr(expert_cfg, "name", "gemma_token"),
-                action_expert_kwargs=(
-                    dataclasses.asdict(getattr(expert_cfg, "il_moe_velocity"))
-                    if getattr(expert_cfg, "name", "gemma_token") == "il_moe_velocity"
-                    else None
-                ),
-            )
+            if pytorch_model_name == "vlm2_subtask":
+                model = _vlm2_model.VLM2SubtaskWithPi05(
+                    vlm2_config,
+                    alpha=getattr(model_cfg, "alpha", 10.0),
+                )
+            else:
+                model = _vlm2_model.VLM2WithPi05(
+                    vlm2_config,
+                    action_expert_name=getattr(expert_cfg, "name", "gemma_token"),
+                    action_expert_kwargs=(
+                        dataclasses.asdict(getattr(expert_cfg, "il_moe_velocity"))
+                        if getattr(expert_cfg, "name", "gemma_token") == "il_moe_velocity"
+                        else None
+                    ),
+                )
         elif pytorch_model_name == "subtask":
             from openpi.models_pytorch import pi05_subtask as _pi05_subtask
 

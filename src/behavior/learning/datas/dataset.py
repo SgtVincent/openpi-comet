@@ -46,7 +46,7 @@ import torch as th
 from torch.utils.data import Dataset
 from torch.utils.data import get_worker_info
 
-from behavior.learning.datas.dataset_utils import SubtaskPhraseConverter
+from behavior.learning.datas.dataset_utils import SubtaskPhraseConverter, _duration_to_segments
 
 ANNOTATIONS_PATH = "annotations"
 ORCHESTRATORS_PATH = "orchestrators"
@@ -94,6 +94,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        resample_group_by: str | None = None,  # None | task_skill | skill_type | skill_description
+        resample_weights: dict[str, float] | None = None,
+        resample_default_weight: float = 1.0,
         subtask_source: str = "orchestrator",  # orchestrator | annotations_primitive | annotations_skill
         subtask_template_path: str | Path | None = None,
         subtask_object_name_mapping_path: str | Path | None = None,
@@ -142,6 +145,18 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self.resample_group_by = None if resample_group_by is None else str(resample_group_by)
+        self.resample_weights = (
+            None if resample_weights is None else {str(k): float(v) for k, v in dict(resample_weights).items()}
+        )
+        self.resample_default_weight = float(resample_default_weight)
+        if self.resample_weights is None:
+            self._resample_weight_norm = 1.0
+        else:
+            self._resample_weight_norm = max(
+                1.0,
+                float(max([self.resample_default_weight, *list(self.resample_weights.values())])),
+            )
         self.subtask_source = subtask_source
         self.subtask_template_path = Path(subtask_template_path) if subtask_template_path is not None else None
         self.subtask_object_name_mapping_path = (
@@ -152,6 +167,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self._subtask_object_name_mapping = None
         self._subtask_segments = {}
         self._subtask_segment_ends = {}
+        self._resample_skill_segments = {}
+        self._resample_skill_segment_ends = {}
+        self._accept_rng = None
 
         # Unused attributes
         self.image_writer = None
@@ -633,6 +651,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
             global_num_workers = max(1, num_workers * world_size)
             global_worker_id = ddp_rank * num_workers + worker_id
+            if self._accept_rng is None:
+                self._accept_rng = random.Random(self.seed + 1000003 * global_worker_id + 17)
             if not hasattr(self, "_active_chunks") or self._active_chunks is None:
                 # Use a global worker id across all ranks so chunk ownership is
                 # partitioned across GPUs instead of duplicated per-rank.
@@ -708,9 +728,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             for key, val in query_result.items():
                 item[key] = val
 
-        task_skill = self._get_current_task_skill(item)
-        weight = skill_weight(task_skill, self.skill_list)
-        if not random.choices([True, False], weights=[weight, 1 - weight])[0]:
+        weight = self._get_resample_weight(item)
+        if self._accept_rng is not None and self._accept_rng.random() >= weight:
             self.current_streaming_frame_idx += 1
             for key in self.meta.video_keys:
                 next(self.obs_loaders[key])[0]
@@ -752,6 +771,74 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.current_streaming_frame_idx += 1
 
         return item
+
+    def _get_resample_key_from_skill_ann(self, item: dict) -> tuple[str | None, str | None]:
+        if self.resample_group_by not in {"skill_type", "skill_description"}:
+            return None, None
+        ep_idx = item["episode_index"].item()
+        frame_index = round(item["timestamp"].item() * self.fps)
+        if ep_idx not in self._resample_skill_segments:
+            ann = self.meta.annotations.get(ep_idx)
+            segs = []
+            if isinstance(ann, dict):
+                for a in ann.get("skill_annotation", []) or []:
+                    if not isinstance(a, dict):
+                        continue
+                    skill_type = a.get("skill_type", "")
+                    if skill_type is None:
+                        skill_type = ""
+                    skill_desc = ""
+                    desc_list = a.get("skill_description", []) or []
+                    if isinstance(desc_list, list):
+                        for d in desc_list:
+                            if isinstance(d, str) and d.strip():
+                                skill_desc = d.strip()
+                                break
+                    for s, e in _duration_to_segments(a.get("frame_duration")):
+                        segs.append((int(s), int(e), str(skill_type), str(skill_desc)))
+            segs.sort(key=lambda x: (x[0], x[1]))
+            ends = [e for _, e, _, _ in segs]
+            self._resample_skill_segments[ep_idx] = segs
+            self._resample_skill_segment_ends[ep_idx] = ends
+        segs = self._resample_skill_segments[ep_idx]
+        ends = self._resample_skill_segment_ends[ep_idx]
+        if not segs:
+            return "", ""
+        i = bisect.bisect_left(ends, frame_index)
+        if 0 <= i < len(segs):
+            s, e, stype, sdesc = segs[i]
+            if s <= frame_index <= e:
+                return stype, sdesc
+        return "", ""
+
+    def _get_resample_weight(self, item: dict) -> float:
+        group_by = self.resample_group_by
+        weights = self.resample_weights
+        default_weight = float(self.resample_default_weight)
+        weight = 1.0
+        if group_by is None:
+            task_skill = self._get_current_task_skill(item)
+            weight = skill_weight(task_skill, self.skill_list)
+        elif group_by == "task_skill":
+            task_skill = self._get_current_task_skill(item)
+            if weights is None:
+                weight = skill_weight(task_skill, self.skill_list)
+            else:
+                weight = float(weights.get(str(task_skill), default_weight)) / float(self._resample_weight_norm)
+        elif group_by in {"skill_type", "skill_description"}:
+            skill_type, skill_desc = self._get_resample_key_from_skill_ann(item)
+            key = skill_type if group_by == "skill_type" else skill_desc
+            if weights is None:
+                weight = default_weight
+            else:
+                weight = float(weights.get(str(key), default_weight)) / float(self._resample_weight_norm)
+        else:
+            raise ValueError(f"Unsupported resample_group_by={group_by}")
+        if weight <= 0.0:
+            return 0.0
+        if weight >= 1.0:
+            return 1.0
+        return float(weight)
 
     def _get_current_task_skill(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()

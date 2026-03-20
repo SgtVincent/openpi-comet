@@ -35,7 +35,7 @@ class TrainConfig:
 
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
-    pytorch_model_name: Literal["pi0", "vlm2", "subtask"] = "pi0"
+    pytorch_model_name: Literal["pi0", "vlm2", "vlm2_subtask", "subtask"] = "pi0"
 
     vlm2_geometry_dim: int = 512
     vlm2_view_dim: int = 512

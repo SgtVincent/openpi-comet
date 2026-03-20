@@ -462,7 +462,13 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
-def _prepare_vlm2_inputs(observation, config: _config.TrainConfig, device: torch.device):
+def _prepare_vlm2_inputs(
+    observation,
+    config: _config.TrainConfig,
+    device: torch.device,
+    *,
+    include_subtask: bool = False,
+):
     image_keys = _model.IMAGE_KEYS
     frames = [observation.images[k] for k in image_keys if k in observation.images]
     if not frames:
@@ -499,7 +505,23 @@ def _prepare_vlm2_inputs(observation, config: _config.TrainConfig, device: torch
     if language_tokens is None or language_masks is None:
         raise ValueError("tokenized_prompt and tokenized_prompt_mask are required for VLM2 training.")
 
-    return video_frames, point_maps, language_tokens, language_masks
+    if not include_subtask:
+        return video_frames, point_maps, language_tokens, language_masks
+
+    subtask_tokens = getattr(observation, "subtask_tokens", None)
+    subtask_mask = getattr(observation, "subtask_mask", None)
+    subtask_ar_mask = getattr(observation, "subtask_ar_mask", None)
+    subtask_loss_mask = getattr(observation, "subtask_loss_mask", None)
+    return (
+        video_frames,
+        point_maps,
+        language_tokens,
+        language_masks,
+        subtask_tokens,
+        subtask_mask,
+        subtask_ar_mask,
+        subtask_loss_mask,
+    )
 
 
 def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
@@ -686,8 +708,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    use_vlm2 = config.pytorch_model_name == "vlm2"
-    if use_vlm2:
+    use_vlm2 = config.pytorch_model_name in ("vlm2", "vlm2_subtask")
+    if config.pytorch_model_name in ("vlm2", "vlm2_subtask"):
         import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
 
         vlm2_config = _vlm2_model.VLM2Config(
@@ -719,7 +741,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             freeze_vggt_backbone=getattr(model_cfg, "freeze_vggt_backbone", False),
             freeze_image_encoder=getattr(model_cfg, "freeze_image_encoder", False),
         )
-        model = _vlm2_model.VLM2WithPi05(vlm2_config).to(device)
+        if config.pytorch_model_name == "vlm2_subtask":
+            alpha = getattr(model_cfg, "alpha", 10.0)
+            model = _vlm2_model.VLM2SubtaskWithPi05(vlm2_config, alpha=alpha).to(device)
+        else:
+            model = _vlm2_model.VLM2WithPi05(vlm2_config).to(device)
     elif config.pytorch_model_name == "subtask":
         alpha = getattr(model_cfg, "alpha", 10.0)
         model = openpi.models_pytorch.pi05_subtask.PI05SubtaskPytorch(
@@ -771,7 +797,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 "Skipping weight loading. Model will be randomly initialized."
             )
         else:
-            load_strict = config.pytorch_model_name not in ("vlm2", "subtask")
+            load_strict = config.pytorch_model_name not in ("vlm2", "vlm2_subtask", "subtask")
             safetensors.torch.load_model(
                 (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
                 model_path,
@@ -892,16 +918,39 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             use_autocast = config.pytorch_training_precision == "bfloat16" and device.type == "cuda"
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_autocast):
                 if use_vlm2:
-                    video_frames, point_maps, language_tokens, language_masks = _prepare_vlm2_inputs(
-                        observation, config, device
-                    )
-                    losses = model(
-                        video_frames=video_frames,
-                        point_maps=point_maps,
-                        language_tokens=language_tokens,
-                        language_masks=language_masks,
-                        actions=actions,
-                    )
+                    if config.pytorch_model_name == "vlm2_subtask":
+                        (
+                            video_frames,
+                            point_maps,
+                            language_tokens,
+                            language_masks,
+                            subtask_tokens,
+                            subtask_mask,
+                            subtask_ar_mask,
+                            subtask_loss_mask,
+                        ) = _prepare_vlm2_inputs(observation, config, device, include_subtask=True)
+                        losses = model(
+                            video_frames=video_frames,
+                            point_maps=point_maps,
+                            language_tokens=language_tokens,
+                            language_masks=language_masks,
+                            actions=actions,
+                            subtask_tokens=subtask_tokens,
+                            subtask_mask=subtask_mask,
+                            subtask_ar_mask=subtask_ar_mask,
+                            subtask_loss_mask=subtask_loss_mask,
+                        )
+                    else:
+                        video_frames, point_maps, language_tokens, language_masks = _prepare_vlm2_inputs(
+                            observation, config, device
+                        )
+                        losses = model(
+                            video_frames=video_frames,
+                            point_maps=point_maps,
+                            language_tokens=language_tokens,
+                            language_masks=language_masks,
+                            actions=actions,
+                        )
                 else:
                     losses = model(observation, actions)
                 # Ensure losses is a tensor and handle different return types

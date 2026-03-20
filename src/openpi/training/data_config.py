@@ -132,6 +132,10 @@ class DataConfig:
     # skill list to use for training
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
 
+    resample_group_by: str | None = None
+    resample_weights: dict[str, float] | None = None
+    resample_default_weight: float = 1.0
+
     subtask_source: str = "orchestrator"
     subtask_template_path: str | None = None
     subtask_object_name_mapping_path: str | None = None

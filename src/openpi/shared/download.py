@@ -21,6 +21,8 @@ if not hasattr(datetime, "UTC"):
 # Environment variable to control cache directory path, ~/.cache/openpi will be used by default.
 _OPENPI_DATA_HOME = "OPENPI_DATA_HOME"
 DEFAULT_CACHE_DIR = "~/.cache/openpi"
+_OPENPI_DOWNLOAD_TIMEOUT_S = "OPENPI_DOWNLOAD_TIMEOUT_S"
+DEFAULT_DOWNLOAD_TIMEOUT_S = 60.0
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,13 @@ def get_cache_dir() -> pathlib.Path:
     return cache_dir
 
 
-def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathlib.Path:
+def maybe_download(
+    url: str,
+    *,
+    force_download: bool = False,
+    timeout_s: float | None = None,
+    **kwargs,
+) -> pathlib.Path:
     """Download a file or directory from a remote filesystem to the local cache, and return the local path.
 
     If the local file already exists, it will be returned directly.
@@ -57,6 +65,11 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
         if not path.exists():
             raise FileNotFoundError(f"File not found at {url}")
         return path.resolve()
+
+    if timeout_s is None:
+        timeout_s = float(os.getenv(_OPENPI_DOWNLOAD_TIMEOUT_S, str(DEFAULT_DOWNLOAD_TIMEOUT_S)))
+    if timeout_s is not None and timeout_s <= 0:
+        timeout_s = None
 
     cache_dir = get_cache_dir()
 
@@ -87,7 +100,7 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
             # Download the data to a local cache.
             logger.info(f"Downloading {url} to {local_path}")
             scratch_path = local_path.with_suffix(".partial")
-            _download_fsspec(url, scratch_path, **kwargs)
+            _download_fsspec(url, scratch_path, timeout_s=timeout_s, **kwargs)
 
             shutil.move(scratch_path, local_path)
             _ensure_permissions(local_path)
@@ -102,23 +115,47 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
     return local_path
 
 
-def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
+def _download_fsspec(url: str, local_path: pathlib.Path, timeout_s: float | None = None, **kwargs) -> None:
     """Download a file from a remote filesystem to the local cache, and return the local path."""
     fs, _ = fsspec.core.url_to_fs(url, **kwargs)
-    info = fs.info(url)
-    # Folders are represented by 0-byte objects with a trailing forward slash.
-    if is_dir := (info["type"] == "directory" or (info["size"] == 0 and info["name"].endswith("/"))):
-        total_size = fs.du(url)
-    else:
-        total_size = info["size"]
-    with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(fs.get, url, local_path, recursive=is_dir)
-        while not future.done():
-            current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
-            pbar.update(current_size - pbar.n)
-            time.sleep(1)
-        pbar.update(total_size - pbar.n)
+    start_t = time.monotonic()
+
+    def _remaining() -> float | None:
+        if timeout_s is None:
+            return None
+        remain = float(timeout_s) - (time.monotonic() - start_t)
+        return max(0.0, remain)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        info_future = executor.submit(fs.info, url)
+        try:
+            info = info_future.result(timeout=_remaining())
+        except concurrent.futures.TimeoutError as e:
+            raise TimeoutError(f"Download timed out after {timeout_s}s while reading metadata for {url}") from e
+
+        is_dir = info["type"] == "directory" or (info["size"] == 0 and info["name"].endswith("/"))
+        if is_dir:
+            du_future = executor.submit(fs.du, url)
+            try:
+                total_size = du_future.result(timeout=_remaining())
+            except concurrent.futures.TimeoutError as e:
+                raise TimeoutError(f"Download timed out after {timeout_s}s while sizing directory {url}") from e
+        else:
+            total_size = info["size"]
+
+        with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
+            future = executor.submit(fs.get, url, local_path, recursive=is_dir)
+            while True:
+                try:
+                    if future.done():
+                        future.result()
+                        break
+                except Exception:
+                    raise
+                current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
+                pbar.update(current_size - pbar.n)
+                time.sleep(1)
+            pbar.update(total_size - pbar.n)
 
 
 def _set_permission(path: pathlib.Path, target_permission: int):

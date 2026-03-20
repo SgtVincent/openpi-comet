@@ -72,6 +72,9 @@ class VLM2Config:
     episodic_memory_capacity: int = 32  # Le
     episodic_similarity_threshold: float = 0.7  # τ
     episodic_fusion_alpha: float = 0.5  # α
+
+    sem_geo_fusion_tanh_gate_enable: bool = False
+    sem_geo_fusion_tanh_gate_init_alpha: float = 0.0
     
     # Attention settings
     num_heads: int = 8
@@ -762,6 +765,166 @@ class VLM2WithPi05(nn.Module):
             Dictionary with memory statistics
         """
         return self.memory.get_memory_stats()
+
+
+class VLM2SubtaskWithPi05(VLM2WithPi05):
+    def __init__(self, config: VLM2Config, *, alpha: float = 10.0):
+        super().__init__(config)
+        self.alpha = alpha
+
+    def make_att_2d_masks(self, pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch.Tensor:
+        assert make_att_2d_masks is not None
+        return make_att_2d_masks(pad_masks, att_masks)
+
+    def forward(
+        self,
+        video_frames: torch.Tensor,
+        point_maps: torch.Tensor,
+        language_tokens: torch.Tensor,
+        language_masks: torch.Tensor,
+        actions: torch.Tensor,
+        *,
+        subtask_tokens: torch.Tensor | None = None,
+        subtask_mask: torch.Tensor | None = None,
+        subtask_ar_mask: torch.Tensor | None = None,
+        subtask_loss_mask: torch.Tensor | None = None,
+        noise: Optional[torch.Tensor] = None,
+        time: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        batch_size = actions.shape[0]
+        device = actions.device
+
+        if noise is None:
+            noise = self.sample_noise(actions.shape, device)
+        if time is None:
+            time = self.sample_time(batch_size, device)
+        assert time is not None
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        lang_emb = self.paligemma_with_expert.embed_language_tokens(language_tokens)
+        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+
+        memory_enhanced_repr = self.process_video_with_memory(
+            video_frames,
+            text_query=lang_emb,
+            text_mask=language_masks,
+        )
+        aggregated_repr = rearrange(memory_enhanced_repr, "b t n d -> b (t n) d")
+
+        proj_weight = getattr(self.repr_to_llm, "weight", None)
+        proj_dtype = proj_weight.dtype if proj_weight is not None else aggregated_repr.dtype
+        visual_prefix = self.repr_to_llm(aggregated_repr.to(proj_dtype))
+
+        lang_emb = lang_emb.to(dtype=visual_prefix.dtype)
+        prefix_embs = torch.cat([visual_prefix, lang_emb], dim=1)
+
+        n_visual = aggregated_repr.shape[1]
+        prefix_pad_masks = torch.cat(
+            [
+                torch.ones(batch_size, n_visual, dtype=torch.bool, device=device),
+                language_masks,
+            ],
+            dim=1,
+        )
+        prefix_att_masks = torch.zeros(prefix_embs.shape[1], dtype=torch.bool, device=device)
+        prefix_att_masks = prefix_att_masks[None, :].expand(batch_size, -1)
+
+        has_subtask = (
+            subtask_tokens is not None
+            and subtask_mask is not None
+            and subtask_loss_mask is not None
+            and bool(subtask_loss_mask.any().item())
+        )
+
+        prefix_len_no_subtask = prefix_embs.shape[1]
+        if has_subtask:
+            subtask_embs = self.paligemma_with_expert.embed_language_tokens(subtask_tokens)
+            subtask_embs = subtask_embs * math.sqrt(subtask_embs.shape[-1])
+            prefix_embs = torch.cat([prefix_embs, subtask_embs], dim=1)
+            prefix_pad_masks = torch.cat([prefix_pad_masks, subtask_mask], dim=1)
+            prefix_att_masks = torch.cat(
+                [prefix_att_masks, torch.ones_like(subtask_mask, dtype=prefix_att_masks.dtype)],
+                dim=1,
+            )
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_action_suffix(x_t, time)
+
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+        prefix_att_masks = prefix_att_masks.to(dtype=suffix_att_masks.dtype)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = self.make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
+
+        if suffix_out is None:
+            raise RuntimeError("Expected suffix outputs from PaliGemma expert forward pass.")
+
+        suffix_out = suffix_out[:, -self.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t_pred = self.action_out_proj(suffix_out)
+        flow_loss = F.mse_loss(v_t_pred, u_t, reduction="mean")
+
+        if not has_subtask:
+            return {
+                "loss": flow_loss,
+                "flow_loss": flow_loss.detach(),
+                "ce_loss": torch.tensor(0.0, device=device),
+            }
+
+        assert prefix_out is not None
+        assert subtask_tokens is not None
+        assert subtask_loss_mask is not None
+
+        subtask_len = subtask_tokens.shape[1]
+        subtask_hidden = prefix_out[:, prefix_len_no_subtask : prefix_len_no_subtask + subtask_len]
+
+        subtask_hidden = subtask_hidden.to(
+            dtype=self.paligemma_with_expert.paligemma.language_model.embed_tokens.weight.dtype
+        )
+        text_logits = torch.matmul(
+            subtask_hidden,
+            self.paligemma_with_expert.paligemma.language_model.embed_tokens.weight.T,
+        )
+
+        shift_logits = text_logits[:, :-1].contiguous()
+        shift_targets = subtask_tokens[:, 1:].contiguous().to(dtype=torch.long)
+        shift_loss_mask = subtask_loss_mask[:, 1:].contiguous().float()
+
+        ce_loss_per_token = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_targets.view(-1),
+            reduction="none",
+        ).view(shift_logits.shape[0], -1)
+        ce_loss_per_batch = (ce_loss_per_token * shift_loss_mask).sum(dim=-1) / shift_loss_mask.sum(dim=-1).clamp(
+            min=1
+        )
+        ce_loss = ce_loss_per_batch.mean()
+
+        combined_loss = ce_loss + self.alpha * flow_loss
+        return {
+            "loss": combined_loss,
+            "flow_loss": flow_loss.detach(),
+            "ce_loss": ce_loss.detach(),
+        }
 
 
 def create_vlm2_with_pi05(
