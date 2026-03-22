@@ -914,10 +914,16 @@ class VLM2SubtaskWithPi05(VLM2WithPi05):
             shift_targets.view(-1),
             reduction="none",
         ).view(shift_logits.shape[0], -1)
-        ce_loss_per_batch = (ce_loss_per_token * shift_loss_mask).sum(dim=-1) / shift_loss_mask.sum(dim=-1).clamp(
-            min=1
-        )
-        ce_loss = ce_loss_per_batch.mean()
+
+        # Global mean CE loss over all valid tokens in the batch.
+        # Previously we computed per-sample mean then averaged across batch (mean-of-means),
+        # which amplified variance when batch composition varied (e.g., some samples had no
+        # valid subtask tokens, producing ce_loss=0 that skewed the batch mean).
+        # Now we sum all per-token losses and divide by total valid tokens directly,
+        # which is the standard NLP practice for consistent loss statistics.
+        total_ce_loss = (ce_loss_per_token * shift_loss_mask).sum()
+        total_valid_tokens = shift_loss_mask.sum().clamp(min=1)
+        ce_loss = total_ce_loss / total_valid_tokens
 
         combined_loss = ce_loss + self.alpha * flow_loss
         return {
