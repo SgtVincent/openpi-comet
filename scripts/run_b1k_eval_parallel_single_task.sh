@@ -1,271 +1,320 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Parallel BEHAVIOR-1K evaluation launcher for OpenPi-Comet.
-#
-# - Runs policy servers on the first half of GPUs (OpenPi / uv env)
-# - Runs BEHAVIOR evaluators on the second half of GPUs (conda env: behavior)
-# - Splits BEHAVIOR `eval_instance_ids` across pairs in round-robin
-#
-# Requirements:
-# - `conda env list` includes an env named: behavior
-# - BEHAVIOR-1K repo is present locally
-# - Checkpoint directory exists locally (download with `proxy_on` enabled if needed)
+usage() {
+  cat <<'EOF'
+Usage:
+  bash scripts/run_b1k_eval_parallel_single_task.sh [--dry-run] <ckpt_dir>
+  bash scripts/run_b1k_eval_parallel_single_task.sh [--dry-run] <ckpt_list.txt>
+  bash scripts/run_b1k_eval_parallel_single_task.sh [--dry-run] <ckpt_a> <ckpt_b> ...
 
+Core behavior:
+  - Single mode: launch one server + one evaluator per worker GPU.
+  - Multi mode: batch checkpoints and split GPU pool across checkpoints.
+  - Dry-run: print launch plan only.
+
+Key env vars:
+  TASK_NAME=turning_on_radio
+  BEHAVIOR_DIR=/home/ubuntu/repo/BEHAVIOR-1K
+  OPENPI_ENV=openpi-comet-nas
+  BEHAVIOR_ENV=behavior
+
+  GPU_IDS=0,1,2,3
+  NUM_GPUS=8
+
+  PORT_BASE=8000
+  PORT_BASE_START=9700
+  PORT_STRIDE=20
+
+  EVAL_ENTRYPOINT=eval_custom.py    # eval.py|eval_custom.py
+  EVAL_INSTANCE_IDS=0,1,2,3,4,5,6,7,8,9
+  DRY_RUN=false
+EOF
+}
+
+log() { echo "[Info] $*"; }
+warn() { echo "[Warn] $*" >&2; }
+die() { echo "[Error] $*" >&2; exit 1; }
+
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ----------------------------
+# Args
+# ----------------------------
+DRY_RUN="${DRY_RUN:-false}"
+declare -a POSITIONAL_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$arg")
+      ;;
+  esac
+done
+set -- "${POSITIONAL_ARGS[@]}"
+
+# ----------------------------
+# Defaults
+# ----------------------------
 TASK_NAME="${TASK_NAME:-turning_on_radio}"
 
-# Pairing mode:
-# - split:    servers use GPU[0..half-1], evaluators use GPU[half..NUM_GPUS-1] (safest for VRAM)
-# - colocate: each pair shares the same GPU id for server + evaluator (maximizes throughput, higher VRAM risk)
-PAIR_MODE="${PAIR_MODE:-split}"  # split | colocate
-
 NUM_GPUS="${NUM_GPUS:-8}"
-PORT_BASE="${PORT_BASE:-8000}"
-# How many evaluation runs to launch.
-# BEHAVIOR test split has 10 entries (indices 0..9). Each entry corresponds to 1 rollout episode.
-EVAL_EPISODES="${EVAL_EPISODES:-10}"
+GPU_IDS="${GPU_IDS:-}"
 
-# Websocket/health-check host used by the BEHAVIOR evaluator.
-# Use IPv4 localhost to avoid IPv6/proxy edge cases.
+PORT_BASE="${PORT_BASE:-8000}"
+PORT_BASE_START="${PORT_BASE_START:-9700}"
+PORT_STRIDE="${PORT_STRIDE:-20}"
+STOP_STALE_ON_START="${STOP_STALE_ON_START:-true}"
+
 MODEL_HOST="${MODEL_HOST:-127.0.0.1}"
 
-# Ensure localhost health checks never go through an HTTP proxy.
-# (The websocket client does `requests.get(http://<host>:<port>/healthz)`.)
-export NO_PROXY="localhost,127.0.0.1,::1${NO_PROXY:+,$NO_PROXY}"
-export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
-
-# JAX/XLA GPU memory behavior for the policy servers.
-# These help prevent JAX from preallocating most of the GPU memory, leaving room for Isaac.
-#
-# See: https://jax.readthedocs.io/en/latest/gpu_memory_allocation.html
-XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
-# Default to a conservative fraction to reduce the chance of VRAM contention.
-XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.40}"
-XLA_PYTHON_CLIENT_ALLOCATOR="${XLA_PYTHON_CLIENT_ALLOCATOR:-platform}"
-
+OPENPI_ENV="${OPENPI_ENV:-openpi-comet-nas}"
+OPENPI_PYTHON="${OPENPI_PYTHON:-}"
+BEHAVIOR_ENV="${BEHAVIOR_ENV:-behavior}"
 BEHAVIOR_DIR="${BEHAVIOR_DIR:-/home/ubuntu/repo/BEHAVIOR-1K}"
-CKPT_DIR="${CKPT_DIR:-$REPO_ROOT/checkpoints/openpi_comet/pi05-b1kpt50-cs32}"
-OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_b1k-base}"
 
+OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_b1k-base}"
 CONTROL_MODE="${CONTROL_MODE:-receeding_horizon}"
 MAX_LEN="${MAX_LEN:-32}"
 
-WRITE_VIDEO="${WRITE_VIDEO:-true}"
+EVAL_ENTRYPOINT="${EVAL_ENTRYPOINT:-eval_custom.py}"
+EVAL_INSTANCE_IDS="${EVAL_INSTANCE_IDS:-0,1,2,3,4,5,6,7,8,9}"
+
 HEADLESS="${HEADLESS:-true}"
-
-# Optional: cap max_steps to keep quick sanity runs short.
-# Example: MAX_STEPS=200
+WRITE_VIDEO="${WRITE_VIDEO:-false}"
 MAX_STEPS="${MAX_STEPS:-}"
-
-# How long to wait after launching servers before starting evaluators.
+SIM_DISPLAY="${SIM_DISPLAY:-${DISPLAY:-:10.0}}"
 SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-10}"
-
-# Evaluator entrypoint:
-# - eval.py:        upstream BEHAVIOR evaluator
-# - eval_custom.py: OpenPi-Comet custom evaluator (requires files copied into OmniGibson/omnigibson/learning)
-EVAL_ENTRYPOINT="${EVAL_ENTRYPOINT:-eval.py}"  # eval.py | eval_custom.py
-
-# To reproduce OpenPi-Comet settings, default to using the full-resolution RGB wrapper.
 ENV_WRAPPER_TARGET="${ENV_WRAPPER_TARGET:-omnigibson.learning.wrappers.RGBWrapper}"
 
-# Server mode:
-# - per_eval: start one policy server per evaluator process (highest compatibility, most GPU/VRAM usage)
-# - shared:  start ONE server and let multiple evaluators connect concurrently
-#            (recommended when simulation is the bottleneck and model inference is fast)
-SERVER_MODE="${SERVER_MODE:-per_eval}"  # per_eval | shared
+SAVE_ROLLOUT="${SAVE_ROLLOUT:-false}"
+PERTURB_POSE="${PERTURB_POSE:-false}"
+PERTURB_POSE_SEED="${PERTURB_POSE_SEED:-42}"
+PARALLEL_EVALUATOR_START_IDX="${PARALLEL_EVALUATOR_START_IDX:-0}"
+PARALLEL_EVALUATOR_END_IDX="${PARALLEL_EVALUATOR_END_IDX:-10}"
 
-# Shared-server tuning:
-# By default, the shared server reserves its GPU exclusively for the model.
-# If you set this to true, one evaluator will also run on the server GPU (higher utilization, higher VRAM risk).
-ALLOW_SERVER_GPU_AS_WORKER="${ALLOW_SERVER_GPU_AS_WORKER:-false}"  # true | false
+XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.40}"
+XLA_PYTHON_CLIENT_ALLOCATOR="${XLA_PYTHON_CLIENT_ALLOCATOR:-platform}"
 
-# Optionally pin the shared server to a specific GPU id.
-# Default: GPU 0 (or the first server GPU in split mode).
-SERVER_GPU_ID="${SERVER_GPU_ID:-}"
+# ----------------------------
+# Helpers
+# ----------------------------
+is_positive_int() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" > 0 ))
+}
 
-RUN_TAG="${RUN_TAG:-parallel_${TASK_NAME}_$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-$REPO_ROOT/eval_logs/pi05-b1kpt50-cs32/$RUN_TAG}"
-
-# DISPLAY 
-export DISPLAY=:10.0
-
-mkdir -p "$OUT_DIR"
-
-if [[ ! -d "$BEHAVIOR_DIR" ]]; then
-  echo "ERROR: BEHAVIOR_DIR not found: $BEHAVIOR_DIR" >&2
-  exit 1
-fi
-
-if [[ ! -d "$CKPT_DIR" ]]; then
-  echo "ERROR: CKPT_DIR not found: $CKPT_DIR" >&2
-  exit 1
-fi
-
-echo "Writing outputs to: $OUT_DIR"
-echo "Task: $TASK_NAME"
-echo "GPUs: $NUM_GPUS   Port base: $PORT_BASE   Eval episodes: $EVAL_EPISODES"
-echo "Model host: $MODEL_HOST"
-echo "Server XLA: PREALLOCATE=$XLA_PYTHON_CLIENT_PREALLOCATE MEM_FRACTION=$XLA_PYTHON_CLIENT_MEM_FRACTION ALLOCATOR=$XLA_PYTHON_CLIENT_ALLOCATOR"
-echo "Pair mode: $PAIR_MODE"
-echo "Server mode: $SERVER_MODE"
-echo "ALLOW_SERVER_GPU_AS_WORKER: $ALLOW_SERVER_GPU_AS_WORKER"
-
-case "$PAIR_MODE" in
-  split|colocate) ;;
-  *)
-    echo "ERROR: PAIR_MODE must be 'split' or 'colocate' (got: $PAIR_MODE)" >&2
-    exit 1
-    ;;
-esac
-
-case "$SERVER_MODE" in
-  per_eval|shared) ;;
-  *)
-    echo "ERROR: SERVER_MODE must be 'per_eval' or 'shared' (got: $SERVER_MODE)" >&2
-    exit 1
-    ;;
-esac
-
-if [[ "$PAIR_MODE" == "split" ]]; then
-  if (( NUM_GPUS < 2 )); then
-    echo "ERROR: NUM_GPUS must be >= 2 in split mode" >&2
-    exit 1
-  fi
-
-  # Split GPUs: servers on [0..half-1], eval on [half..NUM_GPUS-1].
-  half=$((NUM_GPUS / 2))
-  if (( half < 1 )); then
-    echo "ERROR: computed half=$half" >&2
-    exit 1
-  fi
-
-  # Number of (server, eval) pairs.
-  NUM_PAIRS=${NUM_PAIRS:-$half}
-  if (( NUM_PAIRS > half )); then
-    echo "ERROR: NUM_PAIRS=$NUM_PAIRS exceeds available server GPUs ($half)" >&2
-    exit 1
-  fi
-  if (( NUM_PAIRS > (NUM_GPUS - half) )); then
-    echo "ERROR: NUM_PAIRS=$NUM_PAIRS exceeds available eval GPUs ($((NUM_GPUS-half)))" >&2
-    exit 1
-  fi
-
-  SERVER_GPU_BASE=0
-  EVAL_GPU_BASE=$half
-  echo "Server GPUs: 0..$((half-1))"
-  echo "Eval GPUs:   $half..$((NUM_GPUS-1))"
-else
-  if (( NUM_GPUS < 1 )); then
-    echo "ERROR: NUM_GPUS must be >= 1" >&2
-    exit 1
-  fi
-
-  NUM_PAIRS=${NUM_PAIRS:-$NUM_GPUS}
-  if (( NUM_PAIRS > NUM_GPUS )); then
-    echo "ERROR: NUM_PAIRS=$NUM_PAIRS exceeds available GPUs ($NUM_GPUS) in colocate mode" >&2
-    exit 1
-  fi
-
-  SERVER_GPU_BASE=0
-  EVAL_GPU_BASE=0
-  if [[ "$SERVER_MODE" == "per_eval" ]]; then
-    echo "GPUs (colocate): 0..$((NUM_GPUS-1)) (each runs 1 server + 1 evaluator)"
-  else
-    echo "GPUs (colocate): 0..$((NUM_GPUS-1)) (shared server + multiple evaluators)"
-  fi
-fi
-
-echo "Pairs:       $NUM_PAIRS"
-
-if (( EVAL_EPISODES > 10 )); then
-  echo "ERROR: EVAL_EPISODES=$EVAL_EPISODES exceeds BEHAVIOR test instance count (10)" >&2
-  exit 1
-fi
-
-declare -a WORKER_TO_EPISODES
-
-if [[ "$SERVER_MODE" == "per_eval" ]]; then
-  # Distribute indices [0..EVAL_EPISODES-1] across pairs in round-robin.
-  for ((p=0; p<NUM_PAIRS; p++)); do
-    WORKER_TO_EPISODES[p]=""
+parse_csv_ints() {
+  local csv="$1"
+  local -n out_ref="$2"
+  out_ref=()
+  local raw item
+  IFS=',' read -r -a raw <<< "$csv"
+  for item in "${raw[@]}"; do
+    item="${item//[[:space:]]/}"
+    [[ -z "$item" ]] && continue
+    [[ "$item" =~ ^[0-9]+$ ]] || die "invalid integer: $item"
+    out_ref+=("$item")
   done
-  for ((idx=0; idx<EVAL_EPISODES; idx++)); do
-    p=$((idx % NUM_PAIRS))
-    if [[ -z "${WORKER_TO_EPISODES[p]}" ]]; then
-      WORKER_TO_EPISODES[p]="$idx"
-    else
-      WORKER_TO_EPISODES[p]="${WORKER_TO_EPISODES[p]},$idx"
+  (( ${#out_ref[@]} > 0 )) || die "empty integer list from csv: $csv"
+}
+
+read_checkpoint_list_file() {
+  local file="$1"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    local trimmed="${line#${line%%[![:space:]]*}}"
+    trimmed="${trimmed%${trimmed##*[![:space:]]}}"
+    [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+    MULTI_CKPTS+=("$trimmed")
+  done < "$file"
+}
+
+resolve_checkpoint_dir() {
+  local root="$1"
+  [[ -n "$root" ]] || die "checkpoint path not provided"
+
+  if [[ -f "$root/model.safetensors" || -d "$root/params" ]]; then
+    echo "$root"
+    return 0
+  fi
+
+  local latest_step
+  latest_step="$({
+    find "$root" -mindepth 1 -maxdepth 1 -type d -regex '.*/[0-9]+' -print 2>/dev/null | sort -V
+  } | while read -r d; do
+    if [[ -f "$d/model.safetensors" || -d "$d/params" ]]; then
+      echo "$d"
     fi
-  done
-else
-  # Shared server: use ALL available eval GPUs as workers (excluding the server GPU).
-  # Determine worker GPU ids.
-  declare -a WORKER_GPU_IDS
+  done | tail -n 1)"
 
-  # Pick server GPU.
-  if [[ -z "$SERVER_GPU_ID" ]]; then
-    SERVER_GPU_ID="$SERVER_GPU_BASE"
-  fi
-  if ! [[ "$SERVER_GPU_ID" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: SERVER_GPU_ID must be an integer (got: $SERVER_GPU_ID)" >&2
-    exit 1
-  fi
-  if (( SERVER_GPU_ID < 0 || SERVER_GPU_ID >= NUM_GPUS )); then
-    echo "ERROR: SERVER_GPU_ID=$SERVER_GPU_ID out of range for NUM_GPUS=$NUM_GPUS" >&2
-    exit 1
-  fi
-
-  if [[ "$PAIR_MODE" == "split" ]]; then
-    # Candidate workers are the eval half.
-    for ((g=EVAL_GPU_BASE; g<NUM_GPUS; g++)); do
-      if (( g == SERVER_GPU_ID )) && [[ "$ALLOW_SERVER_GPU_AS_WORKER" != "true" ]]; then
-        continue
-      fi
-      WORKER_GPU_IDS+=("$g")
-    done
+  if [[ -n "$latest_step" ]]; then
+    echo "$latest_step"
   else
-    # Candidate workers are all GPUs.
+    echo "$root"
+  fi
+}
+
+resolve_gpu_pool() {
+  local -n gpu_pool_ref="$1"
+  gpu_pool_ref=()
+
+  if [[ -n "$GPU_IDS" ]]; then
+    parse_csv_ints "$GPU_IDS" gpu_pool_ref
+  else
+    local detected
+    detected="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$detected" =~ ^[0-9]+$ ]] && (( detected > 0 )); then
+      local g
+      for ((g=0; g<detected; g++)); do
+        gpu_pool_ref+=("$g")
+      done
+    fi
+  fi
+
+  if (( ${#gpu_pool_ref[@]} == 0 )); then
+    is_positive_int "$NUM_GPUS" || die "NUM_GPUS must be >= 1"
+    local g
     for ((g=0; g<NUM_GPUS; g++)); do
-      if (( g == SERVER_GPU_ID )) && [[ "$ALLOW_SERVER_GPU_AS_WORKER" != "true" ]]; then
-        continue
-      fi
-      WORKER_GPU_IDS+=("$g")
+      gpu_pool_ref+=("$g")
     done
   fi
 
-  if (( ${#WORKER_GPU_IDS[@]} == 0 )); then
-    echo "ERROR: No worker GPUs available for evaluation (NUM_GPUS=$NUM_GPUS)." >&2
-    exit 1
+  is_positive_int "$NUM_GPUS" || die "NUM_GPUS must be >= 1"
+  (( NUM_GPUS <= ${#gpu_pool_ref[@]} )) || die "NUM_GPUS exceeds resolved GPU count (${#gpu_pool_ref[@]})"
+  gpu_pool_ref=("${gpu_pool_ref[@]:0:NUM_GPUS}")
+}
+
+resolve_openpi_runtime() {
+  USE_CONDA_OPENPI=0
+  if conda env list | awk '{print $1}' | grep -qx "$OPENPI_ENV"; then
+    USE_CONDA_OPENPI=1
   fi
 
-  NUM_WORKERS=${NUM_WORKERS:-${#WORKER_GPU_IDS[@]}}
-  if (( NUM_WORKERS > ${#WORKER_GPU_IDS[@]} )); then
-    echo "ERROR: NUM_WORKERS=$NUM_WORKERS exceeds available worker GPUs (${#WORKER_GPU_IDS[@]})." >&2
-    exit 1
+  if (( USE_CONDA_OPENPI == 0 )); then
+    if [[ -z "$OPENPI_PYTHON" && -x "$REPO_ROOT/.venv/bin/python" ]]; then
+      OPENPI_PYTHON="$REPO_ROOT/.venv/bin/python"
+    fi
+    [[ -x "$OPENPI_PYTHON" ]] || die "OPENPI_ENV '$OPENPI_ENV' not found and OPENPI_PYTHON is not executable"
+    log "OpenPi runtime: OPENPI_PYTHON=$OPENPI_PYTHON"
+  else
+    log "OpenPi runtime: conda env '$OPENPI_ENV'"
   fi
+}
 
-  # Distribute indices [0..EVAL_EPISODES-1] across workers.
-  for ((w=0; w<NUM_WORKERS; w++)); do
-    WORKER_TO_EPISODES[w]=""
+assign_eval_ids() {
+  local worker_count="$1"
+  WORKER_TO_IDS=()
+  local i
+  for ((i=0; i<worker_count; i++)); do
+    WORKER_TO_IDS[i]=""
   done
-  for ((idx=0; idx<EVAL_EPISODES; idx++)); do
-    w=$((idx % NUM_WORKERS))
-    if [[ -z "${WORKER_TO_EPISODES[w]}" ]]; then
-      WORKER_TO_EPISODES[w]="$idx"
+  for ((i=0; i<${#EVAL_IDS[@]}; i++)); do
+    local w=$(( i % worker_count ))
+    if [[ -z "${WORKER_TO_IDS[w]}" ]]; then
+      WORKER_TO_IDS[w]="${EVAL_IDS[i]}"
     else
-      WORKER_TO_EPISODES[w]="${WORKER_TO_EPISODES[w]},$idx"
+      WORKER_TO_IDS[w]="${WORKER_TO_IDS[w]},${EVAL_IDS[i]}"
     fi
   done
-fi
+}
 
-declare -a SERVER_PIDS
-declare -a EVAL_PIDS
+launch_server() {
+  local gpu="$1"
+  local port="$2"
+  local log_file="$3"
+
+  setsid bash -c "
+    set -euo pipefail
+    cd \"$REPO_ROOT\"
+    export CUDA_VISIBLE_DEVICES=\"$gpu\"
+    export XLA_PYTHON_CLIENT_PREALLOCATE=\"$XLA_PYTHON_CLIENT_PREALLOCATE\"
+    export XLA_PYTHON_CLIENT_MEM_FRACTION=\"$XLA_PYTHON_CLIENT_MEM_FRACTION\"
+    export XLA_PYTHON_CLIENT_ALLOCATOR=\"$XLA_PYTHON_CLIENT_ALLOCATOR\"
+    if [[ \"$USE_CONDA_OPENPI\" == \"1\" ]]; then
+      exec conda run -n \"$OPENPI_ENV\" --no-capture-output \
+        python scripts/serve_b1k.py \
+        --task_name=\"$TASK_NAME\" \
+        --control_mode=\"$CONTROL_MODE\" \
+        --max_len=\"$MAX_LEN\" \
+        --port=\"$port\" \
+        policy:checkpoint \
+        --policy.config=\"$OPENPI_CONFIG_NAME\" \
+        --policy.dir=\"$CKPT_DIR\"
+    else
+      exec \"$OPENPI_PYTHON\" scripts/serve_b1k.py \
+        --task_name=\"$TASK_NAME\" \
+        --control_mode=\"$CONTROL_MODE\" \
+        --max_len=\"$MAX_LEN\" \
+        --port=\"$port\" \
+        policy:checkpoint \
+        --policy.config=\"$OPENPI_CONFIG_NAME\" \
+        --policy.dir=\"$CKPT_DIR\"
+    fi
+  " >"$log_file" 2>&1 &
+  SERVER_PIDS+=("$!")
+}
+
+launch_eval() {
+  local gpu="$1"
+  local port="$2"
+  local ids_csv="$3"
+
+  local eval_log="$OUT_DIR/eval_gpu${gpu}_p${port}.log"
+  local eval_out="$OUT_DIR/eval_gpu${gpu}_p${port}"
+  mkdir -p "$eval_out"
+
+  local max_steps_arg=""
+  local env_wrapper_arg=""
+  local eval_custom_args=""
+
+  [[ -n "$MAX_STEPS" ]] && max_steps_arg="max_steps=$MAX_STEPS"
+  [[ -n "$ENV_WRAPPER_TARGET" ]] && env_wrapper_arg="env_wrapper._target_=$ENV_WRAPPER_TARGET"
+
+  if [[ "$EVAL_ENTRYPOINT" == "eval_custom.py" ]]; then
+    eval_custom_args="use_parallel_evaluator=false save_rollout=$SAVE_ROLLOUT perturb_pose=$PERTURB_POSE perturb_pose_seed=$PERTURB_POSE_SEED parallel_evaluator_start_idx=$PARALLEL_EVALUATOR_START_IDX parallel_evaluator_end_idx=$PARALLEL_EVALUATOR_END_IDX"
+  fi
+
+  setsid bash -c "
+    set -euo pipefail
+    cd \"$BEHAVIOR_DIR\"
+    export CUDA_VISIBLE_DEVICES=\"$gpu\"
+    unset OMNIGIBSON_GPU_ID
+    export OMNIGIBSON_HEADLESS=\"$HEADLESS\"
+    if [[ -n \"$SIM_DISPLAY\" ]]; then
+      export DISPLAY=\"$SIM_DISPLAY\"
+    else
+      unset DISPLAY
+    fi
+    exec conda run -n \"$BEHAVIOR_ENV\" --no-capture-output \
+      python \"OmniGibson/omnigibson/learning/$EVAL_ENTRYPOINT\" \
+      policy=websocket \
+      task.name=\"$TASK_NAME\" \
+      log_path=\"$eval_out\" \
+      headless=$HEADLESS \
+      write_video=$WRITE_VIDEO \
+      model.host=\"$MODEL_HOST\" \
+      model.port=\"$port\" \
+      $max_steps_arg \
+      $env_wrapper_arg \
+      $eval_custom_args \
+      eval_instance_ids=\"[$ids_csv]\"
+  " >"$eval_log" 2>&1 &
+
+  EVAL_PIDS+=("$!")
+  log "Started eval: gpu=$gpu port=$port ids=[$ids_csv]"
+}
+
 cleanup() {
+  local pid
   for pid in "${SERVER_PIDS[@]:-}"; do
     if kill -0 "$pid" 2>/dev/null; then
-      # Kill the entire process group so wrappers (e.g., uv / conda) don't leak children.
       kill -- -"$pid" 2>/dev/null || true
       kill "$pid" 2>/dev/null || true
     fi
@@ -277,161 +326,198 @@ cleanup() {
     fi
   done
 }
-trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
 
-echo "\n== Launching policy servers =="
-if [[ "$SERVER_MODE" == "per_eval" ]]; then
-  for ((p=0; p<NUM_PAIRS; p++)); do
-    ids="${WORKER_TO_EPISODES[p]}"
-    if [[ -z "$ids" ]]; then
-      echo "- Pair $p: no eval episodes assigned; skipping server"
-      continue
-    fi
+run_single_checkpoint_mode() {
+  command -v conda >/dev/null 2>&1 || die "conda not found in PATH"
+  [[ -d "$BEHAVIOR_DIR" ]] || die "BEHAVIOR_DIR not found: $BEHAVIOR_DIR"
+  [[ "$EVAL_ENTRYPOINT" == "eval.py" || "$EVAL_ENTRYPOINT" == "eval_custom.py" ]] || die "EVAL_ENTRYPOINT must be eval.py|eval_custom.py"
 
-    server_gpu=$((SERVER_GPU_BASE + p))
-    port=$((PORT_BASE + p))
-    server_log="$OUT_DIR/server_gpu${server_gpu}_p${port}.log"
-    echo "- Pair $p: server_gpu=$server_gpu  port=$port   eval_instance_ids=[$ids]"
+  CKPT_DIR="$(resolve_checkpoint_dir "$CKPT_DIR")"
+  [[ -d "$CKPT_DIR" ]] || die "CKPT_DIR not found: $CKPT_DIR"
 
-    setsid bash -c "
-      set -euo pipefail
-      cd \"$REPO_ROOT\"
-      export CUDA_VISIBLE_DEVICES=\"$server_gpu\"
-      export XLA_PYTHON_CLIENT_PREALLOCATE=\"$XLA_PYTHON_CLIENT_PREALLOCATE\"
-      export XLA_PYTHON_CLIENT_MEM_FRACTION=\"$XLA_PYTHON_CLIENT_MEM_FRACTION\"
-      export XLA_PYTHON_CLIENT_ALLOCATOR=\"$XLA_PYTHON_CLIENT_ALLOCATOR\"
-      exec uv run scripts/serve_b1k.py \
-        --task_name=\"$TASK_NAME\" \
-        --control_mode=\"$CONTROL_MODE\" \
-        --max_len=\"$MAX_LEN\" \
-        --port=\"$port\" \
-        policy:checkpoint \
-        --policy.config=\"$OPENPI_CONFIG_NAME\" \
-        --policy.dir=\"$CKPT_DIR\"
-    " >"$server_log" 2>&1 &
+  resolve_openpi_runtime
 
-    SERVER_PIDS+=($!)
+  WORKER_GPUS=()
+  resolve_gpu_pool WORKER_GPUS
+
+  parse_csv_ints "$EVAL_INSTANCE_IDS" EVAL_IDS
+  local id
+  for id in "${EVAL_IDS[@]}"; do
+    (( id >= 0 && id <= 9 )) || die "eval instance id out of range [0,9]: $id"
   done
-else
-  # Shared server: one server on SERVER_GPU_ID, port PORT_BASE.
-  if [[ -z "$SERVER_GPU_ID" ]]; then
-    SERVER_GPU_ID="$SERVER_GPU_BASE"
+
+  assign_eval_ids "${#WORKER_GPUS[@]}"
+
+  local run_name_ckpt="$(basename "$CKPT_DIR")"
+  RUN_TAG="${RUN_TAG:-parallel_${TASK_NAME}_${run_name_ckpt}_$(date +%Y%m%d_%H%M%S)}"
+  OUT_DIR="${OUT_DIR:-$REPO_ROOT/eval_logs/$RUN_TAG}"
+  mkdir -p "$OUT_DIR"
+
+  export NO_PROXY="localhost,127.0.0.1,::1${NO_PROXY:+,$NO_PROXY}"
+  export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
+
+  log "Writing outputs to: $OUT_DIR"
+  log "Task=$TASK_NAME Checkpoint=$CKPT_DIR"
+  log "Worker GPUs=[${WORKER_GPUS[*]}] Eval IDs=[${EVAL_IDS[*]}]"
+
+  local i
+  for ((i=0; i<${#WORKER_TO_IDS[@]}; i++)); do
+    local worker_port=$((PORT_BASE + i))
+    log "worker $i -> ids=[${WORKER_TO_IDS[i]}] gpu=${WORKER_GPUS[i]} port=$worker_port"
+  done
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "Dry-run only: no process started. OUT_DIR=$OUT_DIR"
+    return 0
   fi
-  server_gpu="$SERVER_GPU_ID"
-  port="$PORT_BASE"
-  server_log="$OUT_DIR/server_gpu${server_gpu}_p${port}.log"
-  echo "- Shared server: server_gpu=$server_gpu  port=$port"
 
-  setsid bash -c "
-    set -euo pipefail
-    cd \"$REPO_ROOT\"
-    export CUDA_VISIBLE_DEVICES=\"$server_gpu\"
-    export XLA_PYTHON_CLIENT_PREALLOCATE=\"$XLA_PYTHON_CLIENT_PREALLOCATE\"
-    export XLA_PYTHON_CLIENT_MEM_FRACTION=\"$XLA_PYTHON_CLIENT_MEM_FRACTION\"
-    export XLA_PYTHON_CLIENT_ALLOCATOR=\"$XLA_PYTHON_CLIENT_ALLOCATOR\"
-    exec uv run scripts/serve_b1k.py \
-      --task_name=\"$TASK_NAME\" \
-      --control_mode=\"$CONTROL_MODE\" \
-      --max_len=\"$MAX_LEN\" \
-      --port=\"$port\" \
-      policy:checkpoint \
-      --policy.config=\"$OPENPI_CONFIG_NAME\" \
-      --policy.dir=\"$CKPT_DIR\"
-  " >"$server_log" 2>&1 &
+  SERVER_PIDS=()
+  EVAL_PIDS=()
+  trap cleanup EXIT
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
 
-  SERVER_PIDS+=($!)
-fi
+  log "Launching servers..."
+  for ((i=0; i<${#WORKER_TO_IDS[@]}; i++)); do
+    [[ -z "${WORKER_TO_IDS[i]}" ]] && continue
+    local worker_port=$((PORT_BASE + i))
+    local server_log="$OUT_DIR/server_gpu${WORKER_GPUS[i]}_p${worker_port}.log"
+    launch_server "${WORKER_GPUS[i]}" "$worker_port" "$server_log"
+  done
 
-echo "\nWaiting ${SERVER_STARTUP_WAIT}s for servers to start..."
-sleep "$SERVER_STARTUP_WAIT"
+  log "Waiting ${SERVER_STARTUP_WAIT}s for server warm-up..."
+  sleep "$SERVER_STARTUP_WAIT"
 
-echo "\n== Launching BEHAVIOR evaluators =="
-if [[ "$SERVER_MODE" == "per_eval" ]]; then
-  for ((p=0; p<NUM_PAIRS; p++)); do
-    ids="${WORKER_TO_EPISODES[p]}"
-    if [[ -z "$ids" ]]; then
+  log "Launching evaluators..."
+  for ((i=0; i<${#WORKER_TO_IDS[@]}; i++)); do
+    [[ -z "${WORKER_TO_IDS[i]}" ]] && continue
+    local worker_port=$((PORT_BASE + i))
+    launch_eval "${WORKER_GPUS[i]}" "$worker_port" "${WORKER_TO_IDS[i]}"
+  done
+
+  (( ${#EVAL_PIDS[@]} > 0 )) || die "no evaluators were started"
+  log "Launched ${#SERVER_PIDS[@]} server(s) and ${#EVAL_PIDS[@]} evaluator(s)."
+
+  local overall_rc=0
+  local pid
+  for pid in "${EVAL_PIDS[@]}"; do
+    if ! wait "$pid"; then
+      overall_rc=1
+    fi
+  done
+
+  if (( overall_rc != 0 )); then
+    die "one or more evaluators failed. Logs: $OUT_DIR"
+  else
+    log "All evaluators completed successfully. Logs: $OUT_DIR"
+  fi
+}
+
+run_multi_checkpoint_mode() {
+  resolve_gpu_pool MULTI_GPUS
+
+  local total_models="${#MULTI_CKPTS[@]}"
+  local total_gpus="${#MULTI_GPUS[@]}"
+  (( total_models > 0 )) || die "no checkpoints resolved for multi mode"
+  (( total_gpus > 0 )) || die "no GPUs resolved for multi mode"
+
+  local ckpt
+  for ckpt in "${MULTI_CKPTS[@]}"; do
+    [[ -d "$ckpt" ]] || die "checkpoint dir not found: $ckpt"
+  done
+
+  log "Multi mode: models=$total_models gpus=$total_gpus ids=[${MULTI_GPUS[*]}] dry_run=$DRY_RUN"
+
+  if [[ "$STOP_STALE_ON_START" == "true" && "$DRY_RUN" != "true" ]]; then
+    pkill -f 'scripts/serve_b1k.py|OmniGibson/omnigibson/learning/eval_custom.py' >/dev/null 2>&1 || true
+    sleep 2
+  fi
+
+  local model_index=0
+  while (( model_index < total_models )); do
+    local remaining=$(( total_models - model_index ))
+    local batch_size=$(( remaining < total_gpus ? remaining : total_gpus ))
+    local base_per_model=$(( total_gpus / batch_size ))
+    local remainder=$(( total_gpus % batch_size ))
+    local gpu_cursor=0
+
+    declare -a batch_pids=()
+    local slot
+    for ((slot=0; slot<batch_size; slot++)); do
+      ckpt="${MULTI_CKPTS[model_index]}"
+
+      local per_model_gpus=$base_per_model
+      (( slot < remainder )) && per_model_gpus=$(( per_model_gpus + 1 ))
+
+      declare -a assigned_gpus=("${MULTI_GPUS[@]:gpu_cursor:per_model_gpus}")
+      local assigned_gpu_csv
+      assigned_gpu_csv="$(IFS=,; echo "${assigned_gpus[*]}")"
+      gpu_cursor=$(( gpu_cursor + per_model_gpus ))
+
+      local port_base=$(( PORT_BASE_START + model_index * PORT_STRIDE ))
+      local run_tag="parallel_${TASK_NAME}_m$((model_index + 1))_$(basename "$ckpt")_$(date +%Y%m%d_%H%M%S)"
+
+      log "Model $((model_index + 1))/$total_models ckpt=$ckpt gpus=$assigned_gpu_csv num_gpus=$per_model_gpus port_base=$port_base"
+
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  DRY-RUN: GPU_IDS=$assigned_gpu_csv NUM_GPUS=$per_model_gpus PORT_BASE=$port_base RUN_TAG=$run_tag bash $SCRIPT_PATH '$ckpt'"
+      else
+        (
+          export DRY_RUN=false
+          export GPU_IDS="$assigned_gpu_csv"
+          export NUM_GPUS="$per_model_gpus"
+          export PORT_BASE="$port_base"
+          export RUN_TAG="$run_tag"
+          bash "$SCRIPT_PATH" "$ckpt"
+        ) &
+        batch_pids+=("$!")
+      fi
+
+      model_index=$(( model_index + 1 ))
+    done
+
+    if [[ "$DRY_RUN" == "true" ]]; then
       continue
     fi
 
-    eval_gpu=$((EVAL_GPU_BASE + p))
-    port=$((PORT_BASE + p))
-    eval_log="$OUT_DIR/eval_gpu${eval_gpu}_p${port}.log"
-    eval_out="$OUT_DIR/eval_gpu${eval_gpu}_p${port}"
-    mkdir -p "$eval_out"
-
-    (
-      cd "$BEHAVIOR_DIR"
-      unset CUDA_VISIBLE_DEVICES
-      OMNIGIBSON_GPU_ID="$eval_gpu" \
-        conda run -n behavior --no-capture-output \
-          python "OmniGibson/omnigibson/learning/${EVAL_ENTRYPOINT}" \
-            policy=websocket \
-            task.name="$TASK_NAME" \
-            log_path="$eval_out" \
-            headless=$HEADLESS \
-            write_video=$WRITE_VIDEO \
-            env_wrapper._target_="$ENV_WRAPPER_TARGET" \
-            ${MAX_STEPS:+max_steps=$MAX_STEPS} \
-            model.host="$MODEL_HOST" \
-            model.port="$port" \
-            eval_instance_ids="[$ids]"
-    ) >"$eval_log" 2>&1 &
-
-    EVAL_PIDS+=($!)
-    echo "- Started eval: pair=$p eval_gpu=$eval_gpu port=$port -> $eval_out"
+    local batch_failed=0
+    local pid
+    for pid in "${batch_pids[@]}"; do
+      if ! wait "$pid"; then
+        batch_failed=1
+      fi
+    done
+    (( batch_failed == 0 )) || die "one or more model runs failed in batch"
   done
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "All multi-checkpoint runs planned (dry-run only)."
+  else
+    log "All multi-checkpoint runs completed successfully."
+  fi
+}
+
+# ----------------------------
+# Dispatch
+# ----------------------------
+declare -a MULTI_CKPTS=()
+if (( $# >= 2 )); then
+  MULTI_CKPTS=("$@")
+  run_multi_checkpoint_mode
+  exit 0
+fi
+
+if (( $# == 1 )) && [[ -f "$1" ]]; then
+  read_checkpoint_list_file "$1"
+  run_multi_checkpoint_mode
+  exit 0
+fi
+
+if (( $# >= 1 )); then
+  CKPT_DIR="$1"
 else
-  port=$PORT_BASE
-  for ((w=0; w<NUM_WORKERS; w++)); do
-    ids="${WORKER_TO_EPISODES[w]}"
-    if [[ -z "$ids" ]]; then
-      continue
-    fi
-
-    eval_gpu="${WORKER_GPU_IDS[$w]}"
-    eval_log="$OUT_DIR/eval_gpu${eval_gpu}_p${port}.log"
-    eval_out="$OUT_DIR/eval_gpu${eval_gpu}_p${port}"
-    mkdir -p "$eval_out"
-
-    setsid bash -c "
-      set -euo pipefail
-      cd \"$BEHAVIOR_DIR\"
-      unset CUDA_VISIBLE_DEVICES
-      export OMNIGIBSON_GPU_ID=\"$eval_gpu\"
-      exec conda run -n behavior --no-capture-output \
-        python \"OmniGibson/omnigibson/learning/${EVAL_ENTRYPOINT}\" \
-          policy=websocket \
-          task.name=\"$TASK_NAME\" \
-          log_path=\"$eval_out\" \
-          headless=$HEADLESS \
-          write_video=$WRITE_VIDEO \
-          env_wrapper._target_=\"$ENV_WRAPPER_TARGET\" \
-          ${MAX_STEPS:+max_steps=$MAX_STEPS} \
-          model.host=\"$MODEL_HOST\" \
-          model.port=\"$port\" \
-          eval_instance_ids=\"[$ids]\"
-    " >"$eval_log" 2>&1 &
-
-    EVAL_PIDS+=($!)
-    echo "- Started eval: worker=$w eval_gpu=$eval_gpu port=$port eval_instance_ids=[$ids] -> $eval_out"
-  done
+  CKPT_DIR="${CKPT_DIR:-}"
 fi
 
-echo "\nAll evaluators launched. Tail logs, e.g.:"
-if [[ "$PAIR_MODE" == "split" ]]; then
-  example_eval_gpu="$EVAL_GPU_BASE"
-else
-  example_eval_gpu=1
-fi
-echo "  tail -f $OUT_DIR/eval_gpu${example_eval_gpu}_p${PORT_BASE}.log"
-echo "  tail -f $OUT_DIR/server_gpu0_p${PORT_BASE}.log"
-
-if (( ${#EVAL_PIDS[@]} == 0 )); then
-  echo "ERROR: No evaluators were started (check BEHAVIOR_DIR and EVAL_EPISODES)." >&2
-  exit 1
-fi
-
-# Wait for evaluators to finish. Servers run forever and will be killed by the EXIT trap.
-wait "${EVAL_PIDS[@]}"
+[[ -n "$CKPT_DIR" ]] || die "checkpoint path not provided (positional arg or CKPT_DIR)"
+run_single_checkpoint_mode
