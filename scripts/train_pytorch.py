@@ -262,9 +262,15 @@ def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework.
     retries = max(1, int(os.environ.get("OPENPI_BUILD_DATASET_RETRIES", "3")))
     rank = int(os.environ.get("RANK", "0"))
+    skip_norm_stats = os.environ.get("OPENPI_SKIP_NORM_STATS", "0") == "1"
     for attempt in range(1, retries + 1):
         try:
-            data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
+            data_loader = _data_loader.create_data_loader(
+                config,
+                framework="pytorch",
+                shuffle=True,
+                skip_norm_stats=skip_norm_stats,
+            )
             return data_loader, data_loader.data_config()
         except FileNotFoundError as exc:
             transient_lock_race = exc.filename is None and int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -833,13 +839,35 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         raise RuntimeError("No trainable parameters found (all parameters are frozen).")
 
     # Create optimizer with config parameters
-    optim = torch.optim.AdamW(
-        optim_params,
-        lr=peak_lr,
-        betas=(config.optimizer.b1, config.optimizer.b2),
-        eps=config.optimizer.eps,
-        weight_decay=config.optimizer.weight_decay,
-    )
+    use_8bit_optim = os.environ.get("USE_8BIT_OPTIM", "0") == "1"
+    if use_8bit_optim:
+        try:
+            import bitsandbytes as bnb
+            optim = bnb.optim.AdamW8bit(
+                optim_params,
+                lr=peak_lr,
+                betas=(config.optimizer.b1, config.optimizer.b2),
+                eps=config.optimizer.eps,
+                weight_decay=config.optimizer.weight_decay,
+            )
+            logging.info("Using 8-bit AdamW optimizer from bitsandbytes")
+        except ImportError:
+            logging.warning("bitsandbytes not found, falling back to standard AdamW")
+            optim = torch.optim.AdamW(
+                optim_params,
+                lr=peak_lr,
+                betas=(config.optimizer.b1, config.optimizer.b2),
+                eps=config.optimizer.eps,
+                weight_decay=config.optimizer.weight_decay,
+            )
+    else:
+        optim = torch.optim.AdamW(
+            optim_params,
+            lr=peak_lr,
+            betas=(config.optimizer.b1, config.optimizer.b2),
+            eps=config.optimizer.eps,
+            weight_decay=config.optimizer.weight_decay,
+        )
 
     # Load checkpoint if resuming
     global_step = 0

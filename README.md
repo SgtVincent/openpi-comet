@@ -104,7 +104,7 @@ source .venv/bin/activate
 
 # Install behavior for server deploy 
 cd $PATH_TO_BEHAVIOR_1K
-uv pip install -e bddl
+uv pip install -e bddl3
 uv pip install -e OmniGibson[eval]
 ```
 

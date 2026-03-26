@@ -1,5 +1,6 @@
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi05_subtask_config
+from pathlib import Path
 from openpi.models.vlm2_vla_config import VLM2VLAConfig
 import openpi.training.optimizer as _optimizer
 from openpi.training.data_config import AssetsConfig, DataConfig, LeRobotB1KDataConfig
@@ -301,22 +302,28 @@ _PRETRAIN_CONFIGS = [
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             assets=AssetsConfig(
-                assets_dir="checkpoints/openpi_comet/pi05-b1kpt50-cs32/assets",
+                assets_dir="checkpoints/pi05_base_pytorch/assets",
                 asset_id="behavior-1k/2025-challenge-demos",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/bn/mllm-data-yg/chenjunting/data/2025-challenge-demos/",
                 fine_grained_level=0,
+                subtask_source="annotations_skill",
+                subtask_template_path=str(Path(__file__).resolve().parents[3] / "src/behavior/learning/datas/b1k_subtask_phrase_templates.json"),
+                subtask_object_name_mapping_path=str(Path(__file__).resolve().parents[3] / "src/behavior/learning/datas/b1k_object_id_name_mapping.json"),
+                subtask_joiner=" then ",
             ),
         ),
-        pytorch_weight_path="checkpoints/openpi_comet/pi05-b1kpt50-cs32",
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
+        weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/pi05_base_pytorch"),
         num_train_steps=0,
         num_train_epochs=2,
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=1e-4,
-            decay_steps=360_000,
+            decay_steps=0,
+            decay_lr=1e-5,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
@@ -368,6 +375,41 @@ _PRETRAIN_CONFIGS = [
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=1e-4,
             decay_steps=144_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+        batch_size_per_gpu=32,
+    ),
+    TrainConfig(
+        name="pi0_b1k_skill-pt50_pretrain_lr1e-4_1ep",
+        exp_name="openpi",
+        project_name="B1K",
+        pytorch_model_name="pi0",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="checkpoints/pi05_base_pytorch/assets",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_skill_description=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/bn/mllm-data-yg/chenjunting/data/2025-challenge-demos/",
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
+        weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/pi05_base_pytorch"),
+        num_train_steps=0,
+        num_train_epochs=1,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=1e-4,
+            decay_steps=0,
+            decay_lr=1e-5,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,

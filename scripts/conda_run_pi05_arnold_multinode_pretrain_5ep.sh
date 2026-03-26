@@ -5,10 +5,10 @@ set -x # DEBUG PRINT
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-source /mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/miniconda3/etc/profile.d/conda.sh
+source /mnt/bn/mllm-data-yg/chenjunting/miniconda3/etc/profile.d/conda.sh
 conda activate openpi-comet-nas
-export PYTHONPATH="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python:$PYTHONPATH"
-export LD_LIBRARY_PATH="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/miniconda3/envs/openpi-comet-nas/lib:$LD_LIBRARY_PATH"
+export PYTHONPATH="/mnt/bn/mllm-data-yg/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python:$PYTHONPATH"
+export LD_LIBRARY_PATH="/mnt/bn/mllm-data-yg/chenjunting/miniconda3/envs/openpi-comet-nas/lib:$LD_LIBRARY_PATH"
 
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${REPO_ROOT}/.cache/openpi}"
 export B1K_VIDEO_BACKEND="${B1K_VIDEO_BACKEND:-video_reader}"
@@ -17,6 +17,8 @@ export OPENPI_OFFLINE="${OPENPI_OFFLINE:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+# Per-node local SSD cache to avoid NAS lock contention
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/opt/tiger/hf_datasets_cache/${CONFIG_NAME}/}"
 export OPENPI_PERSISTENT_WORKERS="${OPENPI_PERSISTENT_WORKERS:-1}"
 export OPENPI_DATALOADER_TIMEOUT_S="${OPENPI_DATALOADER_TIMEOUT_S:-600}"
 export OPENPI_DATALOADER_PREFETCH_FACTOR="${OPENPI_DATALOADER_PREFETCH_FACTOR:-2}"
@@ -44,7 +46,7 @@ CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-pt50_cs32_bs64_lr2.5e-5_5ep}"
 NUM_EPOCHS="${NUM_EPOCHS:-5}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"
 KEEP_PERIOD="${KEEP_PERIOD:-5000}"
-FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-1}"
+FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-}"
 PREPARE_HF_CACHE_ONLY="${PREPARE_HF_CACHE_ONLY:-0}"
 
 PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-64}"
@@ -163,6 +165,7 @@ echo "OPENPI_DDP_TIMEOUT_MIN: ${OPENPI_DDP_TIMEOUT_MIN}"
 echo "OPENPI_LOAD_DATASET_NUM_PROC_CAP: ${OPENPI_LOAD_DATASET_NUM_PROC_CAP}"
 echo "OPENPI_HF_LOCAL_SYNC_TIMEOUT_S: ${OPENPI_HF_LOCAL_SYNC_TIMEOUT_S}"
 echo "OPENPI_HF_LOCAL_SYNC_POLL_S: ${OPENPI_HF_LOCAL_SYNC_POLL_S}"
+echo "HF_DATASETS_CACHE: ${HF_DATASETS_CACHE}"
 
 torchrun \
   --master_addr="${MASTER_ADDR}" \

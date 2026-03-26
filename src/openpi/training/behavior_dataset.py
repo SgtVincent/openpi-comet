@@ -13,6 +13,7 @@ def is_behavior_dataset(data_config: _config.DataConfig) -> bool:
 
 def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int):
     from behavior.learning.datas.dataset import BehaviorLeRobotDataset
+    from openpi.training.behavior_skill_dataset import BehaviorLeRobotSkillDataset
 
     args = {}
     if data_config.skill_list != ["all"]:
@@ -27,7 +28,13 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         args["subtask_object_name_mapping_path"] = data_config.subtask_object_name_mapping_path
         args["subtask_joiner"] = data_config.subtask_joiner
 
-    dataset = BehaviorLeRobotDataset(
+    dataset_cls = (
+        BehaviorLeRobotSkillDataset
+        if getattr(data_config, "prompt_from_skill_description", False)
+        else BehaviorLeRobotDataset
+    )
+
+    dataset = dataset_cls(
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,
         tolerance_s=data_config.tolerance_s,
