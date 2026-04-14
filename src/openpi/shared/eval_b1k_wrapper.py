@@ -38,6 +38,9 @@ class B1KPolicyWrapper:
     ) -> None:
         self.policy = policy
         self.task_name = task_name
+        # Session id is used to isolate runtime state (e.g., streaming memory) when the
+        # same model instance is shared across multiple websocket connections.
+        self._session_id: int = id(self)
 
         # load the task name from the metadata
         metadata = json.load(open("scripts/task_mapping.json"))
@@ -65,6 +68,29 @@ class B1KPolicyWrapper:
 
         self.log_config()
 
+    def _maybe_set_active_session(self) -> None:
+        model = getattr(self.policy, "_model", None)
+        if model is None:
+            return
+        setter = getattr(model, "set_active_session", None)
+        if callable(setter):
+            try:
+                setter(self._session_id)
+            except Exception:
+                # Best-effort: do not break rollout if the underlying model doesn't support it.
+                return
+
+    def _maybe_reset_streaming_state(self) -> None:
+        model = getattr(self.policy, "_model", None)
+        if model is None:
+            return
+        resetter = getattr(model, "reset_streaming_state", None)
+        if callable(resetter):
+            try:
+                resetter(self._session_id)
+            except Exception:
+                return
+
     def log_config(self):
         logger.info(f"{self.task_name=}")
         logger.info(f"{self.control_mode=}")
@@ -83,6 +109,8 @@ class B1KPolicyWrapper:
         self.action_queue = deque(maxlen=self.action_horizon)
         self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         self.step_counter = 0
+        self._maybe_set_active_session()
+        self._maybe_reset_streaming_state()
         if self.reasoner:
             self.reasoner.reset()
 
@@ -96,6 +124,7 @@ class B1KPolicyWrapper:
 
         # Shallow copy is enough to share large model weights while isolating mutable rollout state.
         session = copy.copy(self)
+        session._session_id = id(session)
         session.action_queue = deque(maxlen=self.action_horizon)
         session.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         session.step_counter = 0
@@ -191,6 +220,7 @@ class B1KPolicyWrapper:
                 batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
 
             try:
+                self._maybe_set_active_session()
                 action = self.policy.infer(batch)
                 self.last_action = action
             except Exception as e:
@@ -306,6 +336,7 @@ class B1KPolicyWrapper:
             batch["prompt"] = reasoner_response
 
         try:
+            self._maybe_set_active_session()
             action = self.policy.infer(batch)
             self.last_action = action
         except Exception as e:

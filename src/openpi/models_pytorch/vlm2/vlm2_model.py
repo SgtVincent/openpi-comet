@@ -17,7 +17,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple, Any, Literal, TYPE_CHECKING
+from typing import Optional, Dict, List, Tuple, Any, Literal, TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -302,6 +302,57 @@ class VLM2WithPi05(nn.Module):
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
+
+        # Runtime-only streaming memory state, keyed by session id.
+        # This enables websocket servers to share one model instance while keeping
+        # per-connection memory isolated.
+        self._active_session_id: int | None = None
+        self._session_memory_state: dict[int, dict[str, Any]] = {}
+
+    def set_active_session(self, session_id: int | None) -> None:
+        """Switch the active streaming-memory session.
+
+        This is a no-op for non-streaming usage, but allows external wrappers to
+        isolate memory across concurrent rollouts while reusing one model instance.
+        """
+
+        if session_id == self._active_session_id:
+            return
+
+        # Save current session runtime buffers before switching away.
+        if self._active_session_id is not None:
+            self._session_memory_state[self._active_session_id] = self.memory.get_runtime_state()
+
+        self._active_session_id = session_id
+
+        if session_id is None:
+            # No session: clear to avoid accidental cross-episode leakage.
+            self.memory.clear_runtime_state()
+            return
+
+        self.memory.set_runtime_state(self._session_memory_state.get(session_id))
+
+    def reset_streaming_state(self, session_id: int | None = None) -> None:
+        """Clear runtime memory buffers for a given session (or current active)."""
+
+        if session_id is None:
+            session_id = self._active_session_id
+
+        if session_id is None:
+            self.memory.clear_runtime_state()
+            return
+
+        self._session_memory_state.pop(session_id, None)
+        if session_id == self._active_session_id:
+            self.memory.clear_runtime_state()
+
+    def clear_session(self, session_id: int) -> None:
+        """Drop stored runtime memory for a session id."""
+
+        self._session_memory_state.pop(session_id, None)
+        if session_id == self._active_session_id:
+            self._active_session_id = None
+            self.memory.clear_runtime_state()
     
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -324,6 +375,8 @@ class VLM2WithPi05(nn.Module):
         video_frames: torch.Tensor,
         text_query: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
+        *,
+        reset_before_process: bool = False,
     ) -> torch.Tensor:
         """Process video frames through perception and memory modules.
         
@@ -337,9 +390,10 @@ class VLM2WithPi05(nn.Module):
         """
         batch_size, num_frames, C, H, W = video_frames.shape
         device = video_frames.device
-        
-        # Reset memory for new sequence
-        self.reset_memory(batch_size, device)
+
+        # Training codepaths may want per-sample memory reset. Streaming inference should not.
+        if reset_before_process:
+            self.reset_memory(batch_size, device)
         
         all_representations = []
         
@@ -479,7 +533,8 @@ class VLM2WithPi05(nn.Module):
         memory_enhanced_repr = self.process_video_with_memory(
             video_frames, 
             text_query=lang_emb, 
-            text_mask=language_masks
+            text_mask=language_masks,
+            reset_before_process=True,
         )
         
         # Preserve all frame/camera tokens instead of only the last frame.
@@ -581,6 +636,7 @@ class VLM2WithPi05(nn.Module):
 
     def _preprocess_observation(self, observation, *, train: bool = False):
         """Preprocess observation into frames and language tokens."""
+        # Default preprocessing keeps all standard image keys; inference may override.
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
         images = list(observation.images.values())
         lang_tokens = observation.tokenized_prompt
@@ -624,13 +680,21 @@ class VLM2WithPi05(nn.Module):
         Returns:
             Sampled actions (batch, action_horizon, action_dim)
         """
-        images, language_tokens, language_masks = self._preprocess_observation(observation, train=False)
+        # For streaming VLA: 3D encoder (VGGT) defaults to head camera only.
+        # We also treat each replanning call as one timestep; do NOT build a fake "video" from views.
+        processed = cast(
+            Any,
+            _preprocessing.preprocess_observation_pytorch(observation, train=False, image_keys=("base_0_rgb",)),
+        )
+        language_tokens = processed.tokenized_prompt
+        language_masks = processed.tokenized_prompt_mask
         if language_tokens is None or language_masks is None:
             raise ValueError("Observation missing tokenized_prompt/tokenized_prompt_mask for VLM2 inference.")
 
-        video_frames = self._build_video(images)
-        batch_size = video_frames.shape[0]
-        device = video_frames.device
+        base_image = processed.images["base_0_rgb"]  # (B, C, H, W)
+        video_frames = base_image.unsqueeze(1)  # (B, 1, C, H, W)
+        batch_size = base_image.shape[0]
+        device = base_image.device
         
         if noise is None:
             actions_shape = (batch_size, self.action_horizon, self.action_dim)
@@ -646,6 +710,10 @@ class VLM2WithPi05(nn.Module):
             text_query=lang_emb,
             text_mask=language_masks
         )
+
+        # Persist runtime memory for the current session (if any).
+        if self._active_session_id is not None:
+            self._session_memory_state[self._active_session_id] = self.memory.get_runtime_state()
         
         # Aggregate all camera-view tokens (must match training aggregation).
         aggregated_repr = rearrange(memory_enhanced_repr, 'b t n d -> b (t n) d')
@@ -811,6 +879,7 @@ class VLM2SubtaskWithPi05(VLM2WithPi05):
             video_frames,
             text_query=lang_emb,
             text_mask=language_masks,
+            reset_before_process=True,
         )
         aggregated_repr = rearrange(memory_enhanced_repr, "b t n d -> b (t n) d")
 

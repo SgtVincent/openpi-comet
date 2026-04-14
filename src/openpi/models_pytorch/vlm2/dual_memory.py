@@ -8,7 +8,7 @@ This module implements the dual-memory architecture from VLM2:
 Reference: VLM2 paper Section 3.3
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -600,6 +600,77 @@ class DualMemoryModule(nn.Module):
         """
         self.working_memory.reset(batch_size, device)
         self.episodic_memory.reset(batch_size, device)
+
+    def clear_runtime_state(self) -> None:
+        """Clear non-persistent runtime buffers for streaming inference.
+
+        Note:
+            These buffers are registered with `persistent=False`, so they are not saved
+            in checkpoints. Clearing them is a lightweight way to "reset" memory across
+            episodes without knowing the next batch/device a priori.
+        """
+
+        device = self.memory_gate.device
+        # Working memory
+        self.working_memory.memory_buffer = None
+        self.working_memory.num_tokens = None
+        self.working_memory.memory_count = torch.tensor(0, device=device)
+
+        # Episodic memory
+        self.episodic_memory.memory_bank = None
+        self.episodic_memory.num_tokens = None
+        self.episodic_memory.last_used = None
+        self.episodic_memory.memory_count = torch.tensor(0, device=device)
+        self.episodic_memory.step = torch.tensor(0, device=device)
+
+    def get_runtime_state(self) -> dict[str, Any]:
+        """Export runtime memory buffers for per-session streaming inference.
+
+        Returns:
+            A python dict containing working/episodic memory buffers and counters.
+
+        Important:
+            - This is NOT a model checkpoint state (buffers are persistent=False).
+            - The underlying memory updates replace tensors (via clone/roll), so storing
+              references is safe for the current implementation.
+        """
+
+        return {
+            # Working memory
+            "working_memory_buffer": self.working_memory.memory_buffer,
+            "working_memory_count": self.working_memory.memory_count,
+            "working_num_tokens": self.working_memory.num_tokens,
+            # Episodic memory
+            "episodic_memory_bank": self.episodic_memory.memory_bank,
+            "episodic_memory_count": self.episodic_memory.memory_count,
+            "episodic_num_tokens": self.episodic_memory.num_tokens,
+            "episodic_last_used": self.episodic_memory.last_used,
+            "episodic_step": self.episodic_memory.step,
+        }
+
+    def set_runtime_state(self, state: dict[str, Any] | None) -> None:
+        """Restore runtime memory buffers from `get_runtime_state()`.
+
+        Args:
+            state: A dict previously returned by `get_runtime_state()`. If None, clears
+                all runtime buffers.
+        """
+
+        if state is None:
+            self.clear_runtime_state()
+            return
+
+        # Working memory
+        self.working_memory.memory_buffer = state.get("working_memory_buffer")
+        self.working_memory.memory_count = state.get("working_memory_count", torch.tensor(0, device=self.memory_gate.device))
+        self.working_memory.num_tokens = state.get("working_num_tokens")
+
+        # Episodic memory
+        self.episodic_memory.memory_bank = state.get("episodic_memory_bank")
+        self.episodic_memory.memory_count = state.get("episodic_memory_count", torch.tensor(0, device=self.memory_gate.device))
+        self.episodic_memory.num_tokens = state.get("episodic_num_tokens")
+        self.episodic_memory.last_used = state.get("episodic_last_used")
+        self.episodic_memory.step = state.get("episodic_step", torch.tensor(0, device=self.memory_gate.device))
     
     def forward(
         self,
