@@ -752,6 +752,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             model = _vlm2_model.VLM2SubtaskWithPi05(vlm2_config, alpha=alpha).to(device)
         else:
             model = _vlm2_model.VLM2WithPi05(vlm2_config).to(device)
+    elif config.pytorch_model_name == "pi0_hamlet":
+        from openpi.models_pytorch import pi0_hamlet as _pi0_hamlet
+
+        model = _pi0_hamlet.Pi05WithHamlet(model_cfg).to(device)
+    elif config.pytorch_model_name == "pi0_memoryvla":
+        from openpi.models_pytorch import pi0_memoryvla as _pi0_memoryvla
+
+        model = _pi0_memoryvla.Pi05WithMemoryVLA(model_cfg).to(device)
     elif config.pytorch_model_name == "subtask":
         alpha = getattr(model_cfg, "alpha", 10.0)
         model = openpi.models_pytorch.pi05_subtask.PI05SubtaskPytorch(
@@ -803,7 +811,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 "Skipping weight loading. Model will be randomly initialized."
             )
         else:
-            load_strict = config.pytorch_model_name not in ("vlm2", "vlm2_subtask", "subtask")
+            load_strict = config.pytorch_model_name not in ("vlm2", "vlm2_subtask", "subtask", "pi0_hamlet", "pi0_memoryvla")
             safetensors.torch.load_model(
                 (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
                 model_path,
@@ -833,6 +841,40 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             config.num_train_steps,
         )
         decay_steps = config.num_train_steps
+
+    # Optional: LoRA-only training to reduce optimizer-state memory.
+    # This is particularly useful for smoke tests on 80GB GPUs, and matches the
+    # intent of *_lora variants (train adapters, keep backbone frozen).
+    train_lora_only_env = os.environ.get("OPENPI_TRAIN_LORA_ONLY")
+    if train_lora_only_env is None:
+        paligemma_variant = getattr(model_cfg, "paligemma_variant", "")
+        action_expert_variant = getattr(model_cfg, "action_expert_variant", "")
+        train_lora_only = ("lora" in str(paligemma_variant)) or ("lora" in str(action_expert_variant))
+    else:
+        train_lora_only = train_lora_only_env == "1"
+
+    if train_lora_only:
+        target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        keep_prefixes = (
+            "moment_token_pool",
+            "hamlet_memory",
+            "memory_to_prefix_proj",
+            "memoryvla",
+        )
+        num_trainable = 0
+        num_total = 0
+        for name, param in target.named_parameters():
+            num_total += param.numel()
+            keep = ("lora" in name) or any(name.startswith(pfx) for pfx in keep_prefixes)
+            param.requires_grad = bool(keep)
+            if param.requires_grad:
+                num_trainable += param.numel()
+        logging.info(
+            "OPENPI_TRAIN_LORA_ONLY enabled: trainable params=%d (%.2f%% of total %d)",
+            num_trainable,
+            100.0 * num_trainable / max(1, num_total),
+            num_total,
+        )
 
     optim_params = [p for p in model.parameters() if p.requires_grad]
     if len(optim_params) == 0:

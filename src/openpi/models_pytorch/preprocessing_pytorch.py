@@ -161,15 +161,12 @@ def preprocess_observation_pytorch(
             split_images = torch.split(image, batch // (1 + len(meta_image_keys)), dim=0)
             image = split_images[0]
             for i, meta_key in enumerate(meta_image_keys):
-                if is_channels_first:
-                    meta_image = split_images[i + 1].permute(0, 3, 1, 2)
-                else:
-                    meta_image = split_images[i + 1]
+                meta_image = split_images[i + 1].permute(0, 3, 1, 2)
                 out_images[meta_key] = meta_image
 
-        # Convert back to [B, C, H, W] format if it was originally channels-first
-        if is_channels_first:
-            image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        # Normalize output format to [B, C, H, W] for PyTorch image encoders.
+        if image.ndim == 4 and image.shape[-1] in (1, 3):
+            image = image.permute(0, 3, 1, 2)
 
         out_images[key] = image
 

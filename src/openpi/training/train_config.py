@@ -35,7 +35,7 @@ class TrainConfig:
 
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
-    pytorch_model_name: Literal["pi0", "vlm2", "vlm2_subtask", "subtask"] = "pi0"
+    pytorch_model_name: Literal["pi0", "pi0_hamlet", "pi0_memoryvla", "vlm2", "vlm2_subtask", "subtask"] = "pi0"
 
     vlm2_geometry_dim: int = 512
     vlm2_view_dim: int = 512
@@ -55,7 +55,10 @@ class TrainConfig:
 
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
-    data: Sequence[DataConfigFactory] = dataclasses.field(default_factory=lambda: [FakeDataConfig()])
+    # Compatibility: many configs pass a single DataConfigFactory; __post_init__ wraps it into a list.
+    data: Sequence[DataConfigFactory] | DataConfigFactory = dataclasses.field(
+        default_factory=lambda: [FakeDataConfig()]
+    )
 
     sample_weights: list[float] | None = None
 
