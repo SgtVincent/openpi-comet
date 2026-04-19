@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from openpi.models_pytorch.dtype_utils import align_inputs_to_reference_dtype_with_restore
 
 
 class QueryFusion(nn.Module):
@@ -139,10 +140,12 @@ class MemoryAttention(nn.Module):
         batch_size, n_query, _ = query.shape
         _, n_memory, _ = memory.shape
 
-        original_dtype = query.dtype
-        target_dtype = self.q_proj.weight.dtype
-        query = query.to(target_dtype)
-        memory = memory.to(target_dtype)
+        original_dtype, (query, memory) = align_inputs_to_reference_dtype_with_restore(
+            self.q_proj.weight,
+            query,
+            memory,
+            context="memory attention",
+        )
         
         # Compute Q, K, V
         q = self.q_proj(query)
@@ -160,7 +163,7 @@ class MemoryAttention(nn.Module):
         if attention_mask is not None:
             attn = attn.masked_fill(~attention_mask.unsqueeze(1), float('-inf'))
         
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
         attn = self.dropout(attn)
         
         # Apply attention

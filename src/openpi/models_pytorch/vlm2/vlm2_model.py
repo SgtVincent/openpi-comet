@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from openpi.models_pytorch.dtype_utils import align_tensors_to_reference_dtype
 from openpi.models_pytorch import preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.vlm2.view_consistent_3d import (
     ViewConsistent3DRepresentation,
@@ -33,7 +34,7 @@ from openpi.models_pytorch.vlm2.dual_memory import DualMemoryModule
 
 # Type definitions for Gemma variants
 GemmaVariant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
-PrecisionType = Literal["bfloat16", "float32"]
+PrecisionType = Literal["bfloat16", "float16", "float32"]
 
 # Try to import Pi-0.5 components
 try:
@@ -921,12 +922,12 @@ class VLM2SubtaskWithPi05(VLM2WithPi05):
 
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_action_suffix(x_t, time)
 
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+        prefix_embs, suffix_embs = align_tensors_to_reference_dtype(
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight,
+            prefix_embs,
+            suffix_embs,
+            context="language model",
+        )
         prefix_att_masks = prefix_att_masks.to(dtype=suffix_att_masks.dtype)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)

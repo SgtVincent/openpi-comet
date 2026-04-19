@@ -368,6 +368,9 @@ class TorchDataLoader:
             os.environ.setdefault("JAX_PLATFORMS", "cpu")
             os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
             os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+            # Avoid MKL worker crashes in spawned DataLoader processes on this environment.
+            os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+            os.environ.setdefault("MKL_SERVICE_FORCE_INTEL", "1")
 
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
@@ -475,6 +478,8 @@ def _worker_init_fn(worker_id: int) -> None:
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+    os.environ.setdefault("MKL_SERVICE_FORCE_INTEL", "1")
 
     # In DDP each rank spawns its own set of DataLoader workers.  Without
     # rank-aware seeding every rank's worker-k ends up with the same numpy /

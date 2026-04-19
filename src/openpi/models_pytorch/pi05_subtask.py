@@ -307,7 +307,7 @@ class PI05SubtaskPytorch(PI0Pytorch):
 
         for step in range(max_tokens):
             if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1, dtype=torch.float32).to(logits.dtype)
                 next_token = torch.multinomial(probs, 1)
             else:
                 next_token = logits[:, -1].argmax(dim=-1, keepdim=True)

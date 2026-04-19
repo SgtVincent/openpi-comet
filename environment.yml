@@ -167,6 +167,8 @@ dependencies:
   - zlib-ng=2.3.3
   - zstd=1.5.7
   - pip:
+      - accelerate==1.13.0
+      - deepspeed==0.18.8
       - absl-py==2.3.0
       - addict==2.4.0
       - aenum==3.1.16
@@ -296,7 +298,7 @@ dependencies:
       - jupyterlab-widgets==3.0.15
       - jupytext==1.19.1
       - kiwisolver==1.4.8
-      - lerobot==0.3.4
+      - lerobot @ git+https://github.com/huggingface/lerobot@577cd10974b84bea1f06b6472eb9e5e74e07f77a
       - llvmlite==0.46.0
       - lxml==6.0.2
       - markdown-it-py==3.0.0
@@ -339,7 +341,6 @@ dependencies:
       - nvidia-nvtx-cu12==12.6.77
       - oauthlib==3.2.2
       - omegaconf==2.3.0
-      - omnigibson==3.7.2
       - open3d==0.19.0
       - opencv-python==4.11.0.86
       - opencv-python-headless==4.11.0.86

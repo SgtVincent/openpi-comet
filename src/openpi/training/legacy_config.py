@@ -44,7 +44,7 @@ _LEGACY_CONFIGS = [
                 base_config=DataConfig(
                     prompt_from_task=True,
                     episodes_index=list(range(200)),
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["turning_on_radio"],
                     fine_grained_level=0,
                 ),
@@ -155,7 +155,7 @@ _LEGACY_CONFIGS = [
                 base_config=DataConfig(
                     prompt_from_task=True,
                     episodes_index=list(range(200)),
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     fine_grained_level=0,
                 ),
             ),
@@ -219,7 +219,7 @@ _LEGACY_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["turning_on_radio"],
                     fine_grained_level=0,
                 ),
@@ -258,7 +258,7 @@ _LEGACY_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["turning_on_radio"],
                     fine_grained_level=0,
                 ),
@@ -299,7 +299,7 @@ _LEGACY_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                 ),
@@ -340,7 +340,7 @@ _LEGACY_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                 ),
@@ -375,7 +375,7 @@ _LEGACY_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                 ),

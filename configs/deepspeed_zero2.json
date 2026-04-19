@@ -1,0 +1,25 @@
+{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_clipping": 1.0,
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 500000000,
+    "allgather_bucket_size": 500000000
+  },
+  "bf16": {
+    "enabled": true
+  },
+  "torch_autocast": {
+    "enabled": true,
+    "dtype": "bfloat16",
+    "lower_precision_safe_modules": [
+      "torch.nn.Linear",
+      "torch.nn.Conv1d",
+      "torch.nn.Conv2d",
+      "torch.nn.Conv3d"
+    ]
+  }
+}

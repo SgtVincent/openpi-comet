@@ -26,6 +26,7 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from torch.nn.init import _calculate_fan_in_and_fan_out
 
+from openpi.models_pytorch.dtype_utils import align_tensors_to_reference_dtype
 from ...activations import ACT2FN
 from ...modeling_attn_mask_utils import _prepare_4d_attention_mask
 from ...modeling_layers import GradientCheckpointingLayer
@@ -773,9 +774,13 @@ class SiglipVisionTransformer(nn.Module):
         )
 
         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
-        # Convert to bfloat16 if the encoder uses bfloat16
-        if len(self.encoder.layers) > 0 and self.encoder.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(torch.bfloat16)
+        # Align activations to the encoder compute dtype, but only for standard floating dtypes.
+        if len(self.encoder.layers) > 0:
+            (hidden_states,) = align_tensors_to_reference_dtype(
+                self.encoder.layers[0].self_attn.q_proj.weight,
+                hidden_states,
+                context="encoder",
+            )
 
         encoder_outputs: BaseModelOutput = self.encoder(
             inputs_embeds=hidden_states,

@@ -30,7 +30,7 @@ _SFT_MAKE_PIZZA_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                 ),
@@ -73,7 +73,7 @@ _SFT_MAKE_PIZZA_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                 ),
@@ -118,7 +118,7 @@ _SFT_MAKE_PIZZA_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                 ),
@@ -159,7 +159,7 @@ _SFT_MAKE_PIZZA_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                     subtask_source="annotations_skill",
@@ -215,7 +215,7 @@ _SFT_MAKE_PIZZA_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                     subtask_source="annotations_skill",
@@ -264,7 +264,7 @@ _SFT_MAKE_PIZZA_CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                    behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                     tasks=["make_pizza"],
                     fine_grained_level=0,
                     subtask_source="annotations_skill",

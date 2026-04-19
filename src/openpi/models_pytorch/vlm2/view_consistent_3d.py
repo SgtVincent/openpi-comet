@@ -16,11 +16,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from openpi.models_pytorch.dtype_utils import align_inputs_to_reference_dtype_with_restore
+
 
 def get_safe_dtype(target_dtype: torch.dtype, device_type: str) -> torch.dtype:
     """Get a safe dtype for the given device type."""
     if device_type == "cpu":
-        if target_dtype == torch.bfloat16:
+        if target_dtype in (torch.bfloat16, torch.float16):
             return torch.float32
     return target_dtype
 
@@ -181,10 +183,12 @@ class Adaptive3DPositionInjection(nn.Module):
         pos_emb = create_sinusoidal_3d_embedding(coords, self.visual_dim)
 
         # Align dtypes for MLP and gate networks
-        original_dtype = visual_tokens.dtype
-        target_dtype = self.pos_mlp[0].weight.dtype
-        visual_tokens = visual_tokens.to(target_dtype)
-        pos_emb = pos_emb.to(target_dtype)
+        original_dtype, (visual_tokens, pos_emb) = align_inputs_to_reference_dtype_with_restore(
+            self.pos_mlp[0].weight,
+            visual_tokens,
+            pos_emb,
+            context="position injection",
+        )
 
         # Apply position MLP: φ(Ct)
         pos_features = self.pos_mlp(pos_emb)
@@ -355,10 +359,12 @@ class SemanticGeometricFusion(nn.Module):
         _, n_geo, _ = geometry_tokens.shape
 
         # Align dtypes for projections
-        original_dtype = visual_tokens.dtype
-        target_dtype = self.q_proj.weight.dtype
-        visual_tokens = visual_tokens.to(target_dtype)
-        geometry_tokens = geometry_tokens.to(target_dtype)
+        original_dtype, (visual_tokens, geometry_tokens) = align_inputs_to_reference_dtype_with_restore(
+            self.q_proj.weight,
+            visual_tokens,
+            geometry_tokens,
+            context="semantic geometric fusion",
+        )
         
         # Compute Q, K, V
         q = self.q_proj(visual_tokens)  # (batch, n_visual, visual_dim)
@@ -376,7 +382,7 @@ class SemanticGeometricFusion(nn.Module):
         if attention_mask is not None:
             attn = attn.masked_fill(~attention_mask.unsqueeze(1), float('-inf'))
         
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
         attn = self.dropout(attn)
         
         # Apply attention to values

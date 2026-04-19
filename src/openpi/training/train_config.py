@@ -33,9 +33,16 @@ class TrainConfig:
 
     pytorch_weight_path: str | None = None
 
-    pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+    # NOTE: "float16" is supported for quick perf/sanity experiments on GPUs that
+    # accelerate fp16 (e.g., V100). It is generally less numerically stable for
+    # Gemma/PaliGemma fine-tuning than bf16.
+    pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "bfloat16"
 
     pytorch_model_name: Literal["pi0", "vlm2", "vlm2_subtask", "subtask"] = "pi0"
+
+    # Accelerate controls (used by scripts/train_accelerate.py). Defaults preserve existing behavior.
+    gradient_accumulation_steps: int = 1
+    accelerate_mixed_precision: Literal["no", "fp16", "bf16"] | None = None
 
     vlm2_geometry_dim: int = 512
     vlm2_view_dim: int = 512
@@ -122,6 +129,9 @@ class TrainConfig:
         # Compatibility: Allow passing a single DataConfigFactory by wrapping it in a list.
         if not isinstance(self.data, (list, tuple)):
             object.__setattr__(self, "data", [self.data])
+
+        if self.gradient_accumulation_steps <= 0:
+            raise ValueError("--gradient_accumulation_steps must be a positive integer.")
 
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")

@@ -13,12 +13,14 @@ from openpi.models_pytorch.action_experts import create_action_expert
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
+logger = logging.getLogger(__name__)
+
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "cpu":
-        # CPU doesn't support bfloat16, use float32 instead
-        if target_dtype == torch.bfloat16:
+        # CPU doesn't support bfloat16/float16 well, use float32 instead
+        if target_dtype in (torch.bfloat16, torch.float16):
             return torch.float32
         if target_dtype == torch.float64:
             return torch.float64
@@ -124,14 +126,18 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
+        msg = (
+            "transformers_replace compatibility check failed. "
+            "openpi-comet now patches SigLIP init at runtime, so manual `cp` into site-packages should not be required. "
+            "If model creation still fails, check local `src/openpi/models_pytorch/gemma_pytorch.py` and transformers version compatibility."
+        )
         try:
             from transformers.models.siglip import check
 
             if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
+                logger.warning(msg)
         except ImportError:
-            raise ValueError(msg) from None
+            logger.warning(msg)
 
         self.action_expert = create_action_expert(
             action_expert_name,

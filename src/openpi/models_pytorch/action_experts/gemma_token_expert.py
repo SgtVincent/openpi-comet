@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from openpi.models_pytorch.action_experts.base import ActionExpert
+from openpi.models_pytorch.dtype_utils import align_tensors_to_reference_dtype
 
 
 class GemmaTokenExpert(ActionExpert):
@@ -48,12 +49,12 @@ class GemmaTokenExpert(ActionExpert):
     ) -> torch.Tensor:
         prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = model.embed_suffix(state, x_t, time)
-        if (
-            model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+        prefix_embs, suffix_embs = align_tensors_to_reference_dtype(
+            model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight,
+            prefix_embs,
+            suffix_embs,
+            context="language model",
+        )
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -112,4 +113,3 @@ class GemmaTokenExpert(ActionExpert):
         suffix_out = suffix_out[:, -model.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return model.action_out_proj(suffix_out)
-
