@@ -96,23 +96,21 @@ class Policy(BasePolicy):
         observation = _model.Observation.from_dict(inputs)
 
         generated_subtask = None
-        if (
-            self._is_pytorch_model
-            and hasattr(self._model, "predict_subtask_tokens")
-            and hasattr(self._model, "build_hierarchical_observation")
-            and getattr(observation, "subtask_mask", None) is not None
-            and not bool(torch.any(observation.subtask_mask).item())
+        if self._is_pytorch_model and hasattr(self._model, "predict_subtask_tokens") and hasattr(
+            self._model, "build_hierarchical_observation"
         ):
-            if self._cached_subtask_prompt == raw_prompt and self._cached_subtask_tokens is not None:
-                subtask_tokens = self._cached_subtask_tokens
-                generated_subtask = self._cached_subtask_text
-            else:
-                subtask_tokens = self._model.predict_subtask_tokens(observation)
-                generated_texts = self._model.decode_subtask_tokens(subtask_tokens)
-                generated_subtask = generated_texts[0] if generated_texts else None
-                self._cached_subtask_prompt = raw_prompt
-                self._cached_subtask_tokens = subtask_tokens
-                self._cached_subtask_text = generated_subtask
+            subtask_mask = getattr(observation, "subtask_mask", None)
+            should_predict_subtask = subtask_mask is None or (not bool(torch.any(subtask_mask).item()))
+        else:
+            should_predict_subtask = False
+
+        if should_predict_subtask:
+            # The high-level subtask should depend on the current observation.
+            # Caching by raw task prompt makes it effectively constant for the
+            # whole episode because the prompt usually never changes.
+            subtask_tokens = self._model.predict_subtask_tokens(observation)
+            generated_texts = self._model.decode_subtask_tokens(subtask_tokens)
+            generated_subtask = generated_texts[0] if generated_texts else None
             observation = self._model.build_hierarchical_observation(observation, subtask_tokens)
 
         start_time = time.monotonic()
@@ -130,6 +128,10 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if generated_subtask is None and hasattr(self._model, "_last_predicted_subtasks"):
+            predicted = getattr(self._model, "_last_predicted_subtasks", None)
+            if isinstance(predicted, list) and predicted:
+                generated_subtask = predicted[0]
         if generated_subtask is not None:
             outputs["generated_subtask"] = generated_subtask
         return outputs

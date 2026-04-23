@@ -267,6 +267,7 @@ class PI05SubtaskPytorch(PI0Pytorch):
         *,
         max_tokens: int = 64,
         temperature: float = 0.0,
+        min_tokens: int = 1,
     ) -> torch.Tensor:
         images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
 
@@ -292,6 +293,7 @@ class PI05SubtaskPytorch(PI0Pytorch):
         device = prefix_embs.device
         embed_weight = self.paligemma_with_expert.paligemma.language_model.embed_tokens.weight
         emb_dim = embed_weight.shape[1]
+        lm_head = self.paligemma_with_expert.paligemma.lm_head
 
         seq_indices = torch.arange(prefix_hidden.shape[1], device=device).unsqueeze(0)
         last_pos = torch.max(
@@ -299,13 +301,15 @@ class PI05SubtaskPytorch(PI0Pytorch):
             dim=1,
         ).values
         last_hidden = prefix_hidden[torch.arange(batch_size, device=device), last_pos][:, None, :]
-        logits = torch.matmul(last_hidden.to(embed_weight.dtype), embed_weight.T)
+        logits = lm_head(last_hidden)
 
         eos_token = self._eos_token_id()
         generated_tokens = []
         next_pos = prefix_pad_masks.sum(dim=-1).to(torch.int64)
 
         for step in range(max_tokens):
+            if step < min_tokens:
+                logits[:, -1, eos_token] = -torch.inf
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = torch.multinomial(probs, 1)
@@ -330,7 +334,7 @@ class PI05SubtaskPytorch(PI0Pytorch):
             )
             last_hidden = out.last_hidden_state
             past_kv = out.past_key_values
-            logits = torch.matmul(last_hidden.to(embed_weight.dtype), embed_weight.T)
+            logits = lm_head(last_hidden)
             next_pos = next_pos + 1
 
         if not generated_tokens:

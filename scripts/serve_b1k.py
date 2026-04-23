@@ -46,6 +46,8 @@ class Args:
     # If provided, will be used in case the "prompt" key is not present in the data, or if the model doesn't have a default
     # prompt.
     default_prompt: str | None = None
+    # If provided, overrides the task prompt injected by the B1K eval wrapper.
+    prompt_override: str | None = None
 
     # Dataset root, used to retrieve the prompt of the task if taskname is not None.
     dataset_root: str | None = "/scr/behavior/2025-challenge-demos"
@@ -93,6 +95,7 @@ def main(args: Args) -> None:
     policy = B1KPolicyWrapper(
         policy,
         task_name=args.task_name,
+        prompt_override=args.prompt_override,
         control_mode=args.control_mode,
         max_len=args.max_len,
         action_horizon=args.action_horizon,
@@ -101,7 +104,10 @@ def main(args: Args) -> None:
     )
 
     hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
+    try:
+        local_ip = socket.gethostbyname(hostname)
+    except socket.gaierror:
+        local_ip = "127.0.0.1"
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
 
     server = WebsocketPolicyServer(

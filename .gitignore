@@ -184,3 +184,4 @@ log
 # Checkpoints and large artifacts
 checkpoints/
 hf_datasets_cache/
+segment_eval_runs/

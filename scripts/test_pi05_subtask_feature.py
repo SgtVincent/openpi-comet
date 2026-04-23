@@ -647,6 +647,10 @@ def _run_policy_validation(
     repeat: int,
     expect_generated_subtask: bool,
     label: str,
+    prompt: str | None,
+    require_nonempty_subtask: bool,
+    require_deterministic: bool,
+    require_not_prompt_copy: bool,
 ) -> None:
     first_generated_subtask = None
     for run_idx in range(repeat):
@@ -665,13 +669,28 @@ def _run_policy_validation(
             raise AssertionError("Hierarchical inference did not expose generated_subtask in policy output.")
         if not expect_generated_subtask and "generated_subtask" in result:
             raise AssertionError("Ground-truth subtask path unexpectedly returned generated_subtask.")
+        if expect_generated_subtask and require_nonempty_subtask:
+            if not isinstance(generated_subtask, str) or not generated_subtask.strip():
+                raise AssertionError(f"generated_subtask is empty / not a string: {generated_subtask!r}")
+        if (
+            expect_generated_subtask
+            and require_not_prompt_copy
+            and prompt is not None
+            and isinstance(generated_subtask, str)
+            and generated_subtask.strip().lower() == prompt.strip().lower()
+        ):
+            raise AssertionError("generated_subtask equals prompt (verbatim); looks like prompt copying.")
 
         if run_idx == 0:
             first_generated_subtask = generated_subtask
         elif expect_generated_subtask and generated_subtask != first_generated_subtask:
-            raise AssertionError(
-                "Repeated inference with the same prompt produced a different generated_subtask; cache path may be broken."
+            msg = (
+                "Repeated inference with the same observation produced a different generated_subtask. "
+                "This can happen due to nondeterminism; set --require-deterministic to fail."
             )
+            if require_deterministic:
+                raise AssertionError(msg)
+            LOGGER.warning(msg)
 
         LOGGER.info(
             "%s infer run %d OK in %.1f ms: generated_subtask=%r action_shape=%s action_range=[%.4f, %.4f]",
@@ -695,7 +714,7 @@ def _resolve_inference_modes(args: argparse.Namespace) -> list[str]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate PI05_SUBTASK data wiring and hierarchical inference")
-    parser.add_argument("--config", type=str, default="pi05_subtask_b1k-pt50_cs32_bs64_lr2.5e-5_5ep")
+    parser.add_argument("--config", type=str, default="pi05_b1k_skill-pt12_pretrain_lr1e-4_2ep")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--source", choices=("auto", "dataset", "dummy"), default="auto")
@@ -712,6 +731,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--run-train-smoke", action="store_true")
     parser.add_argument("--skip-infer", action="store_true")
     parser.add_argument("--trace-file", type=str, default=None)
+    parser.add_argument(
+        "--require-nonempty-subtask",
+        action="store_true",
+        help="Fail if hierarchical inference returns an empty generated_subtask.",
+    )
+    parser.add_argument(
+        "--require-deterministic",
+        action="store_true",
+        help="Fail if repeated inference on the same observation produces different generated_subtask.",
+    )
+    parser.add_argument(
+        "--require-not-prompt-copy",
+        action="store_true",
+        help="Fail if generated_subtask equals the prompt verbatim (case-insensitive).",
+    )
+    parser.add_argument(
+        "--probe-variation",
+        choices=("none", "state", "images", "both"),
+        default="state",
+        help="Run an extra probe with a modified observation to detect prompt-only caching.",
+    )
+    parser.add_argument(
+        "--require-variation",
+        action="store_true",
+        help="Fail if the probe variation still produces the exact same generated_subtask.",
+    )
     args = parser.parse_args()
     if args.use_ground_truth_subtask and args.inference_mode == "both":
         args.inference_mode = "ground-truth"
@@ -777,21 +822,51 @@ if __name__ == "__main__":
             trace_file=trace_file,
         )
         _trace(trace_file, "policy_built")
-        for inference_mode in _resolve_inference_modes(args):
-            use_ground_truth_subtask = inference_mode == "ground-truth"
-            policy_obs = _prepare_policy_obs(
-                raw_sample,
-                prompt=args.prompt if source_name == "dummy" else None,
-                force_hierarchical=not use_ground_truth_subtask,
-            )
+
+        # Prepare a single policy observation for inference-side validation.
+        base_obs = _prepare_policy_obs(raw_sample, prompt=args.prompt, force_hierarchical=True)
+        prompt_text = base_obs.get("prompt")
+        if not isinstance(prompt_text, str):
+            prompt_text = None
+
+        for mode in _resolve_inference_modes(args):
+            # ground-truth mode keeps subtask_text in the obs
+            obs = _prepare_policy_obs(raw_sample, prompt=args.prompt, force_hierarchical=(mode != "ground-truth"))
+            label = f"[{mode}]"
             _run_policy_validation(
                 policy,
-                policy_obs,
+                obs,
                 repeat=args.repeat_infer,
-                expect_generated_subtask=not use_ground_truth_subtask,
-                label=inference_mode,
+                expect_generated_subtask=(mode != "ground-truth"),
+                label=label,
+                prompt=prompt_text,
+                require_nonempty_subtask=args.require_nonempty_subtask,
+                require_deterministic=args.require_deterministic,
+                require_not_prompt_copy=args.require_not_prompt_copy,
             )
-            _trace(trace_file, f"inference_ok:{inference_mode}")
+
+        # Extra probe: modify observation to ensure we are not caching purely by prompt.
+        if args.probe_variation != "none":
+            probe_obs = dict(base_obs)
+            if args.probe_variation in ("state", "both") and "observation/state" in probe_obs:
+                # Small deterministic perturbation.
+                probe_obs["observation/state"] = np.asarray(probe_obs["observation/state"]).copy()
+                probe_obs["observation/state"].flat[0] = float(probe_obs["observation/state"].flat[0]) + 0.123
+            if args.probe_variation in ("images", "both"):
+                for k in ("observation/egocentric_camera", "observation/wrist_image_left", "observation/wrist_image_right"):
+                    if k in probe_obs:
+                        probe_obs[k] = np.random.randint(0, 256, np.asarray(probe_obs[k]).shape, dtype=np.uint8)
+
+            base_out = policy.infer(base_obs)
+            probe_out = policy.infer(probe_obs)
+            base_st = base_out.get("generated_subtask")
+            probe_st = probe_out.get("generated_subtask")
+            LOGGER.info("probe_variation=%s base_subtask=%r probe_subtask=%r", args.probe_variation, base_st, probe_st)
+            if args.require_variation and base_st == probe_st:
+                raise AssertionError(
+                    "Probe variation did not change generated_subtask. This can be legitimate, "
+                    "but often indicates prompt copying or missing conditioning."
+                )
 
         LOGGER.info("PI05_SUBTASK validation finished successfully.")
         _trace(trace_file, "validation_success")

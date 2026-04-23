@@ -77,10 +77,8 @@ MODEL_HOST="${MODEL_HOST:-127.0.0.1}"
 
 OPENPI_ENV="${OPENPI_ENV:-openpi-comet-nas}"
 OPENPI_PYTHON="${OPENPI_PYTHON:-}"
-BEHAVIOR_ENV="${BEHAVIOR_ENV:-behavior}"
 BEHAVIOR_DIR="${BEHAVIOR_DIR:-/home/ubuntu/repo/BEHAVIOR-1K}"
 
-OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_b1k-base}"
 CONTROL_MODE="${CONTROL_MODE:-receeding_horizon}"
 MAX_LEN="${MAX_LEN:-32}"
 
@@ -93,12 +91,8 @@ MAX_STEPS="${MAX_STEPS:-}"
 SIM_DISPLAY="${SIM_DISPLAY:-${DISPLAY:-:10.0}}"
 SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-10}"
 ENV_WRAPPER_TARGET="${ENV_WRAPPER_TARGET:-omnigibson.learning.wrappers.RGBWrapper}"
-
+SIM_DISPLAY="${SIM_DISPLAY:-${DISPLAY:-:10.0}}"
 SAVE_ROLLOUT="${SAVE_ROLLOUT:-false}"
-PERTURB_POSE="${PERTURB_POSE:-false}"
-PERTURB_POSE_SEED="${PERTURB_POSE_SEED:-42}"
-PARALLEL_EVALUATOR_START_IDX="${PARALLEL_EVALUATOR_START_IDX:-0}"
-PARALLEL_EVALUATOR_END_IDX="${PARALLEL_EVALUATOR_END_IDX:-10}"
 
 XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.40}"
@@ -111,13 +105,6 @@ is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" > 0 ))
 }
 
-parse_csv_ints() {
-  local csv="$1"
-  local -n out_ref="$2"
-  out_ref=()
-  local raw item
-  IFS=',' read -r -a raw <<< "$csv"
-  for item in "${raw[@]}"; do
     item="${item//[[:space:]]/}"
     [[ -z "$item" ]] && continue
     [[ "$item" =~ ^[0-9]+$ ]] || die "invalid integer: $item"
@@ -205,28 +192,6 @@ resolve_openpi_runtime() {
     log "OpenPi runtime: OPENPI_PYTHON=$OPENPI_PYTHON"
   else
     log "OpenPi runtime: conda env '$OPENPI_ENV'"
-  fi
-}
-
-assign_eval_ids() {
-  local worker_count="$1"
-  WORKER_TO_IDS=()
-  local i
-  for ((i=0; i<worker_count; i++)); do
-    WORKER_TO_IDS[i]=""
-  done
-  for ((i=0; i<${#EVAL_IDS[@]}; i++)); do
-    local w=$(( i % worker_count ))
-    if [[ -z "${WORKER_TO_IDS[w]}" ]]; then
-      WORKER_TO_IDS[w]="${EVAL_IDS[i]}"
-    else
-      WORKER_TO_IDS[w]="${WORKER_TO_IDS[w]},${EVAL_IDS[i]}"
-    fi
-  done
-}
-
-launch_server() {
-  local gpu="$1"
   local port="$2"
   local log_file="$3"
 
@@ -270,17 +235,12 @@ launch_eval() {
   local eval_out="$OUT_DIR/eval_gpu${gpu}_p${port}"
   mkdir -p "$eval_out"
 
-  local max_steps_arg=""
   local env_wrapper_arg=""
   local eval_custom_args=""
 
-  [[ -n "$MAX_STEPS" ]] && max_steps_arg="max_steps=$MAX_STEPS"
-  [[ -n "$ENV_WRAPPER_TARGET" ]] && env_wrapper_arg="env_wrapper._target_=$ENV_WRAPPER_TARGET"
-
   if [[ "$EVAL_ENTRYPOINT" == "eval_custom.py" ]]; then
-    eval_custom_args="use_parallel_evaluator=false save_rollout=$SAVE_ROLLOUT perturb_pose=$PERTURB_POSE perturb_pose_seed=$PERTURB_POSE_SEED parallel_evaluator_start_idx=$PARALLEL_EVALUATOR_START_IDX parallel_evaluator_end_idx=$PARALLEL_EVALUATOR_END_IDX"
-  fi
-
+      exec conda run -n \"$OPENPI_ENV\" --no-capture-output \
+        python scripts/serve_b1k.py \
   setsid bash -c "
     set -euo pipefail
     cd \"$BEHAVIOR_DIR\"
@@ -322,32 +282,27 @@ cleanup() {
   for pid in "${EVAL_PIDS[@]:-}"; do
     if kill -0 "$pid" 2>/dev/null; then
       kill -- -"$pid" 2>/dev/null || true
+  if [[ -n "$BEHAVIOR_PYTHON" ]]; then
+    local python_cmd="$BEHAVIOR_PYTHON"
+  else
+    local python_cmd="conda run -n \"$BEHAVIOR_ENV\" --no-capture-output python"
+  fi
+
       kill "$pid" 2>/dev/null || true
     fi
   done
-}
-
-run_single_checkpoint_mode() {
-  command -v conda >/dev/null 2>&1 || die "conda not found in PATH"
-  [[ -d "$BEHAVIOR_DIR" ]] || die "BEHAVIOR_DIR not found: $BEHAVIOR_DIR"
-  [[ "$EVAL_ENTRYPOINT" == "eval.py" || "$EVAL_ENTRYPOINT" == "eval_custom.py" ]] || die "EVAL_ENTRYPOINT must be eval.py|eval_custom.py"
-
-  CKPT_DIR="$(resolve_checkpoint_dir "$CKPT_DIR")"
-  [[ -d "$CKPT_DIR" ]] || die "CKPT_DIR not found: $CKPT_DIR"
-
-  resolve_openpi_runtime
-
-  WORKER_GPUS=()
-  resolve_gpu_pool WORKER_GPUS
+    export CUDA_VISIBLE_DEVICES=\"$gpu\"
+    unset OMNIGIBSON_GPU_ID
 
   parse_csv_ints "$EVAL_INSTANCE_IDS" EVAL_IDS
-  local id
+  local eval_id_upper=9
+  if [[ "$EVAL_EXTRA_OVERRIDES" == *"eval_on_train_instances=true"* ]]; then
+    eval_id_upper=199
+  fi
   for id in "${EVAL_IDS[@]}"; do
-    (( id >= 0 && id <= 9 )) || die "eval instance id out of range [0,9]: $id"
+    (( id >= 0 && id <= eval_id_upper )) || die "eval instance id out of range [0,${eval_id_upper}]: $id"
   done
-
-  assign_eval_ids "${#WORKER_GPUS[@]}"
-
+    exec $python_cmd \"OmniGibson/omnigibson/learning/$EVAL_ENTRYPOINT\" \
   local run_name_ckpt="$(basename "$CKPT_DIR")"
   RUN_TAG="${RUN_TAG:-parallel_${TASK_NAME}_${run_name_ckpt}_$(date +%Y%m%d_%H%M%S)}"
   OUT_DIR="${OUT_DIR:-$REPO_ROOT/eval_logs/$RUN_TAG}"
@@ -383,8 +338,6 @@ run_single_checkpoint_mode() {
     local worker_port=$((PORT_BASE + i))
     local server_log="$OUT_DIR/server_gpu${WORKER_GPUS[i]}_p${worker_port}.log"
     launch_server "${WORKER_GPUS[i]}" "$worker_port" "$server_log"
-  done
-
   log "Waiting ${SERVER_STARTUP_WAIT}s for server warm-up..."
   sleep "$SERVER_STARTUP_WAIT"
 
@@ -395,7 +348,6 @@ run_single_checkpoint_mode() {
     launch_eval "${WORKER_GPUS[i]}" "$worker_port" "${WORKER_TO_IDS[i]}"
   done
 
-  (( ${#EVAL_PIDS[@]} > 0 )) || die "no evaluators were started"
   log "Launched ${#SERVER_PIDS[@]} server(s) and ${#EVAL_PIDS[@]} evaluator(s)."
 
   local overall_rc=0
@@ -450,10 +402,6 @@ run_multi_checkpoint_mode() {
       (( slot < remainder )) && per_model_gpus=$(( per_model_gpus + 1 ))
 
       declare -a assigned_gpus=("${MULTI_GPUS[@]:gpu_cursor:per_model_gpus}")
-      local assigned_gpu_csv
-      assigned_gpu_csv="$(IFS=,; echo "${assigned_gpus[*]}")"
-      gpu_cursor=$(( gpu_cursor + per_model_gpus ))
-
       local port_base=$(( PORT_BASE_START + model_index * PORT_STRIDE ))
       local run_tag="parallel_${TASK_NAME}_m$((model_index + 1))_$(basename "$ckpt")_$(date +%Y%m%d_%H%M%S)"
 
@@ -470,12 +418,7 @@ run_multi_checkpoint_mode() {
           export RUN_TAG="$run_tag"
           bash "$SCRIPT_PATH" "$ckpt"
         ) &
-        batch_pids+=("$!")
-      fi
-
-      model_index=$(( model_index + 1 ))
-    done
-
+    log "All evaluators completed successfully. Logs: $OUT_DIR"
     if [[ "$DRY_RUN" == "true" ]]; then
       continue
     fi
