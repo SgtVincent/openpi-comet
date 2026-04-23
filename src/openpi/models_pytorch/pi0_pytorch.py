@@ -294,6 +294,11 @@ class PI0Pytorch(nn.Module):
         time_emb = time_emb.type(dtype=timestep.dtype)
 
         # Fuse timestep + action information using an MLP
+        # Align noisy_actions to the projection layer compute dtype to avoid fp16/bf16 mismatch
+        # under DeepSpeed/Accelerate mixed precision.
+        if isinstance(noisy_actions, torch.Tensor) and noisy_actions.dtype != self.action_in_proj.weight.dtype:
+            noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
+
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
@@ -364,7 +369,8 @@ class PI0Pytorch(nn.Module):
             time=time,
         )
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        # Keep flow-loss math in fp32 to reduce fp16 overflow risk on V100.
+        return F.mse_loss(u_t.float(), v_t.float(), reduction="none")
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

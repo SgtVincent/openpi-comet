@@ -43,6 +43,7 @@ class TrainConfig:
     # Accelerate controls (used by scripts/train_accelerate.py). Defaults preserve existing behavior.
     gradient_accumulation_steps: int = 1
     accelerate_mixed_precision: Literal["no", "fp16", "bf16"] | None = None
+    debug_overflow: bool = False
 
     vlm2_geometry_dim: int = 512
     vlm2_view_dim: int = 512
@@ -132,6 +133,9 @@ class TrainConfig:
 
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("--gradient_accumulation_steps must be a positive integer.")
+
+        if not isinstance(self.debug_overflow, bool):
+            raise ValueError("--debug_overflow must be a boolean flag.")
 
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")

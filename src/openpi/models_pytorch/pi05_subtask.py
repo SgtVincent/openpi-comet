@@ -153,8 +153,8 @@ class PI05SubtaskPytorch(PI0Pytorch):
             v_t = result["v_t"]
             ce_loss = result["ce_loss"].mean()
 
-            # Flow matching loss
-            flow_loss = F.mse_loss(u_t, v_t, reduction="mean")
+            # Compute flow loss in fp32 for numerical stability under fp16 training.
+            flow_loss = F.mse_loss(u_t.float(), v_t.float(), reduction="mean")
 
             # Combined loss: CE + alpha * flow_matching (Equation 1)
             combined_loss = ce_loss + self.alpha * flow_loss
@@ -176,7 +176,7 @@ class PI05SubtaskPytorch(PI0Pytorch):
                 x_t=x_t,
                 time=time,
             )
-            flow_loss = F.mse_loss(u_t, v_t, reduction="mean")
+            flow_loss = F.mse_loss(u_t.float(), v_t.float(), reduction="mean")
 
             return {
                 "loss": flow_loss,

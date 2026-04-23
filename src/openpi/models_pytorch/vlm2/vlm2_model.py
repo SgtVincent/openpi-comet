@@ -951,7 +951,7 @@ class VLM2SubtaskWithPi05(VLM2WithPi05):
         suffix_out = suffix_out[:, -self.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t_pred = self.action_out_proj(suffix_out)
-        flow_loss = F.mse_loss(v_t_pred, u_t, reduction="mean")
+        flow_loss = F.mse_loss(v_t_pred.float(), u_t.float(), reduction="mean")
 
         if not has_subtask:
             return {

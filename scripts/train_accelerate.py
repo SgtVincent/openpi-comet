@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import faulthandler
+import functools
 import gc
 import logging
 import os
@@ -31,6 +32,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 faulthandler.enable()
 faulthandler.register(signal.SIGUSR1, all_threads=True)
@@ -382,6 +384,274 @@ def _infer_accelerate_mixed_precision(config: _config.TrainConfig) -> str:
     return "no"
 
 
+def _safe_set_nested(config: dict, key_path: str, value) -> None:
+    keys = key_path.split(".")
+    node = config
+    for key in keys[:-1]:
+        child = node.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            node[key] = child
+        node = child
+    node[keys[-1]] = value
+
+
+def _patch_deepspeed_config(
+    ds_config: dict,
+    *,
+    effective_batch_size: int,
+    grad_accum_steps: int,
+    world_size: int,
+    precision: str,
+    clip_grad_norm: float,
+) -> None:
+    ds_config["train_micro_batch_size_per_gpu"] = int(effective_batch_size)
+    ds_config["gradient_accumulation_steps"] = int(grad_accum_steps)
+    ds_config["train_batch_size"] = int(effective_batch_size * grad_accum_steps * world_size)
+    ds_config["gradient_clipping"] = float(clip_grad_norm)
+
+    if precision == "bfloat16":
+        _safe_set_nested(ds_config, "bf16.enabled", True)
+        _safe_set_nested(ds_config, "fp16.enabled", False)
+    elif precision == "float16":
+        _safe_set_nested(ds_config, "bf16.enabled", False)
+        _safe_set_nested(ds_config, "fp16.enabled", True)
+        _safe_set_nested(ds_config, "fp16.auto_cast", False)
+    else:
+        _safe_set_nested(ds_config, "bf16.enabled", False)
+        _safe_set_nested(ds_config, "fp16.enabled", False)
+
+    # Do not combine DeepSpeed precision engines with torch_autocast.
+    _safe_set_nested(ds_config, "torch_autocast.enabled", False)
+
+
+def _validate_deepspeed_precision_config(accelerator: Accelerator, ds_config: dict, *, precision: str) -> None:
+    ds_fp16 = bool(ds_config.get("fp16", {}).get("enabled", False))
+    ds_bf16 = bool(ds_config.get("bf16", {}).get("enabled", False))
+    ds_torch_autocast = bool(ds_config.get("torch_autocast", {}).get("enabled", False))
+
+    if ds_torch_autocast:
+        raise ValueError("DeepSpeed torch_autocast.enabled must be false when using the Accelerate trainer.")
+    if precision == "float16" and not ds_fp16:
+        raise ValueError("Requested float16 training but DeepSpeed fp16.enabled=false.")
+    if precision == "bfloat16" and not ds_bf16:
+        raise ValueError("Requested bfloat16 training but DeepSpeed bf16.enabled=false.")
+    if precision == "float32" and (ds_fp16 or ds_bf16):
+        raise ValueError("Requested float32 training but DeepSpeed fp16/bf16 is still enabled.")
+
+    accel_mp = accelerator.mixed_precision
+    if precision == "float16" and accel_mp not in ("fp16", "no"):
+        raise ValueError(f"Requested float16 training but accelerator.mixed_precision={accel_mp}.")
+    if precision == "bfloat16" and accel_mp not in ("bf16", "no"):
+        raise ValueError(f"Requested bfloat16 training but accelerator.mixed_precision={accel_mp}.")
+    if precision == "float32" and accel_mp != "no":
+        raise ValueError(f"Requested float32 training but accelerator.mixed_precision={accel_mp}.")
+
+
+def _patch_deepspeed_autocast(accelerator: Accelerator) -> None:
+    """Patch DeepSpeed engine to be transparent to external torch.autocast contexts.
+
+    In DeepSpeed >= 0.17.2, ``autocast_if_enabled()`` wraps the engine forward.
+    When ``torch_autocast.enabled=false`` in the DS config (which we force to
+    avoid double mixed-precision with ``fp16.enabled=true``), the engine detects
+    an outer ``torch.autocast`` and **explicitly disables** it via
+    ``torch.autocast(enabled=False)``.  This strips autocast from the entire
+    forward pass, causing float32-activation-vs-float16-weight mismatches.
+
+    The patch makes ``torch_autocast_enabled`` / ``torch_autocast_dtype`` on the
+    engine fall through to the active ``torch.autocast`` state so that the
+    engine re-enables (rather than disables) autocast during forward.
+    """
+    if getattr(accelerator.state, "deepspeed_plugin", None) is None:
+        return
+
+    try:
+        from deepspeed.runtime.engine import DeepSpeedEngine
+    except ImportError:
+        return
+
+    if getattr(DeepSpeedEngine, "_openpi_autocast_patched", False):
+        return
+
+    _orig_enabled = DeepSpeedEngine.torch_autocast_enabled
+    _orig_dtype = DeepSpeedEngine.torch_autocast_dtype
+
+    def _patched_enabled(self):
+        return _orig_enabled(self) or torch.is_autocast_enabled()
+
+    def _patched_dtype(self):
+        if not _orig_enabled(self) and torch.is_autocast_enabled():
+            return torch.get_autocast_dtype("cuda")
+        return _orig_dtype(self)
+
+    DeepSpeedEngine.torch_autocast_enabled = _patched_enabled
+    DeepSpeedEngine.torch_autocast_dtype = _patched_dtype
+    DeepSpeedEngine._openpi_autocast_patched = True
+    logging.info(
+        "Patched DeepSpeedEngine autocast: engine now falls through to external torch.autocast context."
+    )
+
+
+def _patch_deepspeed_loss_scaler() -> None:
+    """Keep training when dynamic loss scale reaches the configured minimum.
+
+    Some DeepSpeed versions type `fp16.min_loss_scale` as an integer config field,
+    which prevents using fractional minima such as `1e-8`. In long V100 FP16 runs,
+    occasional overflow events can still drive the scaler down to the minimum.
+    Instead of hard-failing the whole job at that point, keep DeepSpeed's normal
+    overflow behavior (skip step + hold/reduce scale) and disable the fatal exit.
+    """
+    try:
+        from deepspeed.runtime.fp16.loss_scaler import DynamicLossScaler
+    except ImportError:
+        return
+
+    if getattr(DynamicLossScaler, "_openpi_min_scale_patched", False):
+        return
+
+    _orig_init = DynamicLossScaler.__init__
+
+    @functools.wraps(_orig_init)
+    def _patched_init(
+        self,
+        init_scale,
+        scale_window,
+        min_scale,
+        delayed_shift,
+        consecutive_hysteresis,
+        raise_error_at_min_scale=True,
+        dtype=torch.half,
+    ):
+        return _orig_init(
+            self,
+            init_scale,
+            scale_window,
+            min_scale,
+            delayed_shift,
+            consecutive_hysteresis,
+            raise_error_at_min_scale=False,
+            dtype=dtype,
+        )
+
+    DynamicLossScaler.__init__ = _patched_init
+    DynamicLossScaler._openpi_min_scale_patched = True
+    logging.info(
+        "Patched DeepSpeed DynamicLossScaler: reaching min_loss_scale will skip steps instead of exiting."
+    )
+
+
+def _get_deepspeed_loss_scale(accelerator: Accelerator) -> float | None:
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
+        return None
+    # Accelerate wraps the engine; try multiple known attribute paths.
+    engine_wrapper = getattr(accelerator, "deepspeed_engine_wrapped", None)
+    engine = getattr(engine_wrapper, "engine", engine_wrapper)  # unwrap if needed
+    if engine is None:
+        return None
+
+    # Candidate objects that may hold the loss scale value:
+    # 1. engine.optimizer.loss_scaler (FP16_DeepSpeedZeroOptimizer)
+    # 2. engine.optimizer  (sometimes exposes cur_scale directly)
+    # 3. engine itself     (DeepSpeedEngine.loss_scale property)
+    optimizer = getattr(engine, "optimizer", None)
+    loss_scaler = getattr(optimizer, "loss_scaler", None) if optimizer is not None else None
+    candidates = [obj for obj in (loss_scaler, optimizer, engine) if obj is not None]
+
+    for obj in candidates:
+        for attr in ("cur_scale", "loss_scale"):
+            value = getattr(obj, attr, None)
+            if value is None:
+                continue
+            try:
+                return float(value.item() if hasattr(value, "item") else value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _debug_overflow_enabled(config: _config.TrainConfig) -> bool:
+    return bool(getattr(config, "debug_overflow", False))
+
+
+def _summarize_tensor_for_debug(name: str, value: torch.Tensor) -> str:
+    tensor = value.detach()
+    finite_mask = torch.isfinite(tensor)
+    finite_count = int(finite_mask.sum().item())
+    total_count = tensor.numel()
+    if finite_count > 0:
+        finite_tensor = tensor[finite_mask].float()
+        min_value = float(finite_tensor.min().item())
+        max_value = float(finite_tensor.max().item())
+        mean_abs = float(finite_tensor.abs().mean().item())
+    else:
+        min_value = float("nan")
+        max_value = float("nan")
+        mean_abs = float("nan")
+    return (
+        f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"finite={finite_count}/{total_count} min={min_value:.6g} "
+        f"max={max_value:.6g} mean_abs={mean_abs:.6g}"
+    )
+
+
+def _log_nonfinite_batch_state(*, loss: torch.Tensor, actions: torch.Tensor, observation) -> None:
+    logging.error(
+        "Encountered non-finite loss before backward: value=%s dtype=%s",
+        loss.detach().float().item(),
+        loss.dtype,
+    )
+    logging.error(_summarize_tensor_for_debug("actions", actions))
+
+    for attr_name in ("state", "images", "image_masks", "tokenized_prompt", "tokenized_prompt_mask"):
+        tensor = getattr(observation, attr_name, None)
+        if isinstance(tensor, torch.Tensor):
+            logging.error(_summarize_tensor_for_debug(f"observation.{attr_name}", tensor))
+
+
+def _collect_grad_debug_stats(parameters, accelerator: Accelerator) -> dict[str, float]:
+    device = accelerator.device
+    global_norm_sq = torch.zeros(1, device=device, dtype=torch.float64)
+    max_abs_grad = torch.zeros(1, device=device, dtype=torch.float32)
+    nonfinite_count = torch.zeros(1, device=device, dtype=torch.float32)
+    total_grad_elements = torch.zeros(1, device=device, dtype=torch.float32)
+    grad_tensors = torch.zeros(1, device=device, dtype=torch.float32)
+
+    for param in parameters:
+        grad = getattr(param, "grad", None)
+        if grad is None:
+            continue
+        grad_tensors += 1
+        grad_data = grad.detach()
+        total_grad_elements += float(grad_data.numel())
+        finite_mask = torch.isfinite(grad_data)
+        nonfinite_count += (~finite_mask).sum().to(torch.float32)
+        if finite_mask.any():
+            finite_grad = grad_data[finite_mask].float()
+            global_norm_sq += finite_grad.pow(2).sum(dtype=torch.float64)
+            max_abs_grad = torch.maximum(max_abs_grad, finite_grad.abs().max().to(torch.float32))
+
+    global_norm_sq = cast(torch.Tensor, accelerator.reduce(global_norm_sq, reduction="sum"))
+    max_abs_grad = cast(torch.Tensor, accelerator.reduce(max_abs_grad, reduction="max"))
+    nonfinite_count = cast(torch.Tensor, accelerator.reduce(nonfinite_count, reduction="sum"))
+    total_grad_elements = cast(torch.Tensor, accelerator.reduce(total_grad_elements, reduction="sum"))
+    grad_tensors = cast(torch.Tensor, accelerator.reduce(grad_tensors, reduction="sum"))
+
+    total_grad_elements_value = float(total_grad_elements.item())
+    nonfinite_count_value = float(nonfinite_count.item())
+    finite_ratio = 1.0
+    if total_grad_elements_value > 0:
+        finite_ratio = max(0.0, 1.0 - nonfinite_count_value / total_grad_elements_value)
+
+    return {
+        "global_norm": float(torch.sqrt(global_norm_sq).item()),
+        "max_abs_grad": float(max_abs_grad.item()),
+        "nonfinite_count": nonfinite_count_value,
+        "total_grad_elements": total_grad_elements_value,
+        "finite_ratio": finite_ratio,
+        "grad_tensors": float(grad_tensors.item()),
+    }
+
+
 def _atomic_write_checkpoint_dir(tmp_dir: Path, final_dir: Path) -> None:
     if final_dir.exists():
         shutil.rmtree(final_dir)
@@ -559,28 +829,25 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     # Populate the DeepSpeed plugin config explicitly before `prepare()`.
     if accelerator.distributed_type == DistributedType.DEEPSPEED:
         ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
-        ds_config["train_micro_batch_size_per_gpu"] = int(effective_batch_size)
-        ds_config["gradient_accumulation_steps"] = int(accelerator.gradient_accumulation_steps)
-        ds_config["train_batch_size"] = int(
-            effective_batch_size * accelerator.gradient_accumulation_steps * world_size
-        )
         precision = str(config.pytorch_training_precision)
-        ds_config.setdefault("bf16", {})
-        ds_config.setdefault("fp16", {})
-        ds_config.setdefault("torch_autocast", {})
-        ds_config["bf16"]["enabled"] = precision == "bfloat16"
-        ds_config["fp16"]["enabled"] = precision == "float16"
-        ds_config["torch_autocast"]["enabled"] = precision in ("bfloat16", "float16")
-        ds_config["torch_autocast"]["dtype"] = "bfloat16" if precision == "bfloat16" else "float16"
+        _patch_deepspeed_config(
+            ds_config,
+            effective_batch_size=int(effective_batch_size),
+            grad_accum_steps=int(accelerator.gradient_accumulation_steps),
+            world_size=int(world_size),
+            precision=precision,
+            clip_grad_norm=float(config.optimizer.clip_gradient_norm),
+        )
+        _validate_deepspeed_precision_config(accelerator, ds_config, precision=precision)
         if is_main:
             logging.info(
-                "Patched DeepSpeed config: train_micro_batch_size_per_gpu=%s gradient_accumulation_steps=%s train_batch_size=%s bf16=%s fp16=%s autocast_dtype=%s",
-                ds_config["train_micro_batch_size_per_gpu"],
-                ds_config["gradient_accumulation_steps"],
-                ds_config["train_batch_size"],
-                ds_config["bf16"]["enabled"],
-                ds_config["fp16"]["enabled"],
-                ds_config["torch_autocast"]["dtype"],
+                "Patched DeepSpeed config: micro_bs=%s grad_accum=%s train_bs=%s bf16=%s fp16=%s grad_clip=%s",
+                ds_config.get("train_micro_batch_size_per_gpu"),
+                ds_config.get("gradient_accumulation_steps"),
+                ds_config.get("train_batch_size"),
+                ds_config.get("bf16", {}).get("enabled", False),
+                ds_config.get("fp16", {}).get("enabled", False),
+                ds_config.get("gradient_clipping"),
             )
 
     loader, data_config = build_datasets(config)
@@ -779,8 +1046,15 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
 
+    if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
+        _patch_deepspeed_loss_scaler()
+
     # Prepare with Accelerator (DDP or DeepSpeed).
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+
+    # Patch DeepSpeed engine to not disable our outer torch.autocast context.
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        _patch_deepspeed_autocast(accelerator)
 
     # Resume (after prepare so that accelerator can restore distributed states).
     global_step = 0
@@ -839,6 +1113,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     start_time = time.time()
     infos: list[dict[str, float]] = []
+    consecutive_skipped_updates = 0
+    max_consecutive_skipped_updates = int(os.environ.get("OPENPI_MAX_CONSECUTIVE_SKIPPED_UPDATES", "50"))
 
     pbar = (
         tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
@@ -874,14 +1150,20 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     ds_plugin is not None
                     and ds_plugin.deepspeed_config.get("torch_autocast", {}).get("enabled", False)
                 )
+                # If DeepSpeed has torch_autocast enabled, do not wrap another autocast context.
+                # Otherwise, we enable autocast for half-precision modes to avoid dtype mismatch
+                # (e.g., fp16 weights with fp32 activations).
                 use_autocast = (
-                    config.pytorch_training_precision == "bfloat16"
-                    and accelerator.device.type == "cuda"
+                    accelerator.device.type == "cuda"
+                    and config.pytorch_training_precision in ("bfloat16", "float16")
                     and not ds_uses_torch_autocast
+                )
+                autocast_dtype = (
+                    torch.bfloat16 if config.pytorch_training_precision == "bfloat16" else torch.float16
                 )
                 with torch.autocast(
                     device_type=accelerator.device.type,
-                    dtype=torch.bfloat16,
+                    dtype=autocast_dtype,
                     enabled=use_autocast,
                 ):
                     if profile_memory:
@@ -935,38 +1217,115 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     else:
                         loss = losses.mean()
 
+                if not torch.isfinite(loss.detach()):
+                    if is_main:
+                        _log_nonfinite_batch_state(loss=loss, actions=actions, observation=observation)
+                    raise FloatingPointError("Encountered non-finite loss before backward.")
+
                 if profile_memory:
                     log_memory_usage(accelerator, global_step, "after_forward")
 
-                loss = loss.float()
                 if profile_memory:
                     _reset_peak_memory_stats(accelerator)
                 accelerator.backward(loss)
                 if profile_memory:
                     log_memory_usage(accelerator, global_step, "after_backward")
 
+                loss_for_log = float(loss.detach().float().item())
+                loss_scale = _get_deepspeed_loss_scale(accelerator)
                 if accelerator.sync_gradients:
                     if global_step < 5 and is_main and torch.cuda.is_available() and not profile_memory:
                         log_memory_usage(accelerator, global_step, "after_backward")
 
-                    grad_norm = accelerator.clip_grad_norm_(optim_params, max_norm=config.optimizer.clip_gradient_norm)
+                    grad_stats_pre = None
+                    grad_stats_post = None
+                    clip_threshold = float(config.optimizer.clip_gradient_norm)
+                    if _debug_overflow_enabled(config):
+                        grad_stats_pre = _collect_grad_debug_stats(optim_params, accelerator)
+
+                    grad_norm = accelerator.clip_grad_norm_(optim_params, max_norm=clip_threshold)
+
+                    if _debug_overflow_enabled(config):
+                        grad_stats_post = _collect_grad_debug_stats(optim_params, accelerator)
+                        if is_main:
+                            grad_norm_value = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+                            clipping_triggered = grad_norm_value > clip_threshold
+                            logging.info(
+                                "overflow_debug step=%s loss=%.6f loss_scale=%s clip_threshold=%.4f "
+                                "grad_norm_pre=%.6f grad_norm_api=%.6f grad_norm_post=%.6f "
+                                "max_abs_pre=%.6f max_abs_post=%.6f nonfinite_pre=%d nonfinite_post=%d "
+                                "finite_ratio_pre=%.8f finite_ratio_post=%.8f grad_tensors=%.0f clipped=%s",
+                                global_step,
+                                loss_for_log,
+                                f"{loss_scale:.1f}" if loss_scale is not None else "n/a",
+                                clip_threshold,
+                                grad_stats_pre["global_norm"],
+                                grad_norm_value,
+                                grad_stats_post["global_norm"],
+                                grad_stats_pre["max_abs_grad"],
+                                grad_stats_post["max_abs_grad"],
+                                int(grad_stats_pre["nonfinite_count"]),
+                                int(grad_stats_post["nonfinite_count"]),
+                                grad_stats_pre["finite_ratio"],
+                                grad_stats_post["finite_ratio"],
+                                grad_stats_pre["grad_tensors"],
+                                clipping_triggered,
+                            )
+                            if grad_stats_pre["nonfinite_count"] > 0 or grad_stats_post["nonfinite_count"] > 0:
+                                logging.warning(
+                                    "overflow_debug detected non-finite gradients at step=%s (pre=%d post=%d)",
+                                    global_step,
+                                    int(grad_stats_pre["nonfinite_count"]),
+                                    int(grad_stats_post["nonfinite_count"]),
+                                )
+                            if loss_scale is not None and loss_scale <= 1.0:
+                                logging.warning("overflow_debug loss scale collapsed to %.1f at step=%s", loss_scale, global_step)
                     if profile_memory:
                         _reset_peak_memory_stats(accelerator)
                     optimizer.step()
+                    step_was_skipped = accelerator.optimizer_step_was_skipped
                     if profile_memory:
                         log_memory_usage(accelerator, global_step, "after_optimizer_step")
                     optimizer.zero_grad(set_to_none=True)
+
+                    if step_was_skipped:
+                        consecutive_skipped_updates += 1
+                        if is_main:
+                            logging.warning(
+                                "Optimizer step skipped due to overflow at global_step=%s loss=%.6f "
+                                "loss_scale=%s consecutive_skipped_updates=%s",
+                                global_step,
+                                loss_for_log,
+                                f"{loss_scale:.1f}" if loss_scale is not None else "n/a",
+                                consecutive_skipped_updates,
+                            )
+                        if consecutive_skipped_updates >= max_consecutive_skipped_updates:
+                            raise RuntimeError(
+                                "Too many consecutive optimizer steps were skipped due to overflow. "
+                                f"Reached {consecutive_skipped_updates} skipped updates."
+                            )
+                        continue
+
+                    consecutive_skipped_updates = 0
 
                     # stats/logging use optimizer-step granularity
                     if is_main:
                         infos.append(
                             {
-                                "loss": loss.item(),
+                                "loss": loss_for_log,
                                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
                                 **extra_metrics,
                             }
                         )
+                        if loss_scale is not None:
+                            infos[-1]["loss_scale"] = loss_scale
+                            # Always warn on dangerously low loss scale (regardless of debug mode)
+                            if loss_scale < 1.0:
+                                logging.warning(
+                                    "loss_scale=%.2e at step=%s — training may be numerically unstable",
+                                    loss_scale, global_step,
+                                )
 
                     if is_main and (global_step % int(config.log_interval) == 0):
                         elapsed = time.time() - start_time
@@ -983,8 +1342,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         avg_loss = sum(info["loss"] for info in infos) / len(infos)
                         avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
                         avg_grad_norm = sum(info["grad_norm"] for info in infos) / len(infos)
+                        avg_loss_scale = None
+                        loss_scale_values = [info["loss_scale"] for info in infos if "loss_scale" in info]
+                        if loss_scale_values:
+                            avg_loss_scale = sum(loss_scale_values) / len(loss_scale_values)
                         logging.info(
-                            "step=%s epoch=%s epoch_step=%s/%s loss=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
+                            "step=%s epoch=%s epoch_step=%s/%s loss=%.4f lr=%.2e grad_norm=%.2f loss_scale=%s time=%.1fs",
                             global_step,
                             epoch,
                             epoch_step,
@@ -992,6 +1355,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             avg_loss,
                             avg_lr,
                             avg_grad_norm,
+                            f"{avg_loss_scale:.1f}" if avg_loss_scale is not None else "n/a",
                             elapsed,
                         )
 
@@ -1007,6 +1371,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 "steps_per_epoch": float(steps_per_epoch),
                                 "time_per_step": elapsed / max(1, int(config.log_interval)),
                             }
+                            if avg_loss_scale is not None:
+                                log_payload["loss_scale"] = avg_loss_scale
                             for metric_key in ("flow_loss", "ce_loss"):
                                 vals = [info[metric_key] for info in infos if metric_key in info]
                                 if vals:
@@ -1032,7 +1398,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         pbar.update(1)
                         pbar.set_postfix(
                             {
-                                "loss": f"{loss.item():.4f}",
+                                "loss": f"{loss_for_log:.4f}",
                                 "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                                 "step": current_step,
                             }

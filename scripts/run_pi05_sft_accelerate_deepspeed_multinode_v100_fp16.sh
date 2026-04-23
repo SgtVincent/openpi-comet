@@ -119,9 +119,9 @@ BASE_PI05_CKPT="${BASE_PI05_CKPT:-${REPO_ROOT}/checkpoints/pi05_base_pytorch}"
 DEFAULT_B1K_ASSETS_DIR="${REPO_ROOT}/checkpoints/openpi_comet/pi05-b1kpt50-cs32/assets"
 B1K_ASSETS_DIR="${B1K_ASSETS_DIR:-${DEFAULT_B1K_ASSETS_DIR}}"
 
-SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
-KEEP_PERIOD="${KEEP_PERIOD:-100000}"
-SAVE_AT_EPOCH_END_ONLY="${SAVE_AT_EPOCH_END_ONLY:-1}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"
+KEEP_PERIOD="${KEEP_PERIOD:-10000}"
+SAVE_AT_EPOCH_END_ONLY="${SAVE_AT_EPOCH_END_ONLY:-0}"
 FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-0}"
 PREPARE_HF_CACHE_ONLY="${PREPARE_HF_CACHE_ONLY:-0}"
 
@@ -166,25 +166,44 @@ if [[ -z "${EXP_NAME:-}" ]]; then
   RUN_KEY="${RUN_KEY// /_}"
 
   EXP_NAME_FILE="${EXP_NAME_SYNC_DIR}/pi05_accel_make_pizza_${RUN_KEY}.txt"
+  # Record the wall-clock "script start" boundary so non-rank0 can reject any EXP_NAME_FILE
+  # that was left behind by a previous run. We compare against file mtime below.
+  # NOTE: touching this sentinel is critical to fix the cross-run race where non-rank0
+  # reads a stale EXP_NAME_FILE from a prior (crashed) run before rank0 overwrites it.
+  _script_start_sentinel="${EXP_NAME_SYNC_DIR}/.node${NODE_RANK}.start_sentinel.$$"
+  mkdir -p "${EXP_NAME_SYNC_DIR}"
+  : > "${_script_start_sentinel}"
+  trap 'rm -f "${_script_start_sentinel}"' EXIT
   if [[ "${NODE_RANK}" == "0" ]]; then
-    mkdir -p "${EXP_NAME_SYNC_DIR}"
     if [[ "${RESUME:-0}" == "1" && -s "${EXP_NAME_FILE}" ]]; then
       EXP_NAME="$(cat "${EXP_NAME_FILE}")"
     else
+      # Proactively remove any stale EXP_NAME_FILE from a prior run so that non-rank0
+      # cannot accidentally read it (race condition fix).
+      rm -f "${EXP_NAME_FILE}"
       EXP_NAME="${CONFIG_NAME}_accel_ds_z${DEEPSPEED_STAGE}_v100fp16_${NUM_NODES}n${GPUS_PER_NODE}g_${TIMESTAMP}"
       _tmp_exp_name_file="${EXP_NAME_FILE}.$$.$RANDOM.tmp"
       printf "%s\n" "${EXP_NAME}" > "${_tmp_exp_name_file}"
       mv -f "${_tmp_exp_name_file}" "${EXP_NAME_FILE}"
+      # Bump mtime so non-rank0 can detect that this file belongs to the current run.
+      touch "${EXP_NAME_FILE}"
     fi
   else
+    # Wait for an EXP_NAME_FILE that was WRITTEN AFTER this node's start sentinel.
+    # This rejects stale files from crashed prior runs that share the same RUN_KEY.
+    _start_ts=$(stat -c %Y "${_script_start_sentinel}" 2>/dev/null || echo 0)
     for _i in $(seq 1 600); do
       if [[ -s "${EXP_NAME_FILE}" ]]; then
-        break
+        _file_ts=$(stat -c %Y "${EXP_NAME_FILE}" 2>/dev/null || echo 0)
+        if [[ "${_file_ts}" -ge "${_start_ts}" ]]; then
+          break
+        fi
       fi
       sleep 1
     done
-    if [[ ! -s "${EXP_NAME_FILE}" ]]; then
-      echo "Timed out waiting for EXP_NAME_FILE: ${EXP_NAME_FILE}" >&2
+    _file_ts=$(stat -c %Y "${EXP_NAME_FILE}" 2>/dev/null || echo 0)
+    if [[ ! -s "${EXP_NAME_FILE}" || "${_file_ts}" -lt "${_start_ts}" ]]; then
+      echo "Timed out waiting for fresh EXP_NAME_FILE (>= ${_start_ts}): ${EXP_NAME_FILE} (mtime=${_file_ts})" >&2
       exit 1
     fi
     EXP_NAME="$(cat "${EXP_NAME_FILE}")"
@@ -307,6 +326,11 @@ fi
 if [[ -n "${PYTORCH_TRAINING_PRECISION}" ]]; then
   EXTRA_ARGS+=(--pytorch-training-precision "${PYTORCH_TRAINING_PRECISION}")
 fi
+case "${DEBUG_OVERFLOW:-0}" in
+  1|true|TRUE|True|yes|YES|y|Y)
+    EXTRA_ARGS+=(--debug-overflow)
+    ;;
+esac
 
 # ============================================================
 # Multi-node accelerate launch
