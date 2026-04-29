@@ -170,7 +170,8 @@ cython_debug/
 
 experiments/
 
-outputs
+outputs/
+output/
 eval_logs/
 log
 .github/# Local editor and project files
