@@ -19,6 +19,7 @@ class Pi05WithMemoryVLA(PI0Pytorch):
     ) -> None:
         super().__init__(config, action_expert_name=action_expert_name, action_expert_kwargs=action_expert_kwargs)
         feature_dim = self.paligemma_with_expert.paligemma.config.text_config.hidden_size
+        self.prefix_summary_proj = nn.Linear(feature_dim, feature_dim)
         self.memoryvla = MemoryVLAModule(
             feature_dim=feature_dim,
             bank_capacity=config.memoryvla_bank_capacity,
@@ -64,42 +65,24 @@ class Pi05WithMemoryVLA(PI0Pytorch):
             self._active_session_id = None
             self.memoryvla.reset_runtime_state()
 
-    def _encode_prefix_hidden(
-        self,
-        prefix_embs: torch.Tensor,
-        prefix_pad_masks: torch.Tensor,
-        prefix_att_masks: torch.Tensor,
-    ) -> torch.Tensor:
-        prefix_att_2d_masks = self.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        outputs, _ = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=False,
-        )
-        assert outputs is not None
-        if isinstance(outputs, list):
-            outputs = outputs[0]
-        return outputs
+    def _masked_prefix_summary(self, prefix_embs: torch.Tensor, prefix_pad_masks: torch.Tensor) -> torch.Tensor:
+        weights = prefix_pad_masks.to(dtype=prefix_embs.dtype).unsqueeze(-1)
+        denom = torch.clamp(weights.sum(dim=1), min=1.0)
+        return (prefix_embs * weights).sum(dim=1) / denom
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        prefix_hidden = self._encode_prefix_hidden(prefix_embs, prefix_pad_masks, prefix_att_masks)
-        current_summary = prefix_hidden.mean(dim=1)
+        prefix_summary = self._masked_prefix_summary(prefix_embs, prefix_pad_masks)
         # The MemoryVLA-specific modules are loaded/stored in float32, while the
         # backbone often runs in bfloat16 during eval. Run the memory branch in
         # the module dtype and cast back before concatenating with the prefix.
         memory_dtype = self.prefix_summary_proj.weight.dtype
-        current_tokens = self.prefix_summary_proj(current_summary.to(dtype=memory_dtype)).unsqueeze(1)
+        current_tokens = self.prefix_summary_proj(prefix_summary.to(dtype=memory_dtype)).unsqueeze(1)
         memory_tokens, gate = self.memoryvla(current_tokens, update_memory=not self.training)
         self._last_memory_gate = gate
-        if self._active_session_id is not None:
+        if not self.training and self._active_session_id is not None:
             self._session_memory_state[self._active_session_id] = self.memoryvla.get_runtime_state()
         memory_tokens = self.memory_to_prefix_proj(memory_tokens).to(dtype=prefix_embs.dtype)
 

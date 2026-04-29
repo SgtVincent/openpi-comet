@@ -21,6 +21,7 @@ class Pi05WithHamlet(PI0Pytorch):
         super().__init__(config, action_expert_name=action_expert_name, action_expert_kwargs=action_expert_kwargs)
         feature_dim = self.paligemma_with_expert.paligemma.config.text_config.hidden_size
         self.moment_token_pool = MomentTokenPool(config.hamlet_num_moment_tokens, feature_dim)
+        self.prefix_summary_proj = nn.Linear(feature_dim, feature_dim)
         self.hamlet_memory = HamletMemoryAdapter(
             feature_dim=feature_dim,
             num_moment_tokens=config.hamlet_num_moment_tokens,
@@ -68,50 +69,24 @@ class Pi05WithHamlet(PI0Pytorch):
             self._active_session_id = None
             self.hamlet_memory.reset_runtime_state()
 
-    def _encode_current_moment_tokens(
-        self,
-        prefix_embs: torch.Tensor,
-        prefix_pad_masks: torch.Tensor,
-        prefix_att_masks: torch.Tensor,
-    ) -> torch.Tensor:
+    def _masked_prefix_summary(self, prefix_embs: torch.Tensor, prefix_pad_masks: torch.Tensor) -> torch.Tensor:
+        weights = prefix_pad_masks.to(dtype=prefix_embs.dtype).unsqueeze(-1)
+        denom = torch.clamp(weights.sum(dim=1), min=1.0)
+        return (prefix_embs * weights).sum(dim=1) / denom
+
+    def _encode_current_moment_tokens(self, prefix_embs: torch.Tensor, prefix_pad_masks: torch.Tensor) -> torch.Tensor:
         batch_size = prefix_embs.shape[0]
-        moment_tokens = self.moment_token_pool(batch_size).to(device=prefix_embs.device, dtype=prefix_embs.dtype)
-        moment_pad_masks = torch.ones(
-            batch_size,
-            self.config.hamlet_num_moment_tokens,
-            dtype=prefix_pad_masks.dtype,
-            device=prefix_pad_masks.device,
-        )
-        moment_att_masks = torch.zeros(
-            batch_size,
-            self.config.hamlet_num_moment_tokens,
-            dtype=prefix_att_masks.dtype,
-            device=prefix_att_masks.device,
-        )
-        prefix_with_moment_embs = torch.cat([prefix_embs, moment_tokens], dim=1)
-        prefix_with_moment_pad_masks = torch.cat([prefix_pad_masks, moment_pad_masks], dim=1)
-        prefix_with_moment_att_masks = torch.cat([prefix_att_masks, moment_att_masks], dim=1)
-        prefix_att_2d_masks = self.make_att_2d_masks(prefix_with_moment_pad_masks, prefix_with_moment_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_with_moment_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        outputs, _ = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_with_moment_embs, None],
-            use_cache=False,
-        )
-        assert outputs is not None
-        if isinstance(outputs, list):
-            outputs = outputs[0]
-        return outputs[:, -self.config.hamlet_num_moment_tokens :, :]
+        base_moment_tokens = self.moment_token_pool(batch_size).to(device=prefix_embs.device, dtype=prefix_embs.dtype)
+        prefix_summary = self._masked_prefix_summary(prefix_embs, prefix_pad_masks)
+        proj_dtype = self.prefix_summary_proj.weight.dtype
+        summary_context = self.prefix_summary_proj(prefix_summary.to(dtype=proj_dtype)).to(dtype=prefix_embs.dtype).unsqueeze(1)
+        return base_moment_tokens + summary_context
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        current_moment_tokens = self._encode_current_moment_tokens(prefix_embs, prefix_pad_masks, prefix_att_masks)
+        current_moment_tokens = self._encode_current_moment_tokens(prefix_embs, prefix_pad_masks)
         # Keep the HAMLET memory branch in its module dtype to avoid bfloat16 /
         # float32 mismatches with the main backbone during eval.
         memory_dtype = self.memory_to_prefix_proj.weight.dtype
@@ -119,12 +94,12 @@ class Pi05WithHamlet(PI0Pytorch):
             current_moment_tokens.to(dtype=memory_dtype),
             update_memory=not self.training,
         )
-        if self._active_session_id is not None:
+        if not self.training and self._active_session_id is not None:
             self._session_memory_state[self._active_session_id] = self.hamlet_memory.get_runtime_state()
         memory_tokens = self.memory_to_prefix_proj(memory_tokens).to(dtype=prefix_embs.dtype)
 
         batch_size = prefix_embs.shape[0]
-        moment_input_tokens = self.moment_token_pool(batch_size).to(device=prefix_embs.device, dtype=prefix_embs.dtype)
+        moment_input_tokens = current_moment_tokens.to(device=prefix_embs.device, dtype=prefix_embs.dtype)
         extra_pad_masks = torch.ones(
             batch_size,
             self.config.hamlet_num_moment_tokens * 2,

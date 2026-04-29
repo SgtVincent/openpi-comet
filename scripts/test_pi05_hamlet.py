@@ -56,6 +56,7 @@ def _build_smoke_model() -> Pi05WithHamlet:
     model.config = SimpleNamespace(hamlet_num_moment_tokens=4, action_horizon=32, action_dim=32)
     model.training = False
     model.moment_token_pool = MomentTokenPool(num_tokens=4, feature_dim=8)
+    model.prefix_summary_proj = torch.nn.Identity()
     model.hamlet_memory = HamletMemoryAdapter(feature_dim=8, num_moment_tokens=4, history_length=2, num_heads=2, num_layers=1)
     model.memory_to_prefix_proj = torch.nn.Identity()
     model.paligemma_with_expert = _DummyPaliGemmaExpert()

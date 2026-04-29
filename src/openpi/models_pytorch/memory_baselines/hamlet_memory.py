@@ -64,15 +64,18 @@ class HamletMemoryAdapter(nn.Module):
 
         self.register_buffer("history_buffer", None, persistent=False)
         self.register_buffer("history_count", torch.tensor(0), persistent=False)
+        self.register_buffer("history_write_index", torch.tensor(0), persistent=False)
 
     def reset_runtime_state(self) -> None:
         self.history_buffer = None
         self.history_count = torch.tensor(0, device=self.gate.device)
+        self.history_write_index = torch.tensor(0, device=self.gate.device)
 
     def get_runtime_state(self) -> dict[str, Any]:
         return {
             "history_buffer": self.history_buffer,
             "history_count": self.history_count,
+            "history_write_index": self.history_write_index,
         }
 
     def set_runtime_state(self, state: dict[str, Any] | None) -> None:
@@ -81,17 +84,51 @@ class HamletMemoryAdapter(nn.Module):
             return
         self.history_buffer = state.get("history_buffer")
         self.history_count = state.get("history_count", torch.tensor(0, device=self.gate.device))
+        self.history_write_index = state.get("history_write_index", torch.tensor(0, device=self.gate.device))
+
+    def _ensure_history_buffer(self, current_moment_tokens: torch.Tensor) -> None:
+        batch_size, _, feature_dim = current_moment_tokens.shape
+        if (
+            self.history_buffer is not None
+            and self.history_buffer.shape[0] == batch_size
+            and self.history_buffer.shape[2] == self.num_moment_tokens
+            and self.history_buffer.shape[3] == feature_dim
+            and self.history_buffer.device == current_moment_tokens.device
+            and self.history_buffer.dtype == current_moment_tokens.dtype
+        ):
+            return
+        self.history_buffer = torch.zeros(
+            batch_size,
+            self.history_length,
+            self.num_moment_tokens,
+            feature_dim,
+            device=current_moment_tokens.device,
+            dtype=current_moment_tokens.dtype,
+        )
+        self.history_count = torch.tensor(0, device=current_moment_tokens.device)
+        self.history_write_index = torch.tensor(0, device=current_moment_tokens.device)
+
+    def _get_history_steps(self) -> torch.Tensor | None:
+        if self.history_buffer is None:
+            return None
+        count = int(self.history_count.item())
+        if count <= 0:
+            return None
+        if count < self.history_length:
+            return self.history_buffer[:, :count]
+        write_index = int(self.history_write_index.item())
+        if write_index == 0:
+            return self.history_buffer
+        return torch.cat([self.history_buffer[:, write_index:], self.history_buffer[:, :write_index]], dim=1)
 
     def _append_history(self, current_moment_tokens: torch.Tensor) -> None:
-        current_step = current_moment_tokens.detach().unsqueeze(1)
-        if self.history_buffer is None:
-            self.history_buffer = current_step
-        elif int(self.history_count.item()) < self.history_length:
-            self.history_buffer = torch.cat([self.history_buffer, current_step], dim=1)
-        else:
-            self.history_buffer = torch.cat([self.history_buffer[:, 1:], current_step], dim=1)
+        self._ensure_history_buffer(current_moment_tokens)
+        assert self.history_buffer is not None
+        write_index = int(self.history_write_index.item())
+        self.history_buffer[:, write_index].copy_(current_moment_tokens.detach())
         next_count = min(int(self.history_count.item()) + 1, self.history_length)
         self.history_count = torch.tensor(next_count, device=current_moment_tokens.device)
+        self.history_write_index = torch.tensor((write_index + 1) % self.history_length, device=current_moment_tokens.device)
 
     def get_memory_stats(self) -> dict[str, int]:
         return {
@@ -111,8 +148,9 @@ class HamletMemoryAdapter(nn.Module):
             self.reset_runtime_state()
 
         history_steps: list[torch.Tensor] = []
-        if self.history_buffer is not None and int(self.history_count.item()) > 0:
-            history_steps.append(self.history_buffer[:, : int(self.history_count.item())])
+        stored_history = self._get_history_steps()
+        if stored_history is not None:
+            history_steps.append(stored_history)
         history_steps.append(current_moment_tokens.unsqueeze(1))
 
         sequence = torch.cat(history_steps, dim=1)  # (B, steps, M, D)

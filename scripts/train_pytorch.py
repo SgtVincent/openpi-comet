@@ -305,55 +305,63 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, *, force: bool = False):
     """Save a checkpoint with model state, optimizer state, and metadata."""
-    # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
-        if is_main:
-            # Create temporary directory for atomic checkpoint saving
-            final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-            tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+    # Only save if it's time to save, if it's the final step, or if forced by caller (e.g., epoch-end save).
+    if not force and not (
+        (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1
+    ):
+        return
+    if is_main:
+        # Create temporary directory for atomic checkpoint saving
+        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
 
-            # Remove any existing temp directory and create new one
-            if tmp_ckpt_dir.exists():
-                shutil.rmtree(tmp_ckpt_dir)
-            tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        # Remove any existing temp directory and create new one
+        if tmp_ckpt_dir.exists():
+            shutil.rmtree(tmp_ckpt_dir)
+        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save model state using safetensors (handle shared tensors)
-            model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        # Save model state using safetensors (handle shared tensors)
+        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
-            # Save optimizer state using PyTorch format
-            torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+        # Save optimizer state using PyTorch format
+        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
-            # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
-            metadata = {
-                "global_step": global_step,
-                "config": dataclasses.asdict(config),
-                "timestamp": time.time(),
-            }
-            torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+        # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
+        metadata = {
+            "global_step": global_step,
+            "config": dataclasses.asdict(config),
+            "timestamp": time.time(),
+        }
+        torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
-            # save norm stats
-            norm_stats = data_config.norm_stats
-            if norm_stats is not None and data_config.asset_id is not None:
-                _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+        # save norm stats
+        norm_stats = data_config.norm_stats
+        if norm_stats is not None and data_config.asset_id is not None:
+            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
 
-            # Atomically move temp directory to final location
-            if final_ckpt_dir.exists():
-                shutil.rmtree(final_ckpt_dir)
-            tmp_ckpt_dir.rename(final_ckpt_dir)
+        # Atomically move temp directory to final location
+        if final_ckpt_dir.exists():
+            shutil.rmtree(final_ckpt_dir)
+        tmp_ckpt_dir.rename(final_ckpt_dir)
 
-            logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+        logging.info(
+            "Saved checkpoint at step %s -> %s%s",
+            global_step,
+            final_ckpt_dir,
+            " (forced)" if force else "",
+        )
 
-            # Log checkpoint to wandb
-            if config.wandb_enabled:
-                wandb = _get_wandb()
-                wandb.log({"checkpoint_step": global_step}, step=global_step)
+        # Log checkpoint to wandb
+        if config.wandb_enabled:
+            wandb = _get_wandb()
+            wandb.log({"checkpoint_step": global_step}, step=global_step)
         
-        # Synchronize all ranks after saving to prevent timeout on other ranks
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+    # Synchronize all ranks after saving to prevent timeout on other ranks
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -657,8 +665,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             steps_per_epoch,
         )
         if config.save_at_epoch_end_only:
-            object.__setattr__(config, "save_interval", target_steps)
-            logging.info("save_at_epoch_end_only enabled: save_interval=%s", target_steps)
+            logging.info(
+                "save_at_epoch_end_only enabled: will save once per epoch (and final step if it ends mid-epoch)."
+            )
 
     # # Log sample images to wandb on first batch
     # if is_main and config.wandb_enabled and not resuming:
@@ -1141,8 +1150,15 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 infos = []  # Reset stats collection
 
             global_step += 1
-            # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            # Save checkpoint:
+            # - default: periodic save by save_interval + final-step save
+            # - save_at_epoch_end_only: save once per epoch (based on steps_per_epoch) using a forced save
+            if config.save_at_epoch_end_only:
+                # global_step is "steps completed" (1-based). Use 0-based step index in checkpoint dir name.
+                if (global_step % steps_per_epoch == 0) or (global_step >= config.num_train_steps):
+                    save_checkpoint(model, optim, global_step - 1, config, is_main, data_config, force=True)
+            else:
+                save_checkpoint(model, optim, global_step, config, is_main, data_config)
 
             # Update progress bar
             if pbar is not None:

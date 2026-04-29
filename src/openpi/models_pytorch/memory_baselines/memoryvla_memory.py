@@ -14,15 +14,18 @@ class SingleStreamMemoryBank(nn.Module):
         self.similarity_threshold = similarity_threshold
         self.register_buffer("memory_bank", None, persistent=False)
         self.register_buffer("memory_count", torch.tensor(0), persistent=False)
+        self.register_buffer("memory_write_index", torch.tensor(0), persistent=False)
 
     def reset_runtime_state(self) -> None:
         self.memory_bank = None
         self.memory_count = torch.tensor(0)
+        self.memory_write_index = torch.tensor(0)
 
     def get_runtime_state(self) -> dict[str, Any]:
         return {
             "memory_bank": self.memory_bank,
             "memory_count": self.memory_count,
+            "memory_write_index": self.memory_write_index,
         }
 
     def set_runtime_state(self, state: dict[str, Any] | None) -> None:
@@ -31,6 +34,28 @@ class SingleStreamMemoryBank(nn.Module):
             return
         self.memory_bank = state.get("memory_bank")
         self.memory_count = state.get("memory_count", torch.tensor(0))
+        self.memory_write_index = state.get("memory_write_index", torch.tensor(0))
+
+    def _ensure_memory_bank(self, item: torch.Tensor) -> None:
+        batch_size, feature_dim = item.shape
+        if (
+            self.memory_bank is not None
+            and self.memory_bank.shape[0] == batch_size
+            and self.memory_bank.shape[1] == self.bank_capacity
+            and self.memory_bank.shape[2] == feature_dim
+            and self.memory_bank.device == item.device
+            and self.memory_bank.dtype == item.dtype
+        ):
+            return
+        self.memory_bank = torch.zeros(
+            batch_size,
+            self.bank_capacity,
+            feature_dim,
+            device=item.device,
+            dtype=item.dtype,
+        )
+        self.memory_count = torch.tensor(0, device=item.device)
+        self.memory_write_index = torch.tensor(0, device=item.device)
 
     def _cosine_similarity(self, query: torch.Tensor, memory_bank: torch.Tensor) -> torch.Tensor:
         query = torch.nn.functional.normalize(query, dim=-1)
@@ -40,39 +65,34 @@ class SingleStreamMemoryBank(nn.Module):
     def retrieve(self, query: torch.Tensor) -> torch.Tensor | None:
         if self.memory_bank is None or int(self.memory_count.item()) == 0:
             return None
-        valid_bank = self.memory_bank[:, : int(self.memory_count.item())]
+        # Snapshot the mutable bank before update(); autograd may need these values during backward.
+        valid_bank = self.memory_bank[:, : int(self.memory_count.item())].detach().clone()
         sim = self._cosine_similarity(query, valid_bank)
         weights = torch.softmax(sim, dim=-1)
         return torch.einsum("bk,bkd->bd", weights, valid_bank)
 
     def update(self, item: torch.Tensor) -> None:
         item = item.detach()
-        if self.memory_bank is None:
-            self.memory_bank = item.unsqueeze(1)
-            self.memory_count = torch.tensor(1, device=item.device)
-            return
-        if self.memory_bank.shape[0] != item.shape[0]:
-            self.reset_runtime_state()
-            self.memory_bank = item.unsqueeze(1)
-            self.memory_count = torch.tensor(1, device=item.device)
-            return
+        self._ensure_memory_bank(item)
+        assert self.memory_bank is not None
 
         count = int(self.memory_count.item())
         if count < self.bank_capacity:
-            self.memory_bank = torch.cat([self.memory_bank[:, :count], item.unsqueeze(1)], dim=1)
+            self.memory_bank[:, count].copy_(item)
             self.memory_count = torch.tensor(count + 1, device=item.device)
+            self.memory_write_index = torch.tensor((count + 1) % self.bank_capacity, device=item.device)
             return
 
         sim = self._cosine_similarity(item, self.memory_bank)
         best_idx = torch.argmax(sim, dim=-1)
         if torch.mean(torch.gather(sim, 1, best_idx.unsqueeze(1))).item() >= self.similarity_threshold:
-            updated = self.memory_bank.clone()
-            for batch_idx in range(updated.shape[0]):
+            for batch_idx in range(self.memory_bank.shape[0]):
                 idx = int(best_idx[batch_idx].item())
-                updated[batch_idx, idx] = 0.5 * (updated[batch_idx, idx] + item[batch_idx])
-            self.memory_bank = updated
+                self.memory_bank[batch_idx, idx].mul_(0.5).add_(item[batch_idx], alpha=0.5)
         else:
-            self.memory_bank = torch.cat([self.memory_bank[:, 1:], item.unsqueeze(1)], dim=1)
+            write_index = int(self.memory_write_index.item())
+            self.memory_bank[:, write_index].copy_(item)
+            self.memory_write_index = torch.tensor((write_index + 1) % self.bank_capacity, device=item.device)
 
     def get_memory_stats(self) -> dict[str, int]:
         return {
@@ -93,8 +113,11 @@ class GatedMemoryFusion(nn.Module):
 
     def forward(self, current_tokens: torch.Tensor, retrieved_summary: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         if retrieved_summary is None:
-            gate = torch.zeros_like(current_tokens)
-            return current_tokens, gate
+            zero_retrieved = torch.zeros_like(current_tokens)
+            # Keep the same parameter-usage pattern across steps so DDP static_graph mode remains valid.
+            gate_logits = self.mlp(torch.cat([current_tokens, zero_retrieved], dim=-1)) + self.gate_bias
+            gate = torch.zeros_like(gate_logits)
+            return current_tokens + gate_logits * 0.0, gate
         retrieved_tokens = retrieved_summary[:, None, :].expand_as(current_tokens)
         gate_logits = self.mlp(torch.cat([current_tokens, retrieved_tokens], dim=-1)) + self.gate_bias
         gate = torch.sigmoid(gate_logits)

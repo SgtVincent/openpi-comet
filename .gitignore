@@ -181,6 +181,7 @@ log
 # Binary / large files not tracked in repo
 *.vsix
 *.pdf
+.remote-video-preview-cache/
 
 # Checkpoints and large artifacts
 checkpoints/

@@ -60,6 +60,7 @@ def _build_smoke_model() -> Pi05WithMemoryVLA:
     model = Pi05WithMemoryVLA.__new__(Pi05WithMemoryVLA)
     torch.nn.Module.__init__(model)
     model.training = False
+    model.prefix_summary_proj = torch.nn.Identity()
     model.memoryvla = MemoryVLAModule(feature_dim=8, bank_capacity=2, similarity_threshold=0.7)
     model.memory_to_prefix_proj = torch.nn.Identity()
     model.paligemma_with_expert = _DummyPaliGemmaExpert()
