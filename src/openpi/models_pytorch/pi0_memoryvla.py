@@ -10,8 +10,14 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 class Pi05WithMemoryVLA(PI0Pytorch):
     """Pi0.5 backbone with a single-stream MemoryVLA-style external memory bank."""
 
-    def __init__(self, config) -> None:
-        super().__init__(config)
+    def __init__(
+        self,
+        config,
+        *,
+        action_expert_name: str = "gemma_token",
+        action_expert_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(config, action_expert_name=action_expert_name, action_expert_kwargs=action_expert_kwargs)
         feature_dim = self.paligemma_with_expert.paligemma.config.text_config.hidden_size
         self.memoryvla = MemoryVLAModule(
             feature_dim=feature_dim,
@@ -22,6 +28,10 @@ class Pi05WithMemoryVLA(PI0Pytorch):
         self.memory_to_prefix_proj = nn.Linear(feature_dim, feature_dim)
         nn.init.eye_(self.memory_to_prefix_proj.weight)
         nn.init.zeros_(self.memory_to_prefix_proj.bias)
+        # Kept for checkpoint compatibility; used to project the current-summary token.
+        self.prefix_summary_proj = nn.Linear(feature_dim, feature_dim)
+        nn.init.eye_(self.prefix_summary_proj.weight)
+        nn.init.zeros_(self.prefix_summary_proj.bias)
 
         self._active_session_id: int | None = None
         self._session_memory_state: dict[int, dict[str, Any]] = {}
@@ -81,7 +91,12 @@ class Pi05WithMemoryVLA(PI0Pytorch):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_hidden = self._encode_prefix_hidden(prefix_embs, prefix_pad_masks, prefix_att_masks)
-        current_tokens = prefix_hidden.mean(dim=1, keepdim=True)
+        current_summary = prefix_hidden.mean(dim=1)
+        # The MemoryVLA-specific modules are loaded/stored in float32, while the
+        # backbone often runs in bfloat16 during eval. Run the memory branch in
+        # the module dtype and cast back before concatenating with the prefix.
+        memory_dtype = self.prefix_summary_proj.weight.dtype
+        current_tokens = self.prefix_summary_proj(current_summary.to(dtype=memory_dtype)).unsqueeze(1)
         memory_tokens, gate = self.memoryvla(current_tokens, update_memory=not self.training)
         self._last_memory_gate = gate
         if self._active_session_id is not None:

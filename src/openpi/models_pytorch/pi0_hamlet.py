@@ -11,8 +11,14 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 class Pi05WithHamlet(PI0Pytorch):
     """Pi0.5 backbone with HAMLET-style moment-token history memory."""
 
-    def __init__(self, config) -> None:
-        super().__init__(config)
+    def __init__(
+        self,
+        config,
+        *,
+        action_expert_name: str = "gemma_token",
+        action_expert_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(config, action_expert_name=action_expert_name, action_expert_kwargs=action_expert_kwargs)
         feature_dim = self.paligemma_with_expert.paligemma.config.text_config.hidden_size
         self.moment_token_pool = MomentTokenPool(config.hamlet_num_moment_tokens, feature_dim)
         self.hamlet_memory = HamletMemoryAdapter(
@@ -27,6 +33,10 @@ class Pi05WithHamlet(PI0Pytorch):
         self.memory_to_prefix_proj = nn.Linear(feature_dim, feature_dim)
         nn.init.eye_(self.memory_to_prefix_proj.weight)
         nn.init.zeros_(self.memory_to_prefix_proj.bias)
+        # Kept for checkpoint compatibility with older/newer MemoryVLA/HAMLET variants.
+        self.prefix_summary_proj = nn.Linear(feature_dim, feature_dim)
+        nn.init.eye_(self.prefix_summary_proj.weight)
+        nn.init.zeros_(self.prefix_summary_proj.bias)
 
         self._active_session_id: int | None = None
         self._session_memory_state: dict[int, dict[str, Any]] = {}
@@ -102,7 +112,13 @@ class Pi05WithHamlet(PI0Pytorch):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
         current_moment_tokens = self._encode_current_moment_tokens(prefix_embs, prefix_pad_masks, prefix_att_masks)
-        memory_tokens = self.hamlet_memory(current_moment_tokens, update_memory=not self.training)
+        # Keep the HAMLET memory branch in its module dtype to avoid bfloat16 /
+        # float32 mismatches with the main backbone during eval.
+        memory_dtype = self.memory_to_prefix_proj.weight.dtype
+        memory_tokens = self.hamlet_memory(
+            current_moment_tokens.to(dtype=memory_dtype),
+            update_memory=not self.training,
+        )
         if self._active_session_id is not None:
             self._session_memory_state[self._active_session_id] = self.hamlet_memory.get_runtime_state()
         memory_tokens = self.memory_to_prefix_proj(memory_tokens).to(dtype=prefix_embs.dtype)
