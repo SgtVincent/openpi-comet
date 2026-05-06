@@ -12,7 +12,7 @@ set -x
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-CONDA_PATH="${CONDA_PATH:-/mnt/bn/behavior-data-hl/chenjunting/miniconda3}"
+CONDA_PATH="${CONDA_PATH:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/miniconda3}"
 source "${CONDA_PATH}/etc/profile.d/conda.sh"
 conda activate openpi-comet-nas
 export LD_LIBRARY_PATH="${CONDA_PATH}/envs/openpi-comet-nas/lib:$LD_LIBRARY_PATH"

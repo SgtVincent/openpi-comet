@@ -12,7 +12,7 @@ set -x
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-CONDA_PATH="${CONDA_PATH:-/mnt/bn/behavior-data-hl/chenjunting/miniconda3}"
+CONDA_PATH="${CONDA_PATH:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/miniconda3}"
 source "${CONDA_PATH}/etc/profile.d/conda.sh"
 conda activate openpi-comet-nas
 export LD_LIBRARY_PATH="${CONDA_PATH}/envs/openpi-comet-nas/lib:$LD_LIBRARY_PATH"
@@ -115,6 +115,7 @@ echo "============================================================"
 TASK_NAME="${TASK_NAME:-make_pizza}"
 CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-make_pizza_lr1e-4_5ep_sft}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
+NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-}"
 BASE_PI05_CKPT="${BASE_PI05_CKPT:-${REPO_ROOT}/checkpoints/pi05_base_pytorch}"
 DEFAULT_B1K_ASSETS_DIR="${REPO_ROOT}/checkpoints/openpi_comet/pi05-b1kpt50-cs32/assets"
 B1K_ASSETS_DIR="${B1K_ASSETS_DIR:-${DEFAULT_B1K_ASSETS_DIR}}"
@@ -282,6 +283,7 @@ echo "OPENPI_BEHAVIOR_DATASET_ROOT: ${OPENPI_BEHAVIOR_DATASET_ROOT:-<config_defa
 echo "HF_DATASETS_CACHE: ${HF_DATASETS_CACHE}"
 echo "Multi-node: ${NUM_NODES} nodes × ${GPUS_PER_NODE} GPUs = ${TOTAL_GPUS} GPUs"
 echo "NUM_TRAIN_EPOCHS: ${NUM_TRAIN_EPOCHS}"
+echo "NUM_TRAIN_STEPS: ${NUM_TRAIN_STEPS:-<auto>}"
 echo "SAVE_INTERVAL: ${SAVE_INTERVAL}"
 echo "KEEP_PERIOD: ${KEEP_PERIOD}"
 echo "SAVE_AT_EPOCH_END_ONLY: ${SAVE_AT_EPOCH_END_ONLY}"
@@ -319,6 +321,9 @@ if [[ -n "${BATCH_SIZE_PER_GPU}" ]]; then
 fi
 if [[ -n "${NUM_WORKERS}" ]]; then
   EXTRA_ARGS+=(--num_workers "${NUM_WORKERS}")
+fi
+if [[ -n "${NUM_TRAIN_STEPS}" ]]; then
+  EXTRA_ARGS+=(--num_train_steps "${NUM_TRAIN_STEPS}")
 fi
 if [[ "${GRADIENT_ACCUMULATION_STEPS}" != "1" ]]; then
   EXTRA_ARGS+=(--gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}")
