@@ -30,6 +30,7 @@ class B1KPolicyWrapper:
         self,
         policy: BasePolicy,
         task_name: str = "turning_on_radio",
+        prompt_override: str | None = None,
         control_mode: str = "temporal_ensemble",
         max_len: int = 32,  # receeding horizon | receeding temporal mode
         action_horizon: int = 5,  # temporal ensemble mode | receeding temporal mode
@@ -44,7 +45,7 @@ class B1KPolicyWrapper:
 
         # load the task name from the metadata
         metadata = json.load(open("scripts/task_mapping.json"))
-        self.task_prompt = metadata[task_name].get("task")
+        self.task_prompt = prompt_override if prompt_override is not None else metadata[task_name].get("task")
         self.subtask_prompts = metadata[task_name].get("subtask")
         self.skill_prompts = metadata[task_name].get("skill")
 
@@ -59,6 +60,7 @@ class B1KPolicyWrapper:
         self.step_counter = 0
 
         self.fine_grained_level = fine_grained_level
+        self.last_generated_subtask = None
         if self.fine_grained_level > 0:
             from openpi.shared.client import Client
 
@@ -111,6 +113,7 @@ class B1KPolicyWrapper:
         self.step_counter = 0
         self._maybe_set_active_session()
         self._maybe_reset_streaming_state()
+        self.last_generated_subtask = None
         if self.reasoner:
             self.reasoner.reset()
 
@@ -128,6 +131,7 @@ class B1KPolicyWrapper:
         session.action_queue = deque(maxlen=self.action_horizon)
         session.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         session.step_counter = 0
+        session.last_generated_subtask = None
 
         # Ensure any optional reasoner state is not shared.
         if self.reasoner is not None:
@@ -222,6 +226,8 @@ class B1KPolicyWrapper:
             try:
                 self._maybe_set_active_session()
                 action = self.policy.infer(batch)
+                if "generated_subtask" in action and action["generated_subtask"] is not None:
+                    self.last_generated_subtask = action["generated_subtask"]
                 self.last_action = action
             except Exception as e:
                 action = self.last_action
@@ -338,6 +344,8 @@ class B1KPolicyWrapper:
         try:
             self._maybe_set_active_session()
             action = self.policy.infer(batch)
+            if "generated_subtask" in action and action["generated_subtask"] is not None:
+                self.last_generated_subtask = action["generated_subtask"]
             self.last_action = action
         except Exception as e:
             action = self.last_action

@@ -38,7 +38,7 @@ class TrainConfig:
     # Gemma/PaliGemma fine-tuning than bf16.
     pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "bfloat16"
 
-    pytorch_model_name: Literal["pi0", "vlm2", "vlm2_subtask", "subtask"] = "pi0"
+    pytorch_model_name: Literal["pi0", "pi0_hamlet", "pi0_memoryvla", "vlm2", "vlm2_subtask", "subtask"] = "pi0"
 
     # Accelerate controls (used by scripts/train_accelerate.py). Defaults preserve existing behavior.
     gradient_accumulation_steps: int = 1
@@ -63,7 +63,10 @@ class TrainConfig:
 
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
-    data: Sequence[DataConfigFactory] = dataclasses.field(default_factory=lambda: [FakeDataConfig()])
+    # Compatibility: many configs pass a single DataConfigFactory; __post_init__ wraps it into a list.
+    data: Sequence[DataConfigFactory] | DataConfigFactory = dataclasses.field(
+        default_factory=lambda: [FakeDataConfig()]
+    )
 
     sample_weights: list[float] | None = None
 

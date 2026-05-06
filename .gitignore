@@ -170,7 +170,8 @@ cython_debug/
 
 experiments/
 
-outputs
+outputs/
+output/
 eval_logs/
 log
 .github/# Local editor and project files
@@ -180,7 +181,9 @@ log
 # Binary / large files not tracked in repo
 *.vsix
 *.pdf
+.remote-video-preview-cache/
 
 # Checkpoints and large artifacts
 checkpoints/
 hf_datasets_cache/
+segment_eval_runs/

@@ -1,4 +1,6 @@
 import openpi.models.pi0_config as pi0_config
+import openpi.models.hamlet_config as hamlet_config
+import openpi.models.memoryvla_config as memoryvla_config
 import openpi.models.pi05_subtask_config
 from pathlib import Path
 from openpi.models.vlm2_vla_config import VLM2VLAConfig
@@ -24,6 +26,7 @@ _PRETRAIN_CONFIGS = [
                 fine_grained_level=0,
             ),
         ),
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -51,6 +54,7 @@ _PRETRAIN_CONFIGS = [
                 fine_grained_level=0,
             ),
         ),
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05-b1kpt50-cs32/params"),
         num_train_steps=30_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -91,6 +95,7 @@ _PRETRAIN_CONFIGS = [
                 fine_grained_level=0,
             ),
         ),
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=50_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -118,6 +123,7 @@ _PRETRAIN_CONFIGS = [
                 fine_grained_level=0,
             ),
         ),
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=50_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -161,7 +167,7 @@ _PRETRAIN_CONFIGS = [
                 fine_grained_level=0,
             ),
         ),
-        pytorch_weight_path="checkpoints/openpi_comet/pi05-b1kpt50-cs32",
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         # num_train_steps=0 disables the step cap so num_train_epochs fully controls total steps
         num_train_steps=0,
         num_train_epochs=5,
@@ -196,7 +202,7 @@ _PRETRAIN_CONFIGS = [
                 fine_grained_level=0,
             ),
         ),
-        pytorch_weight_path="checkpoints/openpi_comet/pi05-b1kpt50-cs32",
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/openpi_comet/pi05-b1kpt50-cs32"),
         # num_train_steps=0 disables the step cap so num_train_epochs fully controls total steps
         num_train_steps=0,
@@ -205,6 +211,74 @@ _PRETRAIN_CONFIGS = [
             peak_lr=2.5e-5,
             # Estimated: 5 epochs × ~180k steps/epoch (pt50 dataset, batch_size_per_gpu=64, 64 GPUs).
             # Adjust if steps_per_epoch differs significantly after first run.
+            decay_steps=900_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+        batch_size_per_gpu=64,
+    ),
+    TrainConfig(
+        name="pi05_hamlet_b1k-pt50_cs32_bs64_lr2.5e-5_5ep",
+        exp_name="openpi",
+        project_name="B1K",
+        pytorch_model_name="pi0_hamlet",
+        model=hamlet_config.HamletConfig(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="checkpoints/openpi_comet/pi05-b1kpt50-cs32/assets",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
+        weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/openpi_comet/pi05-b1kpt50-cs32"),
+        num_train_steps=0,
+        num_train_epochs=5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=900_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+        batch_size_per_gpu=64,
+    ),
+    TrainConfig(
+        name="pi05_memoryvla_b1k-pt50_cs32_bs64_lr2.5e-5_5ep",
+        exp_name="openpi",
+        project_name="B1K",
+        pytorch_model_name="pi0_memoryvla",
+        model=memoryvla_config.MemoryVLAConfig(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="checkpoints/openpi_comet/pi05-b1kpt50-cs32/assets",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
+        weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/openpi_comet/pi05-b1kpt50-cs32"),
+        num_train_steps=0,
+        num_train_epochs=5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
             decay_steps=900_000,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
@@ -238,6 +312,7 @@ _PRETRAIN_CONFIGS = [
                 ),
             ),
         ],
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/openpi_comet/pi05-b1kpt50-cs32"),
         num_train_steps=20_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -275,7 +350,7 @@ _PRETRAIN_CONFIGS = [
                 fine_grained_level=0,
             ),
         ),
-        pytorch_weight_path="checkpoints/openpi_comet/pi05-b1kpt50-cs32",
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         num_train_steps=0,
         num_train_epochs=5,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -369,7 +444,7 @@ _PRETRAIN_CONFIGS = [
                 fine_grained_level=0,
             ),
         ),
-        pytorch_weight_path="checkpoints/openpi_comet/pi05-b1kpt50-cs32",
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
         num_train_steps=0,
         num_train_epochs=2,
         lr_schedule=_optimizer.CosineDecaySchedule(

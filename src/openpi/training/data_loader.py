@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -216,6 +217,26 @@ def create_data_loader(
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    if isinstance(config.data, list) and len(config.data) == 1:
+        single_data_factory = config.data[0]
+        data_config = single_data_factory.create(config.assets_dirs, config.model)
+        logging.info(f"data_config repo_id: {data_config.repo_id}")
+        if data_config.rlds_data_dir is not None:
+            raise NotImplementedError("RLDS data loader is not supported in this fork.")
+        return create_torch_data_loader(
+            data_config,
+            model_config=config.model,
+            action_horizon=config.model.action_horizon,
+            batch_size=config.batch_size,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            num_workers=config.num_workers,
+            seed=config.seed,
+            skip_norm_stats=skip_norm_stats,
+            framework=framework,
+        )
+
     if isinstance(config.data, list):
         data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
         if not all(_behavior_dataset.is_behavior_dataset(dc) for dc in data_configs):

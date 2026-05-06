@@ -343,16 +343,42 @@ class BaseModelConfig(abc.ABC):
                 alpha=getattr(train_config.model, "alpha", 10.0),
                 action_expert_name="subtask",
             )
+        elif pytorch_model_name == "pi0_memoryvla":
+            from openpi.models_pytorch import pi0_memoryvla as _pi0_memoryvla
+
+            expert_cfg = getattr(train_config.model, "pytorch_action_expert", None)
+            model = _pi0_memoryvla.Pi05WithMemoryVLA(
+                config=train_config.model,
+                action_expert_name=getattr(expert_cfg, "name", "gemma_token"),
+                action_expert_kwargs=(
+                    dataclasses.asdict(getattr(expert_cfg, "il_moe_velocity"))
+                    if getattr(expert_cfg, "name", "gemma_token") == "il_moe_velocity"
+                    else None
+                ),
+            )
+        elif pytorch_model_name == "pi0_hamlet":
+            from openpi.models_pytorch import pi0_hamlet as _pi0_hamlet
+
+            expert_cfg = getattr(train_config.model, "pytorch_action_expert", None)
+            model = _pi0_hamlet.Pi05WithHamlet(
+                config=train_config.model,
+                action_expert_name=getattr(expert_cfg, "name", "gemma_token"),
+                action_expert_kwargs=(
+                    dataclasses.asdict(getattr(expert_cfg, "il_moe_velocity"))
+                    if getattr(expert_cfg, "name", "gemma_token") == "il_moe_velocity"
+                    else None
+                ),
+            )
         else:
             from openpi.models_pytorch import pi0_pytorch
 
+            expert_cfg = getattr(train_config.model, "pytorch_action_expert", None)
             model = pi0_pytorch.PI0Pytorch(
                 config=train_config.model,
-                action_expert_name=getattr(getattr(train_config.model, "pytorch_action_expert", None), "name", "gemma_token"),
+                action_expert_name=getattr(expert_cfg, "name", "gemma_token"),
                 action_expert_kwargs=(
-                    dataclasses.asdict(getattr(getattr(train_config.model, "pytorch_action_expert", None), "il_moe_velocity"))
-                    if getattr(getattr(train_config.model, "pytorch_action_expert", None), "name", "gemma_token")
-                    == "il_moe_velocity"
+                    dataclasses.asdict(getattr(expert_cfg, "il_moe_velocity"))
+                    if getattr(expert_cfg, "name", "gemma_token") == "il_moe_velocity"
                     else None
                 ),
             )

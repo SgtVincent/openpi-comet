@@ -1,4 +1,6 @@
 import openpi.models.pi0_config as pi0_config
+import openpi.models.hamlet_config as hamlet_config
+import openpi.models.memoryvla_config as memoryvla_config
 from openpi.models.vlm2_vla_config import VLM2VLAConfig
 import openpi.training.optimizer as _optimizer
 from openpi.training.data_config import FakeDataConfig
@@ -30,6 +32,66 @@ _TEST_CONFIGS = [
             decay_steps=10,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=8,
+        batch_size=8 * 4,
+    ),
+    TrainConfig(
+        name="pi05_hamlet_test",
+        exp_name="pi05_hamlet_test_run",
+        project_name="B1K",
+        model=hamlet_config.HamletConfig(
+            action_horizon=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        pytorch_model_name="pi0_hamlet",
+        data=FakeDataConfig(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/openpi_comet/pi05-b1kpt50-cs32"),
+        num_train_steps=10,
+        log_interval=1,
+        save_interval=5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-6,
+            decay_steps=10,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=8,
+        batch_size=8 * 4,
+    ),
+    TrainConfig(
+        name="pi05_memoryvla_test",
+        exp_name="pi05_memoryvla_test_run",
+        project_name="B1K",
+        model=memoryvla_config.MemoryVLAConfig(
+            action_horizon=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        pytorch_model_name="pi0_memoryvla",
+        data=FakeDataConfig(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/openpi_comet/pi05-b1kpt50-cs32"),
+        num_train_steps=10,
+        log_interval=1,
+        save_interval=5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-6,
+            decay_steps=10,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints",
         num_workers=8,

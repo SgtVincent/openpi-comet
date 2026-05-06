@@ -305,55 +305,63 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, *, force: bool = False):
     """Save a checkpoint with model state, optimizer state, and metadata."""
-    # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
-        if is_main:
-            # Create temporary directory for atomic checkpoint saving
-            final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-            tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+    # Only save if it's time to save, if it's the final step, or if forced by caller (e.g., epoch-end save).
+    if not force and not (
+        (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1
+    ):
+        return
+    if is_main:
+        # Create temporary directory for atomic checkpoint saving
+        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
 
-            # Remove any existing temp directory and create new one
-            if tmp_ckpt_dir.exists():
-                shutil.rmtree(tmp_ckpt_dir)
-            tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        # Remove any existing temp directory and create new one
+        if tmp_ckpt_dir.exists():
+            shutil.rmtree(tmp_ckpt_dir)
+        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save model state using safetensors (handle shared tensors)
-            model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        # Save model state using safetensors (handle shared tensors)
+        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
-            # Save optimizer state using PyTorch format
-            torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+        # Save optimizer state using PyTorch format
+        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
-            # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
-            metadata = {
-                "global_step": global_step,
-                "config": dataclasses.asdict(config),
-                "timestamp": time.time(),
-            }
-            torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+        # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
+        metadata = {
+            "global_step": global_step,
+            "config": dataclasses.asdict(config),
+            "timestamp": time.time(),
+        }
+        torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
-            # save norm stats
-            norm_stats = data_config.norm_stats
-            if norm_stats is not None and data_config.asset_id is not None:
-                _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+        # save norm stats
+        norm_stats = data_config.norm_stats
+        if norm_stats is not None and data_config.asset_id is not None:
+            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
 
-            # Atomically move temp directory to final location
-            if final_ckpt_dir.exists():
-                shutil.rmtree(final_ckpt_dir)
-            tmp_ckpt_dir.rename(final_ckpt_dir)
+        # Atomically move temp directory to final location
+        if final_ckpt_dir.exists():
+            shutil.rmtree(final_ckpt_dir)
+        tmp_ckpt_dir.rename(final_ckpt_dir)
 
-            logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+        logging.info(
+            "Saved checkpoint at step %s -> %s%s",
+            global_step,
+            final_ckpt_dir,
+            " (forced)" if force else "",
+        )
 
-            # Log checkpoint to wandb
-            if config.wandb_enabled:
-                wandb = _get_wandb()
-                wandb.log({"checkpoint_step": global_step}, step=global_step)
+        # Log checkpoint to wandb
+        if config.wandb_enabled:
+            wandb = _get_wandb()
+            wandb.log({"checkpoint_step": global_step}, step=global_step)
         
-        # Synchronize all ranks after saving to prevent timeout on other ranks
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+    # Synchronize all ranks after saving to prevent timeout on other ranks
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -657,8 +665,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             steps_per_epoch,
         )
         if config.save_at_epoch_end_only:
-            object.__setattr__(config, "save_interval", target_steps)
-            logging.info("save_at_epoch_end_only enabled: save_interval=%s", target_steps)
+            logging.info(
+                "save_at_epoch_end_only enabled: will save once per epoch (and final step if it ends mid-epoch)."
+            )
 
     # # Log sample images to wandb on first batch
     # if is_main and config.wandb_enabled and not resuming:
@@ -752,6 +761,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             model = _vlm2_model.VLM2SubtaskWithPi05(vlm2_config, alpha=alpha).to(device)
         else:
             model = _vlm2_model.VLM2WithPi05(vlm2_config).to(device)
+    elif config.pytorch_model_name == "pi0_hamlet":
+        from openpi.models_pytorch import pi0_hamlet as _pi0_hamlet
+
+        model = _pi0_hamlet.Pi05WithHamlet(model_cfg).to(device)
+    elif config.pytorch_model_name == "pi0_memoryvla":
+        from openpi.models_pytorch import pi0_memoryvla as _pi0_memoryvla
+
+        model = _pi0_memoryvla.Pi05WithMemoryVLA(model_cfg).to(device)
     elif config.pytorch_model_name == "subtask":
         alpha = getattr(model_cfg, "alpha", 10.0)
         model = openpi.models_pytorch.pi05_subtask.PI05SubtaskPytorch(
@@ -803,7 +820,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 "Skipping weight loading. Model will be randomly initialized."
             )
         else:
-            load_strict = config.pytorch_model_name not in ("vlm2", "vlm2_subtask", "subtask")
+            load_strict = config.pytorch_model_name not in ("vlm2", "vlm2_subtask", "subtask", "pi0_hamlet", "pi0_memoryvla")
             safetensors.torch.load_model(
                 (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
                 model_path,
@@ -833,6 +850,40 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             config.num_train_steps,
         )
         decay_steps = config.num_train_steps
+
+    # Optional: LoRA-only training to reduce optimizer-state memory.
+    # This is particularly useful for smoke tests on 80GB GPUs, and matches the
+    # intent of *_lora variants (train adapters, keep backbone frozen).
+    train_lora_only_env = os.environ.get("OPENPI_TRAIN_LORA_ONLY")
+    if train_lora_only_env is None:
+        paligemma_variant = getattr(model_cfg, "paligemma_variant", "")
+        action_expert_variant = getattr(model_cfg, "action_expert_variant", "")
+        train_lora_only = ("lora" in str(paligemma_variant)) or ("lora" in str(action_expert_variant))
+    else:
+        train_lora_only = train_lora_only_env == "1"
+
+    if train_lora_only:
+        target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        keep_prefixes = (
+            "moment_token_pool",
+            "hamlet_memory",
+            "memory_to_prefix_proj",
+            "memoryvla",
+        )
+        num_trainable = 0
+        num_total = 0
+        for name, param in target.named_parameters():
+            num_total += param.numel()
+            keep = ("lora" in name) or any(name.startswith(pfx) for pfx in keep_prefixes)
+            param.requires_grad = bool(keep)
+            if param.requires_grad:
+                num_trainable += param.numel()
+        logging.info(
+            "OPENPI_TRAIN_LORA_ONLY enabled: trainable params=%d (%.2f%% of total %d)",
+            num_trainable,
+            100.0 * num_trainable / max(1, num_total),
+            num_total,
+        )
 
     optim_params = [p for p in model.parameters() if p.requires_grad]
     if len(optim_params) == 0:
@@ -1099,8 +1150,15 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 infos = []  # Reset stats collection
 
             global_step += 1
-            # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            # Save checkpoint:
+            # - default: periodic save by save_interval + final-step save
+            # - save_at_epoch_end_only: save once per epoch (based on steps_per_epoch) using a forced save
+            if config.save_at_epoch_end_only:
+                # global_step is "steps completed" (1-based). Use 0-based step index in checkpoint dir name.
+                if (global_step % steps_per_epoch == 0) or (global_step >= config.num_train_steps):
+                    save_checkpoint(model, optim, global_step - 1, config, is_main, data_config, force=True)
+            else:
+                save_checkpoint(model, optim, global_step, config, is_main, data_config)
 
             # Update progress bar
             if pbar is not None:
