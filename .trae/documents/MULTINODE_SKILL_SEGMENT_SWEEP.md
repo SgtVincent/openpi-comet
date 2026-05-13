@@ -206,6 +206,22 @@ python scripts/run_skill_metric_multinode_sweep.py \
 - `multinode_skill_task_summary.csv`
 - `multinode_skill_summary.md`
 
+### Visual Review Stage
+
+当你开启 review 流程后，还会额外生成：
+
+- `review/review_manifest.csv`
+- `review/review_manifest.json`
+- `review/segments/<task>/demo_<id>/skill_<idx>/final_rgb.png`
+- `review/segments/<task>/demo_<id>/skill_<idx>/review_payload.json`
+- `review/segments/<task>/demo_<id>/skill_<idx>/source_paths.json`
+
+如果运行时已经开启新的关键帧落盘逻辑，同一个 `skill_<idx>` 目录下还可能直接复用：
+
+- `review/start_restore.png`
+- `review/end_restore.png`
+- `review/final_rollout.png`
+
 ## Useful Flags
 
 - `--skills "move to,open door"`:
@@ -222,6 +238,93 @@ python scripts/run_skill_metric_multinode_sweep.py \
   保存逐帧 predicate trace，适合定点排查
 - `--write-video`:
   输出视频，适合少量失败样本复盘
+
+## Visual Validation Workflow
+
+目标是验证“segment 最后一帧 RGB observation + metric 输出”是否符合人工常识，并把规则迭代收敛到稳定状态。
+
+### 1. 先复用已有 run dir
+
+优先对已有结果生成 review set，而不是每次都整套重跑。示例：
+
+```bash
+source /mnt/bn/behavior-data-hl/chenjunting/miniconda3/etc/profile.d/conda.sh
+conda activate openpi-comet-nas
+cd /mnt/bn/navigation-hl/mlx/users/chenjunting/repo/openpi-comet
+
+python scripts/build_skill_metric_review_set.py \
+  --run-dir /mnt/bn/navigation-hl/mlx/users/chenjunting/repo/openpi-comet/segment_eval_runs/skill_trace_eval_20260423_202747 \
+  --skills "move to,open door" \
+  --samples-per-skill 8 \
+  --holdout-per-skill 2
+```
+
+该脚本会：
+
+- 复用已有 `metrics/*.json`
+- 优先复用运行时保存的 `review/*.png`
+- 若没有关键帧 png，则从 `videos/*.mp4` 抽最后一帧生成 `final_rgb.png`
+- 生成可人工填写的 `review_manifest.csv`
+
+### 2. 填写人工复核结果
+
+在 `review_manifest.csv` 中人工填写以下列：
+
+- `human_judgement`: `pass` / `fail` / `uncertain`
+- `human_reason`: 误判原因说明
+- `issue_bucket`: 例如 `threshold_too_strict`、`wrong_target`、`rollout_true_failure`
+
+人工判读时，优先看：
+
+- `final_rgb.png` 或 `review/final_rollout.png`
+- `review/end_restore.png`
+- `review_payload.json` 里的：
+  - `template_trace_end`
+  - `rollout_final_trace`
+  - geometry diagnostics
+
+### 3. 汇总一致率
+
+```bash
+python scripts/summarize_skill_metric_review.py \
+  --manifest /mnt/bn/navigation-hl/mlx/users/chenjunting/repo/openpi-comet/segment_eval_runs/<RUN_DIR>/review/review_manifest.csv
+```
+
+会输出：
+
+- `review_summary.csv`
+- `review_by_skill.csv`
+- `review_by_issue_bucket.csv`
+- `review_detailed.csv`
+- `review_report.md`
+
+### 4. 规则迭代与回归
+
+推荐顺序：
+
+1. 先修一类 issue bucket
+2. 小规模重跑目标 skill
+3. 重新生成 review set
+4. 重新汇总 review
+5. 先看 discovery 集，再看 holdout 集
+
+验收标准建议固定为：
+
+- 人工一致率 `>= 90%`
+- holdout 集不回退
+- 连续两轮 review 结论稳定
+
+### 5. 单机 8 卡脚本直接联动 review
+
+`scripts/run_skill_eval_single_node_8gpu.sh` 现在支持在 merge 后直接生成 review set：
+
+```bash
+POST_MERGE_BUILD_REVIEW_SET=1 \
+REVIEW_TARGET_SKILLS="move to,open door" \
+REVIEW_SAMPLES_PER_SKILL=8 \
+REVIEW_HOLDOUT_PER_SKILL=2 \
+bash scripts/run_skill_eval_single_node_8gpu.sh
+```
 
 ## Smoke Test
 
