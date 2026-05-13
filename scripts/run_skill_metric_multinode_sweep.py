@@ -2,34 +2,145 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from collections import defaultdict
 import csv
+import hashlib
 import importlib.util
 import json
 import math
 import os
+from pathlib import Path
+import random
 import shlex
 import signal
 import socket
 import subprocess
 import sys
 import time
-from collections import Counter, defaultdict
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
+import urllib.error
+import urllib.request
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BEHAVIOR_DIR_DEFAULT = Path("/mnt/bn/navigation-hl/mlx/users/chenjunting/repo/BEHAVIOR-1K")
 DEMO_DATA_PATH_DEFAULT = Path("/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos")
 RAWDATA_PATH_DEFAULT = Path("/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-rawdata")
 DEFAULT_CKPT = REPO_ROOT / "checkpoints" / "openpi_comet" / "pi05-b1kpt50-cs32"
-DEFAULT_CONFIG = "pi05_b1k_skill-pt50_pretrain_lr1e-4_2ep"
+DEFAULT_CONFIG = "pi05_b1k-pt50_cs32_bs64_lr2.5e-5_step50k"
 REGISTRY_REL_PATH = Path("OmniGibson/omnigibson/learning/utils/segment_skill_metric_registry.py")
+TASK_MAPPING_PATH = REPO_ROOT / "scripts" / "task_mapping.json"
 CONDA_SH = "/mnt/bn/behavior-data-hl/chenjunting/miniconda3/etc/profile.d/conda.sh"
+RESULT_ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS = "env_task_success_before_segment_success"
+ATTEMPTABLE_RESULT_TYPES = {
+    "predicate_satisfied",
+    "short_proxy_success",
+    "likely_proxy_false_positive",
+    "timeout",
+    "truncated",
+    "env_terminated",
+    "short_video_problem",
+    RESULT_ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS,
+}
+METRIC_INVALID_PREFIX = "metric_invalid"
+RESULT_METRIC_INVALID_MISSING_OBJECT = "metric_invalid_missing_object"
+RESULT_PRE_SATISFIED_START = "pre_satisfied_start"
+RESULT_SHORT_PROXY_SUCCESS = "short_proxy_success"
+RESULT_LIKELY_PROXY_FALSE_POSITIVE = "likely_proxy_false_positive"
+RESULT_SHORT_VIDEO_PROBLEM = "short_video_problem"
+SHORT_VIDEO_PROBLEM_STEP_THRESHOLD = 150
+TRANSFER_POSE_PROXY_FAMILY = "transfer_pose_proxy"
+
+
+def is_short_video_problem_row(row: Dict[str, Any]) -> bool:
+    """Flag predicate successes that terminate before producing a meaningful review video.
+
+    Rollout videos are written at roughly 30 FPS in the segment eval pipeline, so 150
+    rollout steps corresponds to the manual-review threshold of about five seconds.
+    User review found these very short successful videos are not representative of
+    actual skill completion, even when they are not a metric-family-specific proxy.
+    """
+    if row.get("result_type") != "predicate_satisfied" or not bool(row.get("success")):
+        return False
+    final_step = row.get("final_step")
+    try:
+        return final_step is not None and int(final_step) < SHORT_VIDEO_PROBLEM_STEP_THRESHOLD
+    except (TypeError, ValueError):
+        return False
+
+
+def is_transfer_pose_proxy_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat transfer-pose proxy successes as review-needed, not clean success.
+
+    These metrics only check that the object reaches the demonstration end pose
+    while still grasped. Manual review found this can be a proxy-only hit for
+    hand-over skills: the object pose matches numerically, but the video does
+    not show a stable semantic hand-over.
+    """
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == TRANSFER_POSE_PROXY_FAMILY
+    )
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_early_metric_activation_review_needed(row: Dict[str, Any]) -> bool:
+    if row.get("result_type") != "predicate_satisfied" or not bool(row.get("success")):
+        return False
+    if bool(row.get("start_all_satisfied")):
+        return False
+
+    early_hits = _safe_int(row.get("early_predicate_satisfied_steps"))
+    if early_hits is not None and early_hits > 0:
+        return True
+
+    first_hit = _safe_int(row.get("first_predicate_satisfied_step"))
+    min_steps = _safe_int(row.get("min_success_steps"))
+    return first_hit is not None and min_steps is not None and min_steps > 0 and first_hit < min_steps
+
+
+def has_meaningful_policy_caused_transition(row: Dict[str, Any]) -> bool:
+    if row.get("result_type") != "predicate_satisfied" or not bool(row.get("success")):
+        return False
+    if bool(row.get("start_all_satisfied")):
+        return False
+    if bool(row.get("early_metric_activation_review_needed")) or is_early_metric_activation_review_needed(row):
+        return False
+
+    first_hit = _safe_int(row.get("first_predicate_satisfied_step"))
+    min_steps = _safe_int(row.get("min_success_steps"))
+    if first_hit is None or min_steps is None or min_steps <= 0:
+        return False
+    return first_hit >= min_steps
 
 
 def q(text: Any) -> str:
     return shlex.quote(str(text))
+
+
+def load_task_mapping(task_mapping_path: Path = TASK_MAPPING_PATH) -> Dict[str, Dict[str, Any]]:
+    with task_mapping_path.open() as f:
+        return json.load(f)
+
+
+def build_server_identity(*, out_dir: Path, worker_rank: int, task_name: str, port: int) -> Dict[str, str]:
+    task_mapping = load_task_mapping()
+    task_prompt = str(task_mapping[task_name]["task"])
+    server_run_id = f"{out_dir.name}:worker{worker_rank:03d}:{task_name}:p{int(port)}"
+    server_token = hashlib.sha256(server_run_id.encode("utf-8")).hexdigest()
+    return {
+        "server_run_id": server_run_id,
+        "server_token": server_token,
+        "task_name": task_name,
+        "task_prompt_sha256": hashlib.sha256(task_prompt.encode("utf-8")).hexdigest(),
+    }
 
 
 def parse_csv_ints(text: str) -> List[int]:
@@ -85,15 +196,20 @@ def parse_frame_duration(frame_duration: Any) -> Optional[Tuple[int, int]]:
     return None
 
 
-def get_dynamic_max_steps(frame_duration: Any, fallback: int) -> int:
+def get_dynamic_max_steps(frame_duration: Any, fallback: int, cap: int = 0) -> int:
     parsed = parse_frame_duration(frame_duration)
     if parsed is None:
-        return fallback
-    start, end = parsed
-    duration = end - start
-    if duration <= 0:
-        return fallback
-    return duration * 2
+        steps = fallback
+    else:
+        start, end = parsed
+        duration = end - start
+        if duration <= 0:
+            steps = fallback
+        else:
+            steps = duration * 2
+    if cap and cap > 0:
+        steps = min(steps, cap)
+    return steps
 
 
 def resolve_checkpoint_dir(path: Path) -> Path:
@@ -110,23 +226,116 @@ def resolve_checkpoint_dir(path: Path) -> Path:
     return path
 
 
-def wait_for_server(port: int, timeout_s: int) -> None:
+def wait_for_server(port: int, timeout_s: int, expected_identity: Optional[Dict[str, str]] = None) -> None:
     start = time.time()
     last_log = start
+    health_url = f"http://127.0.0.1:{port}/healthz"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     while time.time() - start < timeout_s:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(1.0)
-            try:
-                sock.connect(("127.0.0.1", port))
-                return
-            except OSError:
-                now = time.time()
-                # Avoid silent long waits in worker logs.
-                if now - last_log >= 30:
-                    print(f"[worker] waiting for server port {port}... elapsed={int(now-start)}s", flush=True)
-                    last_log = now
-                time.sleep(1.0)
-    raise TimeoutError(f"server not ready on port {port} after {timeout_s}s")
+        try:
+            req = urllib.request.Request(health_url, headers={"Connection": "close"})
+            with opener.open(req, timeout=2.0) as resp:
+                status = getattr(resp, "status", None) or resp.getcode()
+                if 200 <= int(status) < 300:
+                    if expected_identity:
+                        payload = json.loads(resp.read().decode("utf-8"))
+                        mismatches = [
+                            f"{key}: expected={expected!r}, actual={payload.get(key)!r}"
+                            for key, expected in expected_identity.items()
+                            if expected is not None and payload.get(key) != expected
+                        ]
+                        if mismatches:
+                            raise RuntimeError(
+                                f"unexpected server identity at {health_url}: " + "; ".join(mismatches)
+                            )
+                    return
+        except (urllib.error.URLError, ConnectionError, OSError, socket.timeout, ValueError):
+            now = time.time()
+            # Avoid silent long waits in worker logs.
+            if now - last_log >= 30:
+                print(f"[worker] waiting for server healthz {health_url}... elapsed={int(now-start)}s", flush=True)
+                last_log = now
+            time.sleep(1.0)
+        else:
+            # Non-2xx HTTP response: keep waiting.
+            now = time.time()
+            if now - last_log >= 30:
+                print(f"[worker] server healthz not ready yet at {health_url}... elapsed={int(now-start)}s", flush=True)
+                last_log = now
+            time.sleep(1.0)
+    raise TimeoutError(f"server healthz not ready at {health_url} after {timeout_s}s")
+
+
+def is_port_free(port: int) -> bool:
+    """Best-effort check that a TCP port is available for bind.
+
+    Note: this is inherently racy; callers should still verify the spawned server stays alive.
+    """
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", int(port)))
+        except OSError:
+            return False
+        return True
+
+
+def find_free_port(preferred: int, *, stride: int = 1, max_tries: int = 50) -> int:
+    """Find an available port near `preferred`.
+
+    `stride` is used to keep port selections disjoint across workers (e.g. stride=gpus_per_node).
+    """
+
+    preferred = int(preferred)
+    stride = max(1, int(stride))
+    for attempt in range(max(1, int(max_tries))):
+        candidate = preferred + attempt * stride
+        if is_port_free(candidate):
+            return candidate
+    raise RuntimeError(f"no free port found near {preferred} (stride={stride}, max_tries={max_tries})")
+
+
+def wait_for_port_free(port: int, *, timeout_s: float = 30.0) -> bool:
+    """Wait briefly for a just-stopped server to release its listening port."""
+
+    deadline = time.time() + float(timeout_s)
+    while time.time() < deadline:
+        if is_port_free(port):
+            return True
+        time.sleep(0.5)
+    return is_port_free(port)
+
+
+def wait_for_server_proc(
+    *,
+    proc: subprocess.Popen[str],
+    port: int,
+    timeout_s: int,
+    log_file: Optional[Path] = None,
+    expected_identity: Optional[Dict[str, str]] = None,
+) -> None:
+    """Wait for server health and fail fast if the process exits."""
+
+    start = time.time()
+    last_exc: Optional[BaseException] = None
+    while time.time() - start < timeout_s:
+        if proc.poll() is not None:
+            tail = tail_text(log_file) if log_file is not None else ""
+            raise RuntimeError(
+                f"server process exited before becoming healthy (code={proc.returncode}). "
+                f"log: {log_file}\n{tail}"
+            )
+        try:
+            wait_for_server(port, timeout_s=10, expected_identity=expected_identity)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            time.sleep(1.0)
+    tail = tail_text(log_file) if log_file is not None else ""
+    raise TimeoutError(
+        f"server not ready on port {port} after {timeout_s}s. last_error={last_exc}. log: {log_file}\n{tail}"
+    )
 
 
 def wait_for_path(path: Path, timeout_s: int) -> None:
@@ -361,6 +570,7 @@ def write_manifest(args: argparse.Namespace, jobs: List[Dict[str, Any]]) -> None
         "ckpt_dir": str(args.ckpt_dir),
         "resolved_ckpt_dir": str(resolve_checkpoint_dir(args.ckpt_dir)),
         "config_name": args.config_name,
+        "policy_backend": args.policy_backend,
         "num_nodes": args.num_nodes,
         "gpus_per_node": args.gpus_per_node,
         "total_workers": total_workers,
@@ -407,10 +617,13 @@ def start_server(
     gpu_id: int,
     ckpt_dir: Path,
     config_name: str,
+    policy_backend: str,
+    server_run_id: str,
+    server_token: str,
     openpi_env: str,
     behavior_dir: Path,
     out_dir: Path,
-) -> subprocess.Popen[str]:
+) -> tuple[subprocess.Popen[str], Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     log_file = out_dir / f"server_{task_name}_gpu{gpu_id}_p{port}.log"
     cmd = f"""
@@ -424,7 +637,7 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.40
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 export PYTHONPATH={q(str(REPO_ROOT / 'src'))}:{q(str(behavior_dir / 'joylo'))}:{q(str(behavior_dir / 'OmniGibson'))}:{q(str(behavior_dir / 'bddl3'))}${{PYTHONPATH:+:$PYTHONPATH}}
-python scripts/serve_b1k.py --task_name={q(task_name)} --control_mode=receeding_horizon --max_len=32 --port={q(port)} policy:checkpoint --policy.config={q(config_name)} --policy.dir={q(ckpt_dir)}
+python scripts/serve_b1k.py --task_name={q(task_name)} --control_mode=receeding_horizon --max_len=32 --port={q(port)} --server-run-id={q(server_run_id)} --server-token={q(server_token)} --policy-backend={q(policy_backend)} policy:checkpoint --policy.config={q(config_name)} --policy.dir={q(ckpt_dir)}
 """
     with log_file.open("w") as f:
         proc = subprocess.Popen(
@@ -432,15 +645,21 @@ python scripts/serve_b1k.py --task_name={q(task_name)} --control_mode=receeding_
             stdout=f,
             stderr=subprocess.STDOUT,
             text=True,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
-    return proc
+    return proc, log_file
 
 
 def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: bool, returncode: int, segment_log: Path) -> Dict[str, Any]:
     with metrics_path.open() as f:
         metrics = json.load(f)
-    return {
+    rollout = metrics.get("rollout", {})
+    predicate_debug = metrics.get("predicate_debug", {})
+    env_terminal_debug = rollout.get("env_terminal_debug")
+    env_termination_reason = rollout.get("env_termination_reason")
+    if env_termination_reason is None and isinstance(env_terminal_debug, dict):
+        env_termination_reason = env_terminal_debug.get("termination_reason")
+    row = {
         "job_key": sample["job_key"],
         "skill": sample["skill"],
         "task_name": sample["task_name"],
@@ -453,12 +672,46 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
         "returncode": returncode,
         "success": metrics.get("success"),
         "result_type": metrics.get("result_type"),
-        "metric_family": metrics.get("predicate_debug", {}).get("metric_family"),
-        "start_all_satisfied": metrics.get("predicate_debug", {}).get("start_all_satisfied"),
-        "final_step": metrics.get("rollout", {}).get("final_step"),
+        "metric_family": predicate_debug.get("metric_family"),
+        "start_all_satisfied": predicate_debug.get("start_all_satisfied"),
+        "short_proxy_success": predicate_debug.get("short_proxy_success"),
+        "likely_proxy_false_positive": predicate_debug.get("likely_proxy_false_positive"),
+        "transfer_pose_proxy_success_unconfirmed": predicate_debug.get(
+            "transfer_pose_proxy_success_unconfirmed"
+        ),
+        "metrics_short_video_problem": predicate_debug.get("short_video_problem"),
+        "short_success_required_step": predicate_debug.get("short_success_required_step"),
+        "min_success_steps": predicate_debug.get("min_success_steps"),
+        "first_predicate_satisfied_step": predicate_debug.get("first_predicate_satisfied_step"),
+        "early_predicate_satisfied_steps": predicate_debug.get("early_predicate_satisfied_steps"),
+        "final_step": rollout.get("final_step"),
+        "rollout_attempted": rollout.get("rollout_attempted"),
+        "termination_reason": rollout.get("termination_reason"),
+        "env_termination_reason": env_termination_reason,
+        "env_done_success": rollout.get("env_done_success"),
+        "rollout_terminated": rollout.get("env_terminated_seen", rollout.get("terminated")),
+        "rollout_truncated": rollout.get("truncated"),
+        "rollout_last_terminated": rollout.get("last_terminated"),
+        "env_terminated_seen": rollout.get("env_terminated_seen", rollout.get("terminated")),
+        "env_done_success_seen": rollout.get("env_done_success_seen", rollout.get("env_done_success")),
+        "first_env_terminated_step": rollout.get("first_env_terminated_step"),
+        "first_env_done_success_step": rollout.get("first_env_done_success_step"),
+        "env_task_success_before_segment_success": rollout.get("env_task_success_before_segment_success"),
+        "env_terminal_debug": env_terminal_debug,
+        "env_terminal_debug_json": json.dumps(env_terminal_debug, ensure_ascii=False, sort_keys=True)
+        if env_terminal_debug is not None
+        else None,
+        "rollout_start_all_satisfied": rollout.get("start_all_satisfied"),
+        "rollout_require_unsatisfied_at_start": rollout.get("require_unsatisfied_at_start"),
+        "rollout_max_steps": rollout.get("max_steps"),
         "metrics_path": str(metrics_path),
         "segment_log": str(segment_log),
     }
+    row["short_video_problem"] = is_short_video_problem_row(row)
+    row["transfer_pose_proxy_success_unconfirmed"] = is_transfer_pose_proxy_success_unconfirmed(row)
+    row["early_metric_activation_review_needed"] = is_early_metric_activation_review_needed(row)
+    row["meaningful_policy_caused_transition"] = has_meaningful_policy_caused_transition(row)
+    return row
 
 
 def run_segment_eval(
@@ -472,24 +725,43 @@ def run_segment_eval(
     rawdata_path: Path,
     out_dir: Path,
     default_max_steps: int,
+    max_dynamic_steps_cap: int,
     dry_run: bool,
     write_video: bool,
     segment_predicate_dump_trace: bool,
+    expected_task_prompt_sha256: str,
+    expected_server_run_id: str,
+    expected_server_token: str,
 ) -> Dict[str, Any]:
     task_name = sample["task_name"]
     demo_id = sample["demo_id"]
     skill_idx = int(sample["skill_idx"])
-    dynamic_max_steps = get_dynamic_max_steps(sample.get("frame_duration"), fallback=default_max_steps)
+    dynamic_max_steps = get_dynamic_max_steps(
+        sample.get("frame_duration"),
+        fallback=default_max_steps,
+        cap=max(0, int(max_dynamic_steps_cap or 0)),
+    )
 
     skill_out = out_dir / "raw" / task_name / f"demo_{demo_id}" / f"skill_{skill_idx:03d}"
     skill_out.mkdir(parents=True, exist_ok=True)
     segment_log = skill_out / "segment_eval.log"
-    # OmniGibson/Isaac can conflict across concurrent workers if they share the same app data/cache.
-    # Also, putting appdata on NAS is extremely slow. Default to local disk (/tmp) for appdata, and
-    # isolate per-(run, gpu, port).
+    # OmniGibson/Isaac appdata must stay on local disk (/tmp). A run-scoped cache forces every
+    # recheck to redownload / rebuild Isaac extensions, which dominates these short segment evals.
+    # Default to a stable per-GPU cache so reruns reuse warmed artifacts while different workers
+    # remain isolated. Allow env override for debugging or more aggressive isolation.
     og_appdata_base = Path(os.environ.get("OMNIGIBSON_APPDATA_PATH_BASE", "/tmp/omnigibson-appdata"))
     og_user = os.environ.get("USER", "user")
-    og_appdata = og_appdata_base / og_user / out_dir.name / f"gpu{gpu_id}_p{port}"
+    og_appdata_scope = os.environ.get("OMNIGIBSON_APPDATA_SCOPE", "gpu")
+    if og_appdata_scope == "gpu":
+        og_appdata = og_appdata_base / og_user / f"gpu{gpu_id}"
+    elif og_appdata_scope == "gpu_port":
+        og_appdata = og_appdata_base / og_user / f"gpu{gpu_id}_p{port}"
+    elif og_appdata_scope == "run_gpu_port":
+        og_appdata = og_appdata_base / og_user / out_dir.name / f"gpu{gpu_id}_p{port}"
+    else:
+        raise RuntimeError(
+            "invalid OMNIGIBSON_APPDATA_SCOPE; expected one of: gpu, gpu_port, run_gpu_port"
+        )
     og_appdata.mkdir(parents=True, exist_ok=True)
 
     existing_metrics = sorted((skill_out / "metrics").glob("*.json"))
@@ -508,7 +780,8 @@ export PYTHONUNBUFFERED=1
 export PYTHONPATH={q(str(behavior_dir / 'joylo'))}:{q(str(behavior_dir / 'OmniGibson'))}:{q(str(behavior_dir / 'bddl3'))}${{PYTHONPATH:+:$PYTHONPATH}}
 export NO_PROXY="localhost,127.0.0.1,::1${{NO_PROXY:+,$NO_PROXY}}"
 export no_proxy="localhost,127.0.0.1,::1${{no_proxy:+,$no_proxy}}"
-export OMNIGIBSON_GPU_ID={q(gpu_id)}
+export CUDA_VISIBLE_DEVICES={q(gpu_id)}
+unset OMNIGIBSON_GPU_ID
 export OMNIGIBSON_DATA_PATH={q(str(behavior_dir / 'datasets'))}
 export OMNIGIBSON_APPDATA_PATH={q(str(og_appdata))}
 export MPLBACKEND="${{MPLBACKEND:-Agg}}"
@@ -534,9 +807,14 @@ python OmniGibson/omnigibson/learning/eval_segment.py \
   segment_max_steps={q(dynamic_max_steps)} \
   model.host=127.0.0.1 \
   model.port={q(port)} \
+  model.expected_task_name={q(task_name)} \
+  model.expected_task_prompt_sha256={q(expected_task_prompt_sha256)} \
+  model.expected_server_run_id={q(expected_server_run_id)} \
+  model.expected_server_token={q(expected_server_token)} \
   env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper \
   partial_scene_load=true \
-  segment_predicate_window_mode=anytime \
+  segment_predicate_window_mode=consecutive \
+  segment_predicate_min_consecutive=3 \
   segment_predicate_dump_trace={q(str(segment_predicate_dump_trace).lower())}
 """
     with segment_log.open("w") as f:
@@ -597,31 +875,53 @@ def run_worker(args: argparse.Namespace) -> int:
 
     total_runtime_ok = 0
     total_success = 0
+    stagger_applied = False
     for task_name in sorted(grouped):
         server_proc: Optional[subprocess.Popen[str]] = None
+        server_log: Optional[Path] = None
+        task_port = args.port
         try:
-            if args.server_start_stagger_s > 0 and args.worker_rank >= 0:
+            if not stagger_applied and args.server_start_stagger_s > 0 and args.worker_rank >= 0:
                 # Stagger heavy model init/JIT to avoid 8-way compile storms on one node.
                 delay = args.server_start_stagger_s * int(args.worker_rank)
                 if delay > 0:
                     print(f"[worker {args.worker_rank:03d}] staggering server start by {delay}s", flush=True)
                     time.sleep(delay)
-            server_proc = start_server(
+                stagger_applied = True
+            # Avoid silently connecting to a stale server from another run.
+            # If the preferred port is already in use, hop by `gpus_per_node` to keep worker ports disjoint.
+            task_port = find_free_port(args.port, stride=args.gpus_per_node, max_tries=200)
+            server_identity = build_server_identity(
+                out_dir=args.out_dir,
+                worker_rank=args.worker_rank,
                 task_name=task_name,
-                port=args.port,
+                port=task_port,
+            )
+            server_proc, server_log = start_server(
+                task_name=task_name,
+                port=task_port,
                 gpu_id=args.gpu_id,
                 ckpt_dir=ckpt_dir,
                 config_name=args.config_name,
+                policy_backend=args.policy_backend,
+                server_run_id=server_identity["server_run_id"],
+                server_token=server_identity["server_token"],
                 openpi_env=args.openpi_env,
                 behavior_dir=args.behavior_dir,
                 out_dir=args.out_dir / "server_logs",
             )
             print(
-                f"[worker {args.worker_rank:03d}] started server for task={task_name} gpu={args.gpu_id} port={args.port}",
+                f"[worker {args.worker_rank:03d}] started server for task={task_name} gpu={args.gpu_id} port={task_port}",
                 flush=True,
             )
-            wait_for_server(args.port, args.server_ready_timeout)
-            print(f"[worker {args.worker_rank:03d}] server ready on port {args.port}", flush=True)
+            wait_for_server_proc(
+                proc=server_proc,
+                port=task_port,
+                timeout_s=args.server_ready_timeout,
+                log_file=server_log,
+                expected_identity=server_identity,
+            )
+            print(f"[worker {args.worker_rank:03d}] server ready on port {task_port}", flush=True)
             for sample in grouped[task_name]:
                 print(
                     f"[worker {args.worker_rank:03d}] {sample['skill']} | {sample['task_name']} | "
@@ -629,7 +929,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 )
                 row = run_segment_eval(
                     sample=sample,
-                    port=args.port,
+                    port=task_port,
                     gpu_id=args.gpu_id,
                     behavior_env=args.behavior_env,
                     behavior_dir=args.behavior_dir,
@@ -637,9 +937,13 @@ def run_worker(args: argparse.Namespace) -> int:
                     rawdata_path=args.rawdata_path,
                     out_dir=args.out_dir,
                     default_max_steps=args.max_steps,
+                    max_dynamic_steps_cap=args.max_dynamic_steps_cap,
                     dry_run=args.dry_run,
                     write_video=args.write_video,
                     segment_predicate_dump_trace=args.segment_predicate_dump_trace,
+                    expected_task_prompt_sha256=server_identity["task_prompt_sha256"],
+                    expected_server_run_id=server_identity["server_run_id"],
+                    expected_server_token=server_identity["server_token"],
                 )
                 row["worker_rank"] = args.worker_rank
                 row["node_rank"] = args.node_rank
@@ -649,6 +953,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 total_success += int(bool(row.get("success")))
         finally:
             stop_process(server_proc)
+            wait_for_port_free(task_port)
 
     final_status = {
         **status,
@@ -661,22 +966,231 @@ def run_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
+    runtime_pass = bool(row.get("runtime_ok"))
+    result_type = row.get("result_type")
+    pre_satisfied_start = result_type == RESULT_PRE_SATISFIED_START
+    short_proxy_success = result_type in {RESULT_SHORT_PROXY_SUCCESS, RESULT_LIKELY_PROXY_FALSE_POSITIVE} or bool(
+        row.get("short_proxy_success")
+    )
+    likely_proxy_false_positive = result_type == RESULT_LIKELY_PROXY_FALSE_POSITIVE or bool(
+        row.get("likely_proxy_false_positive")
+    )
+    transfer_pose_proxy_success_unconfirmed = bool(
+        row.get("transfer_pose_proxy_success_unconfirmed")
+    ) or is_transfer_pose_proxy_success_unconfirmed(row)
+    short_video_problem = (
+        result_type == RESULT_SHORT_VIDEO_PROBLEM
+        or bool(row.get("short_video_problem"))
+        or bool(row.get("metrics_short_video_problem"))
+        or is_short_video_problem_row(row)
+    )
+    early_metric_activation_review_needed = bool(row.get("early_metric_activation_review_needed")) or is_early_metric_activation_review_needed(
+        row
+    )
+    metric_invalid_missing_object = result_type == RESULT_METRIC_INVALID_MISSING_OBJECT
+    metric_invalid = str(result_type or "").startswith(METRIC_INVALID_PREFIX)
+    rollout_attempted = row.get("rollout_attempted")
+    if rollout_attempted is None:
+        policy_attempted = result_type in ATTEMPTABLE_RESULT_TYPES
+    else:
+        policy_attempted = bool(rollout_attempted) and result_type in ATTEMPTABLE_RESULT_TYPES
+    attemptable = runtime_pass and policy_attempted and not pre_satisfied_start and not metric_invalid
+    policy_success_attemptable = attemptable and bool(row.get("success")) and result_type == "predicate_satisfied"
+    policy_success_clean_attemptable = (
+        policy_success_attemptable
+        and not short_proxy_success
+        and not short_video_problem
+        and not transfer_pose_proxy_success_unconfirmed
+        and not early_metric_activation_review_needed
+    )
+    meaningful_policy_caused_transition = (
+        attemptable
+        and (bool(row.get("meaningful_policy_caused_transition")) or has_meaningful_policy_caused_transition(row))
+    )
+    timeout = attemptable and result_type == "timeout"
+    truncated = attemptable and result_type == "truncated"
+    env_terminated_metric_unsatisfied = attemptable and result_type == "env_terminated" and not bool(row.get("success"))
+    env_task_success_before_segment_success = (
+        attemptable and result_type == RESULT_ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS and not bool(row.get("success"))
+    )
+    metric_unsatisfied_attemptable = attemptable and not policy_success_attemptable
+    other_metric_unsatisfied = (
+        metric_unsatisfied_attemptable
+        and not timeout
+        and not truncated
+        and not env_terminated_metric_unsatisfied
+        and not env_task_success_before_segment_success
+        and not likely_proxy_false_positive
+    )
+    return {
+        "runtime_pass": runtime_pass,
+        "runtime_fail": not runtime_pass,
+        "pre_satisfied_start": runtime_pass and pre_satisfied_start,
+        "metric_invalid": runtime_pass and metric_invalid,
+        "metric_invalid_missing_object": runtime_pass and metric_invalid_missing_object,
+        "attemptable": attemptable,
+        "policy_success_attemptable": policy_success_attemptable,
+        "policy_success_clean_attemptable": policy_success_clean_attemptable,
+        "short_video_problem": runtime_pass and short_video_problem,
+        "early_metric_activation_review_needed": runtime_pass and early_metric_activation_review_needed,
+        "short_proxy_success": runtime_pass and short_proxy_success,
+        "likely_proxy_false_positive": runtime_pass and likely_proxy_false_positive,
+        "transfer_pose_proxy_success_unconfirmed": runtime_pass
+        and transfer_pose_proxy_success_unconfirmed,
+        "meaningful_policy_caused_transition": runtime_pass and meaningful_policy_caused_transition,
+        "timeout": timeout,
+        "truncated": truncated,
+        "env_terminated_metric_unsatisfied": env_terminated_metric_unsatisfied,
+        "env_task_success_before_segment_success": env_task_success_before_segment_success,
+        "metric_unsatisfied_attemptable": metric_unsatisfied_attemptable,
+        "other_metric_unsatisfied": other_metric_unsatisfied,
+    }
+
+
+def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(rows)
+    classes = [classify_result_row(row) for row in rows]
+    runtime_pass = sum(int(c["runtime_pass"]) for c in classes)
+    runtime_fail = sum(int(c["runtime_fail"]) for c in classes)
+    pre_satisfied_start = sum(int(c["pre_satisfied_start"]) for c in classes)
+    metric_invalid = sum(int(c["metric_invalid"]) for c in classes)
+    metric_invalid_missing_object = sum(int(c["metric_invalid_missing_object"]) for c in classes)
+    attemptable = sum(int(c["attemptable"]) for c in classes)
+    policy_success_attemptable = sum(int(c["policy_success_attemptable"]) for c in classes)
+    policy_success_clean_attemptable = sum(int(c["policy_success_clean_attemptable"]) for c in classes)
+    short_video_problem = sum(int(c["short_video_problem"]) for c in classes)
+    early_metric_activation_review_needed = sum(int(c["early_metric_activation_review_needed"]) for c in classes)
+    short_proxy_success = sum(int(c["short_proxy_success"]) for c in classes)
+    likely_proxy_false_positive = sum(int(c["likely_proxy_false_positive"]) for c in classes)
+    transfer_pose_proxy_success_unconfirmed = sum(
+        int(c["transfer_pose_proxy_success_unconfirmed"]) for c in classes
+    )
+    meaningful_policy_caused_transition = sum(int(c["meaningful_policy_caused_transition"]) for c in classes)
+    metric_unsatisfied_attemptable = sum(int(c["metric_unsatisfied_attemptable"]) for c in classes)
+    timeout = sum(int(c["timeout"]) for c in classes)
+    truncated = sum(int(c["truncated"]) for c in classes)
+    env_unsat = sum(int(c["env_terminated_metric_unsatisfied"]) for c in classes)
+    env_task_success_before_segment_success = sum(
+        int(c["env_task_success_before_segment_success"]) for c in classes
+    )
+    other_unsat = sum(int(c["other_metric_unsatisfied"]) for c in classes)
+    success_raw = sum(int(bool(row.get("success"))) for row in rows)
+    env_done_success_count = sum(int(row.get("env_done_success") is True) for row in rows)
+    rollout_terminated_count = sum(int(row.get("rollout_terminated") is True) for row in rows)
+    rollout_truncated_flag_count = sum(int(row.get("rollout_truncated") is True) for row in rows)
+    termination_reason_counts = dict(
+        sorted(
+            Counter(
+                str(row.get("termination_reason")) for row in rows if row.get("termination_reason") is not None
+            ).items()
+        )
+    )
+    env_termination_reason_counts = dict(
+        sorted(
+            Counter(
+                str(row.get("env_termination_reason"))
+                for row in rows
+                if row.get("env_termination_reason") is not None
+            ).items()
+        )
+    )
+    return {
+        "segment_count": total,
+        "runtime_pass_count": runtime_pass,
+        "runtime_fail_count": runtime_fail,
+        "runtime_pass_rate": runtime_pass / total if total else 0.0,
+        "pre_satisfied_start_count": pre_satisfied_start,
+        "metric_invalid_count": metric_invalid,
+        "metric_invalid_missing_object_count": metric_invalid_missing_object,
+        "attemptable_segment_count": attemptable,
+        "policy_success_attemptable_count": policy_success_attemptable,
+        "policy_success_attemptable_rate": policy_success_attemptable / attemptable if attemptable else 0.0,
+        "policy_success_clean_attemptable_count": policy_success_clean_attemptable,
+        "policy_success_clean_attemptable_rate": policy_success_clean_attemptable / attemptable if attemptable else 0.0,
+        "short_video_problem_count": short_video_problem,
+        "early_metric_activation_review_needed_count": early_metric_activation_review_needed,
+        "short_proxy_success_count": short_proxy_success,
+        "likely_proxy_false_positive_count": likely_proxy_false_positive,
+        "transfer_pose_proxy_success_unconfirmed_count": transfer_pose_proxy_success_unconfirmed,
+        "meaningful_policy_caused_transition_count": meaningful_policy_caused_transition,
+        "metric_unsatisfied_attemptable_count": metric_unsatisfied_attemptable,
+        "timeout_count": timeout,
+        "truncated_count": truncated,
+        "env_terminated_metric_unsatisfied_count": env_unsat,
+        "env_task_success_before_segment_success_count": env_task_success_before_segment_success,
+        "other_metric_unsatisfied_count": other_unsat,
+        "success_count_raw": success_raw,
+        "success_rate_raw_completed": success_raw / total if total else 0.0,
+        "predicate_satisfied_count": sum(1 for row in rows if row.get("result_type") == "predicate_satisfied"),
+        "env_done_success_count": env_done_success_count,
+        "rollout_terminated_count": rollout_terminated_count,
+        "rollout_truncated_flag_count": rollout_truncated_flag_count,
+        "termination_reason_counts": termination_reason_counts,
+        "termination_reason_counts_json": json.dumps(termination_reason_counts, ensure_ascii=False, sort_keys=True),
+        "env_termination_reason_counts": env_termination_reason_counts,
+        "env_termination_reason_counts_json": json.dumps(env_termination_reason_counts, ensure_ascii=False, sort_keys=True),
+        # Backwards-compatible legacy fields. Prefer the *_attemptable fields for policy rates.
+        "success_count": success_raw,
+        "success_rate": success_raw / total if total else 0.0,
+    }
+
+
 def render_summary_md(summary: Dict[str, Any]) -> str:
     lines = ["# Multinode Skill Segment Sweep Summary", ""]
     lines.append(f"- out_dir: `{summary['out_dir']}`")
     lines.append(f"- planned_jobs: `{summary['planned_jobs']}`")
     lines.append(f"- completed_jobs: `{summary['completed_jobs']}`")
     lines.append(f"- runtime_pass: `{summary['runtime_pass']}`")
-    lines.append(f"- policy_success: `{summary['policy_success']}`")
+    lines.append(f"- runtime_fail: `{summary['runtime_fail']}`")
+    lines.append(f"- pre_satisfied_start: `{summary['pre_satisfied_start']}`")
+    lines.append(f"- metric_invalid: `{summary.get('metric_invalid', 0)}`")
+    lines.append(f"- metric_invalid_missing_object: `{summary.get('metric_invalid_missing_object', 0)}`")
+    lines.append(f"- attemptable_segments: `{summary['attemptable_segments']}`")
+    lines.append(f"- policy_success_attemptable: `{summary['policy_success_attemptable']}`")
+    lines.append(f"- policy_success_attemptable_rate: `{summary['policy_success_attemptable_rate']:.4f}`")
+    lines.append(f"- policy_success_clean_attemptable: `{summary.get('policy_success_clean_attemptable', 0)}`")
+    lines.append(
+        f"- policy_success_clean_attemptable_rate: "
+        f"`{summary.get('policy_success_clean_attemptable_rate', 0.0):.4f}`"
+    )
+    lines.append(f"- short_video_problem: `{summary.get('short_video_problem', 0)}`")
+    lines.append(
+        f"- early_metric_activation_review_needed: `{summary.get('early_metric_activation_review_needed', 0)}`"
+    )
+    lines.append(f"- short_proxy_success: `{summary.get('short_proxy_success', 0)}`")
+    lines.append(f"- likely_proxy_false_positive: `{summary.get('likely_proxy_false_positive', 0)}`")
+    lines.append(
+        f"- meaningful_policy_caused_transition: `{summary.get('meaningful_policy_caused_transition', 0)}`"
+    )
+    lines.append(f"- metric_unsatisfied_attemptable: `{summary['metric_unsatisfied_attemptable']}`")
+    lines.append(f"- timeout: `{summary['timeout']}`")
+    lines.append(f"- truncated: `{summary['truncated']}`")
+    lines.append(f"- env_terminated_metric_unsatisfied: `{summary['env_terminated_metric_unsatisfied']}`")
+    lines.append(
+        f"- env_task_success_before_segment_success: `{summary.get('env_task_success_before_segment_success', 0)}`"
+    )
+    lines.append(f"- env_done_success_count: `{summary.get('env_done_success_count', 0)}`")
+    lines.append(f"- rollout_terminated_count: `{summary.get('rollout_terminated_count', 0)}`")
+    lines.append(f"- rollout_truncated_flag_count: `{summary.get('rollout_truncated_flag_count', 0)}`")
+    lines.append(f"- policy_success_raw: `{summary['policy_success_raw']}`")
     lines.append(f"- missing_jobs: `{summary['missing_jobs']}`")
     lines.append("")
-    lines.append("| Skill | Tasks | Demos | Segments | Runtime Pass Rate | Success Rate |")
-    lines.append("|---|---:|---:|---:|---:|---:|")
-    for row in summary["skill_summary"]:
-        lines.append(
+    lines.append(
+        "| Skill | Tasks | Demos | Segments | Runtime Pass Rate | Attemptable | "
+        "Policy Success / Attemptable | Pre-satisfied | Timeout | Truncated | Env-terminated Unsat |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.extend(
+        (
             f"| {row['skill']} | {row['task_count']} | {row['demo_count']} | {row['segment_count']} | "
-            f"{row['runtime_pass_rate']:.4f} | {row['success_rate']:.4f} |"
+            f"{row['runtime_pass_rate']:.4f} | {row['attemptable_segment_count']} | "
+            f"{row['policy_success_attemptable_count']} / {row['attemptable_segment_count']} "
+            f"({row['policy_success_attemptable_rate']:.4f}) | {row['pre_satisfied_start_count']} | "
+            f"{row['timeout_count']} | {row['truncated_count']} | {row['env_terminated_metric_unsatisfied_count']} |"
         )
+        for row in summary["skill_summary"]
+    )
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -704,51 +1218,70 @@ def merge_results(args: argparse.Namespace) -> int:
 
     skill_summary = []
     for skill, skill_rows in sorted(skill_grouped.items()):
-        runtime_pass = sum(int(bool(row.get("runtime_ok"))) for row in skill_rows)
-        success = sum(int(bool(row.get("success"))) for row in skill_rows)
-        total = len(skill_rows)
         skill_summary.append(
             {
                 "skill": skill,
                 "task_count": len({row["task_name"] for row in skill_rows}),
                 "demo_count": len({row["demo_id"] for row in skill_rows}),
-                "segment_count": total,
-                "runtime_pass_count": runtime_pass,
-                "runtime_pass_rate": runtime_pass / total if total else 0.0,
-                "success_count": success,
-                "success_rate": success / total if total else 0.0,
-                "timeout_count": sum(1 for row in skill_rows if row.get("result_type") == "timeout"),
-                "predicate_satisfied_count": sum(
-                    1 for row in skill_rows if row.get("result_type") == "predicate_satisfied"
-                ),
+                **summarize_result_rows(skill_rows),
             }
         )
 
     skill_task_summary = []
     for (skill, task_name), task_rows in sorted(skill_task_grouped.items()):
-        runtime_pass = sum(int(bool(row.get("runtime_ok"))) for row in task_rows)
-        success = sum(int(bool(row.get("success"))) for row in task_rows)
-        total = len(task_rows)
         skill_task_summary.append(
             {
                 "skill": skill,
                 "task_name": task_name,
                 "demo_count": len({row["demo_id"] for row in task_rows}),
-                "segment_count": total,
-                "runtime_pass_count": runtime_pass,
-                "runtime_pass_rate": runtime_pass / total if total else 0.0,
-                "success_count": success,
-                "success_rate": success / total if total else 0.0,
+                **summarize_result_rows(task_rows),
             }
         )
 
+    top_summary = summarize_result_rows(rows)
+    result_type_counts = dict(sorted(Counter(str(row.get("result_type")) for row in rows).items()))
     summary = {
+        "schema_version": 2,
         "out_dir": str(args.out_dir),
         "planned_jobs": len(planned_jobs),
         "completed_jobs": len(rows),
-        "runtime_pass": sum(int(bool(row.get("runtime_ok"))) for row in rows),
-        "policy_success": sum(int(bool(row.get("success"))) for row in rows),
         "missing_jobs": len(missing_keys),
+        "raw_result_rows": len(result_rows),
+        "deduped_result_rows": len(rows),
+        "runtime_pass": top_summary["runtime_pass_count"],
+        "runtime_fail": top_summary["runtime_fail_count"],
+        "runtime_pass_rate_completed": top_summary["runtime_pass_rate"],
+        "runtime_pass_rate_planned": top_summary["runtime_pass_count"] / len(planned_jobs) if planned_jobs else 0.0,
+        "pre_satisfied_start": top_summary["pre_satisfied_start_count"],
+        "metric_invalid": top_summary["metric_invalid_count"],
+        "metric_invalid_missing_object": top_summary["metric_invalid_missing_object_count"],
+        "attemptable_segments": top_summary["attemptable_segment_count"],
+        "policy_success_attemptable": top_summary["policy_success_attemptable_count"],
+        "policy_success_attemptable_rate": top_summary["policy_success_attemptable_rate"],
+        "policy_success_clean_attemptable": top_summary["policy_success_clean_attemptable_count"],
+        "policy_success_clean_attemptable_rate": top_summary["policy_success_clean_attemptable_rate"],
+        "short_video_problem": top_summary["short_video_problem_count"],
+        "early_metric_activation_review_needed": top_summary["early_metric_activation_review_needed_count"],
+        "short_proxy_success": top_summary["short_proxy_success_count"],
+        "likely_proxy_false_positive": top_summary["likely_proxy_false_positive_count"],
+        "transfer_pose_proxy_success_unconfirmed": top_summary[
+            "transfer_pose_proxy_success_unconfirmed_count"
+        ],
+        "meaningful_policy_caused_transition": top_summary["meaningful_policy_caused_transition_count"],
+        "metric_unsatisfied_attemptable": top_summary["metric_unsatisfied_attemptable_count"],
+        "timeout": top_summary["timeout_count"],
+        "truncated": top_summary["truncated_count"],
+        "env_terminated_metric_unsatisfied": top_summary["env_terminated_metric_unsatisfied_count"],
+        "env_task_success_before_segment_success": top_summary["env_task_success_before_segment_success_count"],
+        "other_metric_unsatisfied": top_summary["other_metric_unsatisfied_count"],
+        "env_done_success_count": top_summary["env_done_success_count"],
+        "rollout_terminated_count": top_summary["rollout_terminated_count"],
+        "rollout_truncated_flag_count": top_summary["rollout_truncated_flag_count"],
+        "termination_reason_counts": top_summary["termination_reason_counts"],
+        "env_termination_reason_counts": top_summary["env_termination_reason_counts"],
+        "policy_success_raw": top_summary["success_count_raw"],
+        "policy_success": top_summary["success_count_raw"],
+        "result_type_counts": result_type_counts,
         "missing_job_keys": missing_keys,
         "skill_summary": skill_summary,
         "skill_task_summary": skill_task_summary,
@@ -772,7 +1305,34 @@ def merge_results(args: argparse.Namespace) -> int:
             "result_type",
             "metric_family",
             "start_all_satisfied",
+            "short_video_problem",
+            "metrics_short_video_problem",
+            "early_metric_activation_review_needed",
+            "short_proxy_success",
+            "likely_proxy_false_positive",
+            "transfer_pose_proxy_success_unconfirmed",
+            "short_success_required_step",
+            "min_success_steps",
+            "first_predicate_satisfied_step",
+            "early_predicate_satisfied_steps",
+            "meaningful_policy_caused_transition",
             "final_step",
+            "rollout_attempted",
+            "termination_reason",
+            "env_termination_reason",
+            "env_done_success",
+            "rollout_terminated",
+            "rollout_truncated",
+            "rollout_last_terminated",
+            "env_terminated_seen",
+            "env_done_success_seen",
+            "first_env_terminated_step",
+            "first_env_done_success_step",
+            "env_task_success_before_segment_success",
+            "env_terminal_debug_json",
+            "rollout_start_all_satisfied",
+            "rollout_require_unsatisfied_at_start",
+            "rollout_max_steps",
             "returncode",
             "metrics_path",
             "segment_log",
@@ -791,11 +1351,38 @@ def merge_results(args: argparse.Namespace) -> int:
             "demo_count",
             "segment_count",
             "runtime_pass_count",
+            "runtime_fail_count",
             "runtime_pass_rate",
+            "pre_satisfied_start_count",
+            "metric_invalid_count",
+            "metric_invalid_missing_object_count",
+            "attemptable_segment_count",
+            "policy_success_attemptable_count",
+            "policy_success_attemptable_rate",
+            "policy_success_clean_attemptable_count",
+            "policy_success_clean_attemptable_rate",
+            "short_video_problem_count",
+            "early_metric_activation_review_needed_count",
+            "short_proxy_success_count",
+            "likely_proxy_false_positive_count",
+            "transfer_pose_proxy_success_unconfirmed_count",
+            "meaningful_policy_caused_transition_count",
+            "metric_unsatisfied_attemptable_count",
+            "timeout_count",
+            "truncated_count",
+            "env_terminated_metric_unsatisfied_count",
+            "env_task_success_before_segment_success_count",
+            "other_metric_unsatisfied_count",
+            "success_count_raw",
+            "success_rate_raw_completed",
             "success_count",
             "success_rate",
-            "timeout_count",
             "predicate_satisfied_count",
+            "env_done_success_count",
+            "rollout_terminated_count",
+            "rollout_truncated_flag_count",
+            "termination_reason_counts_json",
+            "env_termination_reason_counts_json",
         ],
     )
     write_csv(
@@ -807,9 +1394,38 @@ def merge_results(args: argparse.Namespace) -> int:
             "demo_count",
             "segment_count",
             "runtime_pass_count",
+            "runtime_fail_count",
             "runtime_pass_rate",
+            "pre_satisfied_start_count",
+            "metric_invalid_count",
+            "metric_invalid_missing_object_count",
+            "attemptable_segment_count",
+            "policy_success_attemptable_count",
+            "policy_success_attemptable_rate",
+            "policy_success_clean_attemptable_count",
+            "policy_success_clean_attemptable_rate",
+            "short_video_problem_count",
+            "early_metric_activation_review_needed_count",
+            "short_proxy_success_count",
+            "likely_proxy_false_positive_count",
+            "transfer_pose_proxy_success_unconfirmed_count",
+            "meaningful_policy_caused_transition_count",
+            "metric_unsatisfied_attemptable_count",
+            "timeout_count",
+            "truncated_count",
+            "env_terminated_metric_unsatisfied_count",
+            "env_task_success_before_segment_success_count",
+            "other_metric_unsatisfied_count",
+            "success_count_raw",
+            "success_rate_raw_completed",
             "success_count",
             "success_rate",
+            "predicate_satisfied_count",
+            "env_done_success_count",
+            "rollout_terminated_count",
+            "rollout_truncated_flag_count",
+            "termination_reason_counts_json",
+            "env_termination_reason_counts_json",
         ],
     )
     (args.out_dir / "multinode_skill_summary.md").write_text(render_summary_md(summary))
@@ -872,6 +1488,8 @@ def launch_node(args: argparse.Namespace) -> int:
                 args.behavior_env,
                 "--config-name",
                 args.config_name,
+                "--policy-backend",
+                args.policy_backend,
                 "--ckpt-dir",
                 str(args.ckpt_dir),
                 "--behavior-dir",
@@ -886,6 +1504,8 @@ def launch_node(args: argparse.Namespace) -> int:
                 str(gpu_id),
                 "--port",
                 str(port),
+                "--max-dynamic-steps-cap",
+                str(args.max_dynamic_steps_cap),
             ]
             if args.server_start_stagger_s > 0:
                 cmd.extend(["--server-start-stagger-s", str(args.server_start_stagger_s)])
@@ -898,7 +1518,13 @@ def launch_node(args: argparse.Namespace) -> int:
             if args.resume:
                 cmd.append("--resume")
             with worker_log.open("w") as f:
-                proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, text=True)
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                )
             children.append((proc, worker_rank, worker_log))
 
         remaining = list(children)
@@ -925,8 +1551,7 @@ def launch_node(args: argparse.Namespace) -> int:
         return 0
     finally:
         for proc, _, _ in children:
-            if proc.poll() is None:
-                proc.terminate()
+            stop_process(proc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -943,8 +1568,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-nodes", type=int, default=int(os.environ.get("NUM_NODES", "1")))
     parser.add_argument("--gpus-per-node", type=int, default=int(os.environ.get("GPUS_PER_NODE", "8")))
     parser.add_argument("--local-gpu-ids", default=os.environ.get("LOCAL_GPU_IDS", ""))
-    parser.add_argument("--port-base", type=int, default=16000)
+    parser.add_argument(
+        "--port-base",
+        type=int,
+        default=0,
+        help="base port for per-GPU workers; 0 picks a random safe base automatically",
+    )
     parser.add_argument("--max-steps", type=int, default=120)
+    parser.add_argument(
+        "--max-dynamic-steps-cap",
+        type=int,
+        default=0,
+        help="optional upper bound for duration-derived segment_max_steps; 0 disables the cap",
+    )
     parser.add_argument("--server-ready-timeout", type=int, default=1800)
     parser.add_argument(
         "--server-start-stagger-s",
@@ -956,6 +1592,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openpi-env", default="openpi-comet-nas")
     parser.add_argument("--behavior-env", default="behavior")
     parser.add_argument("--config-name", default=DEFAULT_CONFIG)
+    parser.add_argument("--policy-backend", choices=["auto", "torch", "jax"], default="auto")
     parser.add_argument("--ckpt-dir", type=Path, default=DEFAULT_CKPT)
     parser.add_argument("--behavior-dir", type=Path, default=BEHAVIOR_DIR_DEFAULT)
     parser.add_argument("--demo-data-path", type=Path, default=DEMO_DATA_PATH_DEFAULT)
@@ -996,6 +1633,12 @@ def parse_args() -> argparse.Namespace:
         args.local_gpu_ids = list(range(args.gpus_per_node))
     if len(args.local_gpu_ids) != args.gpus_per_node:
         raise RuntimeError("LOCAL_GPU_IDS count must match --gpus-per-node")
+
+    # Pick a random, non-privileged port base by default to reduce collisions with stale runs.
+    # Keep enough headroom for retry hopping (find_free_port with stride=gpus_per_node).
+    if int(args.port_base) <= 0:
+        rng = random.SystemRandom()
+        args.port_base = rng.randint(20000, 60000)
     if str(args.out_dir).startswith("/tmp") and not args.allow_tmp_out_dir:
         raise RuntimeError(
             "refusing to write formal evaluation outputs under /tmp. "
