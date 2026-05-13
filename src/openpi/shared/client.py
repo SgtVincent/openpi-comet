@@ -170,16 +170,20 @@ class Client:
     ):
         self.model = model
         self.preserved_kwargs = inspect.signature(
-            openai.OpenAI(api_key="").beta.chat.completions.parse
+            openai.OpenAI(api_key=api_key).beta.chat.completions.parse
         ).parameters.keys()
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url, timeout=600)
         self.logger = logging.getLogger(self.__class__.__name__)
         self.uuid = uuid.uuid4()
         self.history_multi_modals = deque(maxlen=64 * 10)
+        self.plan_status = ""
+        self.subtask_history: list[str] = []
 
     def reset(self):
         self.history_multi_modals.clear()
         self.uuid = uuid.uuid4()
+        self.plan_status = ""
+        self.subtask_history = []
 
     @retry(
         stop=stop_after_attempt(10),

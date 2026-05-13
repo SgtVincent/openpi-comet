@@ -56,8 +56,14 @@ class Args:
 
     # Port to serve the policy on.
     port: int = 8000
+    # Optional run identifier propagated to healthz / websocket metadata.
+    server_run_id: str | None = None
+    # Optional per-server token propagated to healthz / websocket metadata.
+    server_token: str | None = None
     # Record the policy's behavior for debugging.
     record: bool = False
+    # Force model backend selection. "auto" preserves the existing checkpoint-based detection.
+    policy_backend: str = "auto"
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -77,7 +83,10 @@ class Args:
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     return _policy_config.create_trained_policy(
-        _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+        _config.get_config(args.policy.config),
+        args.policy.dir,
+        default_prompt=args.default_prompt,
+        policy_backend=args.policy_backend,
     )
 
 
@@ -86,7 +95,7 @@ def main(args: Args) -> None:
     logging.info(f"Using task_name: {args.task_name}")
 
     policy = create_policy(args)
-    policy_metadata = policy.metadata
+    base_policy_metadata = dict(policy.metadata or {})
 
     # Record the policy's behavior.
     if args.record:
@@ -102,6 +111,13 @@ def main(args: Args) -> None:
         temporal_ensemble_max=args.temporal_ensemble_max,
         fine_grained_level=args.fine_grained_level,
     )
+    policy_metadata = {
+        **base_policy_metadata,
+        **policy.server_identity_metadata(),
+        "server_run_id": args.server_run_id,
+        "server_token": args.server_token,
+    }
+    policy_metadata = {k: v for k, v in policy_metadata.items() if v is not None}
 
     hostname = socket.gethostname()
     try:
@@ -109,6 +125,7 @@ def main(args: Args) -> None:
     except socket.gaierror:
         local_ip = "127.0.0.1"
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
+    policy_metadata.update({"server_hostname": hostname, "server_ip": local_ip, "server_port": args.port})
 
     server = WebsocketPolicyServer(
         policy=policy,

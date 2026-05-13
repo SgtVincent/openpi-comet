@@ -1,7 +1,6 @@
 import logging
-import os
 import pathlib
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import jax.numpy as jnp
 
@@ -24,6 +23,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    policy_backend: Literal["auto", "torch", "jax"] = "auto",
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -39,24 +39,45 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        policy_backend: Which backend to load. "auto" prefers PyTorch when `model.safetensors`
+            exists and otherwise falls back to JAX params; "torch" and "jax" force the backend.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
-        presence of "model.safensors" in the checkpoint directory.
+        presence of "model.safetensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    checkpoint_dir = pathlib.Path(checkpoint_dir)
 
-    # Check if this is a PyTorch model by looking for model.safetensors
-    weight_path = os.path.join(checkpoint_dir, "model.safetensors")
-    is_pytorch = os.path.exists(weight_path)
+    weight_path = checkpoint_dir / "model.safetensors"
+    params_path = checkpoint_dir / "params"
+    if policy_backend not in {"auto", "torch", "jax"}:
+        raise ValueError(f"Unsupported policy backend: {policy_backend}")
 
-    logging.info("Loading model...")
+    if policy_backend == "torch":
+        is_pytorch = True
+    elif policy_backend == "jax":
+        is_pytorch = False
+    else:
+        # Check if this is a PyTorch model by looking for model.safetensors.
+        is_pytorch = weight_path.exists()
+
+    if is_pytorch and not weight_path.exists():
+        raise FileNotFoundError(
+            f"Requested PyTorch backend but checkpoint is missing weights: {weight_path}"
+        )
+    if not is_pytorch and not params_path.exists():
+        raise FileNotFoundError(
+            f"Requested JAX backend but checkpoint is missing params dir: {params_path}"
+        )
+
+    logging.info("Loading model with backend=%s from %s", "torch" if is_pytorch else "jax", checkpoint_dir)
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        model = train_config.model.load(_model.restore_params(params_path, dtype=jnp.bfloat16))
     data_factories = train_config.data if isinstance(train_config.data, (list, tuple)) else [train_config.data]
     if len(data_factories) != 1:
         raise NotImplementedError("Serving with multiple datasets is not supported.")

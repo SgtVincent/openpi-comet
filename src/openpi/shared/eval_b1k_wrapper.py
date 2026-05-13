@@ -1,7 +1,10 @@
 from collections import deque
 import copy
+import hashlib
 import json
 import logging
+from pathlib import Path
+import re
 
 import cv2
 import numpy as np
@@ -11,6 +14,8 @@ import torch
 
 logger = logging.getLogger("policy")
 logger.setLevel(20)  # info
+
+TASK_MAPPING_PATH = Path(__file__).resolve().parents[3] / "scripts" / "task_mapping.json"
 
 RESIZE_SIZE = 224
 DESPTH_RESIZE_SIZE = 720
@@ -39,12 +44,14 @@ class B1KPolicyWrapper:
     ) -> None:
         self.policy = policy
         self.task_name = task_name
+        self.prompt_override = prompt_override
         # Session id is used to isolate runtime state (e.g., streaming memory) when the
         # same model instance is shared across multiple websocket connections.
         self._session_id: int = id(self)
 
         # load the task name from the metadata
-        metadata = json.load(open("scripts/task_mapping.json"))
+        with TASK_MAPPING_PATH.open() as f:
+            metadata = json.load(f)
         self.task_prompt = prompt_override if prompt_override is not None else metadata[task_name].get("task")
         self.subtask_prompts = metadata[task_name].get("subtask")
         self.skill_prompts = metadata[task_name].get("skill")
@@ -58,9 +65,11 @@ class B1KPolicyWrapper:
         self.max_len = max_len  # how long the policy sequences are
         self.temporal_ensemble_max = temporal_ensemble_max  # max number of sequences to ensemble
         self.step_counter = 0
+        self.last_policy_inferred = False
 
         self.fine_grained_level = fine_grained_level
         self.last_generated_subtask = None
+        self.last_prompt_debug: dict[str, object] | None = None
         if self.fine_grained_level > 0:
             from openpi.shared.client import Client
 
@@ -107,13 +116,24 @@ class B1KPolicyWrapper:
         logger.info(f"{self.subtask_prompts=}")
         logger.info(f"{self.skill_prompts=}")
 
+    def server_identity_metadata(self) -> dict[str, object]:
+        return {
+            "task_name": self.task_name,
+            "task_prompt_sha256": hashlib.sha256(self.task_prompt.encode("utf-8")).hexdigest(),
+            "prompt_override_used": self.prompt_override is not None,
+            "control_mode": self.control_mode,
+            "fine_grained_level": self.fine_grained_level,
+        }
+
     def reset(self):
         self.action_queue = deque(maxlen=self.action_horizon)
         self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         self.step_counter = 0
+        self.last_policy_inferred = False
         self._maybe_set_active_session()
         self._maybe_reset_streaming_state()
         self.last_generated_subtask = None
+        self.last_prompt_debug = None
         if self.reasoner:
             self.reasoner.reset()
 
@@ -131,7 +151,9 @@ class B1KPolicyWrapper:
         session.action_queue = deque(maxlen=self.action_horizon)
         session.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         session.step_counter = 0
+        session.last_policy_inferred = False
         session.last_generated_subtask = None
+        session.last_prompt_debug = None
 
         # Ensure any optional reasoner state is not shared.
         if self.reasoner is not None:
@@ -193,8 +215,93 @@ class B1KPolicyWrapper:
 
         return processed_obs
 
+    @staticmethod
+    def _normalize_skill_text(text: str | None) -> str:
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+    def _match_allowed_skill(self, raw_reasoner_output: str | None) -> tuple[str | None, str | None]:
+        normalized_output = self._normalize_skill_text(raw_reasoner_output)
+        if not normalized_output or not self.skill_prompts:
+            return None, None
+
+        normalized_skills = [(skill, self._normalize_skill_text(skill)) for skill in self.skill_prompts if skill]
+        for skill, normalized_skill in normalized_skills:
+            if normalized_output == normalized_skill:
+                return skill, "exact"
+
+        contains_matches = [
+            (skill, normalized_skill)
+            for skill, normalized_skill in normalized_skills
+            if normalized_skill and normalized_skill in normalized_output
+        ]
+        if contains_matches:
+            best_skill, _ = max(contains_matches, key=lambda item: len(item[1]))
+            return best_skill, "contains"
+
+        reverse_matches = [
+            (skill, normalized_skill)
+            for skill, normalized_skill in normalized_skills
+            if normalized_output in normalized_skill
+        ]
+        if reverse_matches:
+            best_skill, _ = min(reverse_matches, key=lambda item: len(item[1]))
+            return best_skill, "contained_by"
+
+        return None, None
+
+    def _resolve_policy_prompt(self, *, egocentric_camera: np.ndarray | None = None) -> tuple[str, dict[str, object]]:
+        prompt_debug: dict[str, object] = {
+            "task_name": self.task_name,
+            "task_prompt": self.task_prompt,
+            "fine_grained_level": self.fine_grained_level,
+            "skill_candidates": list(self.skill_prompts or []),
+            "reasoner_enabled": self.fine_grained_level > 0 and self.reasoner is not None,
+            "reasoner_output": None,
+            "reasoner_error": None,
+            "selected_skill": None,
+            "match_type": None,
+            "fallback_to_task_prompt": False,
+            "fallback_reason": None,
+            "final_prompt": self.task_prompt,
+        }
+        if not prompt_debug["reasoner_enabled"]:
+            prompt_debug["fallback_reason"] = "fine_grained_disabled"
+            return self.task_prompt, prompt_debug
+
+        if not self.skill_prompts:
+            prompt_debug["fallback_to_task_prompt"] = True
+            prompt_debug["fallback_reason"] = "missing_skill_prompts"
+            return self.task_prompt, prompt_debug
+
+        try:
+            reasoner_response = self.reasoner.generate_subtask(
+                high_level_task=self.task_prompt,
+                multi_modals=[egocentric_camera] if egocentric_camera is not None else [],
+            )
+        except Exception as exc:
+            logger.warning("Reasoner failed; falling back to task prompt: %s", exc)
+            prompt_debug["fallback_to_task_prompt"] = True
+            prompt_debug["fallback_reason"] = "reasoner_error"
+            prompt_debug["reasoner_error"] = f"{type(exc).__name__}: {exc}"
+            return self.task_prompt, prompt_debug
+        logger.info(f"* {reasoner_response}")
+        prompt_debug["reasoner_output"] = reasoner_response
+        selected_skill, match_type = self._match_allowed_skill(reasoner_response)
+        if selected_skill is None:
+            prompt_debug["fallback_to_task_prompt"] = True
+            prompt_debug["fallback_reason"] = "no_skill_match"
+            return self.task_prompt, prompt_debug
+
+        prompt_debug["selected_skill"] = selected_skill
+        prompt_debug["match_type"] = match_type
+        prompt_debug["final_prompt"] = selected_skill
+        return selected_skill, prompt_debug
+
     def act_receeding_temporal(self, input_obs):
         # Step 1: check if we should re-run policy
+        self.last_policy_inferred = False
         if self.step_counter % self.replan_interval == 0:
             nbatch = copy.deepcopy(input_obs)
             if nbatch["observation"].shape[-1] != 3:
@@ -212,13 +319,9 @@ class B1KPolicyWrapper:
                 "prompt": self.task_prompt,
             }
 
-            if self.fine_grained_level > 0 and self.reasoner is not None:
-                reasoner_response = self.reasoner.generate_subtask(
-                    high_level_task=self.task_prompt,
-                    multi_modals=[batch["observation/egocentric_camera"]],
-                )
-                logger.info(f"* {reasoner_response}")
-                batch["prompt"] = reasoner_response
+            batch["prompt"], self.last_prompt_debug = self._resolve_policy_prompt(
+                egocentric_camera=batch["observation/egocentric_camera"]
+            )
 
             if "observation/egocentric_depth" in nbatch:
                 batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
@@ -226,6 +329,7 @@ class B1KPolicyWrapper:
             try:
                 self._maybe_set_active_session()
                 action = self.policy.infer(batch)
+                self.last_policy_inferred = True
                 if "generated_subtask" in action and action["generated_subtask"] is not None:
                     self.last_generated_subtask = action["generated_subtask"]
                 self.last_action = action
@@ -304,6 +408,7 @@ class B1KPolicyWrapper:
             Shape: (10, 16)
         """
         input_obs = self.process_obs(input_obs)
+        self.last_policy_inferred = False
         if self.control_mode == "receeding_temporal":
             return self.act_receeding_temporal(input_obs)
 
@@ -332,18 +437,14 @@ class B1KPolicyWrapper:
         if "observation/egocentric_depth" in nbatch:
             batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
 
-        if self.fine_grained_level > 0 and self.reasoner is not None:
-            # skill_prompt = SKILL_PROMPT.format(task_prompt=self.task_prompt, skill_prompts="\n".join(self.skill_prompts))
-            reasoner_response = self.reasoner.generate_subtask(
-                high_level_task=self.task_prompt,
-                multi_modals=[batch["observation/egocentric_camera"]],
-            )
-            logger.info(f"* {reasoner_response}")
-            batch["prompt"] = reasoner_response
+        batch["prompt"], self.last_prompt_debug = self._resolve_policy_prompt(
+            egocentric_camera=batch["observation/egocentric_camera"]
+        )
 
         try:
             self._maybe_set_active_session()
             action = self.policy.infer(batch)
+            self.last_policy_inferred = True
             if "generated_subtask" in action and action["generated_subtask"] is not None:
                 self.last_generated_subtask = action["generated_subtask"]
             self.last_action = action
