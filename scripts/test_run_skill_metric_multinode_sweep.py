@@ -15,6 +15,14 @@ assert _COMPARE_SPEC is not None and _COMPARE_SPEC.loader is not None
 compare_mod = importlib.util.module_from_spec(_COMPARE_SPEC)
 _COMPARE_SPEC.loader.exec_module(compare_mod)
 
+_PERSISTENT_WORKER_MODULE_PATH = Path(__file__).with_name("persistent_skill_eval_worker.py")
+_PERSISTENT_WORKER_SPEC = importlib.util.spec_from_file_location(
+    "persistent_skill_eval_worker", _PERSISTENT_WORKER_MODULE_PATH
+)
+assert _PERSISTENT_WORKER_SPEC is not None and _PERSISTENT_WORKER_SPEC.loader is not None
+persistent_worker_mod = importlib.util.module_from_spec(_PERSISTENT_WORKER_SPEC)
+_PERSISTENT_WORKER_SPEC.loader.exec_module(persistent_worker_mod)
+
 
 def test_classify_result_row_excludes_metric_invalid_from_attemptable() -> None:
     row = {"runtime_ok": True, "success": False, "result_type": "metric_invalid_missing_object"}
@@ -217,6 +225,28 @@ def test_articulation_close_success_requires_review_not_clean_success() -> None:
     assert summary["articulation_close_success_unconfirmed_count"] == 1
 
 
+def test_articulation_close_proxy_success_requires_review_not_clean_success() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "articulation_close_proxy",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["attemptable"] is True
+    assert classes["policy_success_attemptable"] is True
+    assert classes["articulation_close_proxy_success_unconfirmed"] is True
+    assert classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["articulation_close_proxy_success_unconfirmed_count"] == 1
+
+
 def test_geometry_base_facing_success_requires_review_not_clean_success() -> None:
     row = {
         "runtime_ok": True,
@@ -409,6 +439,14 @@ def test_compare_summary_uses_same_new_proxy_guards() -> None:
         "rollout_attempted": True,
         "final_step": 188,
     }
+    articulation_close_proxy_row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "articulation_close_proxy",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
     open_drawer_row = {
         "runtime_ok": True,
         "success": True,
@@ -423,9 +461,10 @@ def test_compare_summary_uses_same_new_proxy_guards() -> None:
     can_classes = compare_mod.classify_result_row(can_meat_row)
     orientation_classes = compare_mod.classify_result_row(orientation_row)
     articulation_open_proxy_classes = compare_mod.classify_result_row(articulation_open_proxy_row)
+    articulation_close_proxy_classes = compare_mod.classify_result_row(articulation_close_proxy_row)
     open_drawer_classes = compare_mod.classify_result_row(open_drawer_row)
     summary = compare_mod.summarize_result_rows(
-        [can_meat_row, orientation_row, articulation_open_proxy_row, open_drawer_row]
+        [can_meat_row, orientation_row, articulation_open_proxy_row, articulation_close_proxy_row, open_drawer_row]
     )
 
     assert can_classes["policy_success_attemptable"] is True
@@ -435,13 +474,16 @@ def test_compare_summary_uses_same_new_proxy_guards() -> None:
     assert orientation_classes["policy_success_clean_attemptable"] is False
     assert articulation_open_proxy_classes["articulation_open_proxy_success_unconfirmed"] is True
     assert articulation_open_proxy_classes["policy_success_clean_attemptable"] is False
+    assert articulation_close_proxy_classes["articulation_close_proxy_success_unconfirmed"] is True
+    assert articulation_close_proxy_classes["policy_success_clean_attemptable"] is False
     assert open_drawer_classes["articulation_open_success_unconfirmed"] is True
     assert open_drawer_classes["policy_success_clean_attemptable"] is False
-    assert summary["policy_success_attemptable_count"] == 4
+    assert summary["policy_success_attemptable_count"] == 5
     assert summary["policy_success_clean_attemptable_count"] == 0
     assert summary["can_meat_lid_success_unconfirmed_count"] == 1
     assert summary["orientation_proxy_success_unconfirmed_count"] == 1
     assert summary["articulation_open_proxy_success_unconfirmed_count"] == 1
+    assert summary["articulation_close_proxy_success_unconfirmed_count"] == 1
     assert summary["articulation_open_success_unconfirmed_count"] == 1
 
 
@@ -762,6 +804,12 @@ def test_compare_partial_summary_matches_new_review_and_transition_schema(tmp_pa
                 "task_name": "can_meat",
                 "demo_id": "demo006",
             },
+            {
+                "job_key": "push tray|task_epsilon|demo007|007",
+                "skill": "push tray",
+                "task_name": "task_epsilon",
+                "demo_id": "demo007",
+            },
         ]
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest))
@@ -876,10 +924,28 @@ def test_compare_partial_summary_matches_new_review_and_transition_schema(tmp_pa
                 ),
                 json.dumps(
                     {
-                        "job_key": "open drawer|task_delta|demo007|007",
+                        "job_key": "push tray|task_epsilon|demo007|007",
+                        "skill": "push tray",
+                        "task_name": "task_epsilon",
+                        "demo_id": "demo007",
+                        "runtime_ok": True,
+                        "success": True,
+                        "result_type": "predicate_satisfied",
+                        "metric_family": "articulation_close_proxy",
+                        "rollout_attempted": True,
+                        "start_all_satisfied": False,
+                        "min_success_steps": 150,
+                        "first_predicate_satisfied_step": 170,
+                        "early_predicate_satisfied_steps": 0,
+                        "termination_reason": "predicate_satisfied",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "job_key": "open drawer|task_delta|demo008|008",
                         "skill": "open drawer",
                         "task_name": "task_delta",
-                        "demo_id": "demo007",
+                        "demo_id": "demo008",
                         "runtime_ok": True,
                         "success": True,
                         "result_type": "predicate_satisfied",
@@ -899,21 +965,26 @@ def test_compare_partial_summary_matches_new_review_and_transition_schema(tmp_pa
 
     summary = compare_mod.build_partial_summary(run_dir)
 
-    assert summary["policy_success_attemptable"] == 7
+    assert summary["policy_success_attemptable"] == 8
     assert summary["policy_success_clean_attemptable"] == 1
     assert summary["early_metric_activation_review_needed"] == 1
     assert summary["relation_transfer_proxy_success_unconfirmed"] == 1
     assert summary["orientation_proxy_success_unconfirmed"] == 1
+    assert summary["articulation_close_proxy_success_unconfirmed"] == 1
     assert summary["articulation_open_proxy_success_unconfirmed"] == 1
     assert summary["articulation_open_success_unconfirmed"] == 1
     assert summary["can_meat_lid_success_unconfirmed"] == 1
-    assert summary["meaningful_policy_caused_transition"] == 6
+    assert summary["meaningful_policy_caused_transition"] == 7
     task_alpha = next(row for row in summary["skill_task_summary"] if row["task_name"] == "task_alpha")
     assert task_alpha["early_metric_activation_review_needed_count"] == 1
     assert task_alpha["relation_transfer_proxy_success_unconfirmed_count"] == 1
     assert task_alpha["meaningful_policy_caused_transition_count"] == 2
     assert any(
         row["task_name"] == "task_beta" and row["orientation_proxy_success_unconfirmed_count"] == 1
+        for row in summary["skill_task_summary"]
+    )
+    assert any(
+        row["task_name"] == "task_epsilon" and row["articulation_close_proxy_success_unconfirmed_count"] == 1
         for row in summary["skill_task_summary"]
     )
     assert any(
@@ -928,3 +999,107 @@ def test_compare_partial_summary_matches_new_review_and_transition_schema(tmp_pa
         row["task_name"] == "can_meat" and row["can_meat_lid_success_unconfirmed_count"] == 1
         for row in summary["skill_task_summary"]
     )
+
+
+def test_metric_family_summary_surfaces_review_needed_counts() -> None:
+    rows = [
+        {
+            "runtime_ok": True,
+            "success": True,
+            "result_type": "predicate_satisfied",
+            "metric_family": "articulation_close_proxy",
+            "rollout_attempted": True,
+            "final_step": 188,
+        },
+        {
+            "runtime_ok": True,
+            "success": True,
+            "result_type": "predicate_satisfied",
+            "metric_family": "grasp_release",
+            "rollout_attempted": True,
+            "final_step": 188,
+            "start_all_satisfied": False,
+            "min_success_steps": 150,
+            "first_predicate_satisfied_step": 170,
+            "early_predicate_satisfied_steps": 0,
+        },
+    ]
+
+    family_summary = mod.build_metric_family_summary(rows)
+
+    close_proxy = next(row for row in family_summary if row["metric_family"] == "articulation_close_proxy")
+    grasp_release = next(row for row in family_summary if row["metric_family"] == "grasp_release")
+    assert close_proxy["policy_success_attemptable_count"] == 1
+    assert close_proxy["policy_success_clean_attemptable_count"] == 0
+    assert close_proxy["review_needed_success_count"] == 1
+    assert close_proxy["articulation_close_proxy_success_unconfirmed_count"] == 1
+    assert grasp_release["policy_success_attemptable_count"] == 1
+    assert grasp_release["policy_success_clean_attemptable_count"] == 1
+    assert grasp_release["review_needed_success_count"] == 0
+
+
+def test_persistent_worker_status_summary_counts_done_events(tmp_path) -> None:
+    status_path = tmp_path / "persistent_worker_000.jsonl"
+    status_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "started", "ts": 10.0}),
+                json.dumps(
+                    {
+                        "event": "heartbeat",
+                        "ts": 20.0,
+                        "state": "segment_running",
+                        "phase_elapsed_s": 12.0,
+                        "job_key": "job-1",
+                        "task_name": "task_a",
+                        "demo_id": "demo001",
+                        "skill_idx": 3,
+                    }
+                ),
+                json.dumps({"event": "segment_done", "ts": 25.0}),
+                json.dumps({"event": "segment_resume_hit", "ts": 30.0}),
+            ]
+        )
+        + "\n"
+    )
+
+    summary = mod.summarize_persistent_worker_status(status_path)
+
+    assert summary["done_count"] == 2
+    assert summary["state"] == "segment_running"
+    assert summary["job_key"] == "job-1"
+    assert summary["task_name"] == "task_a"
+    assert summary["demo_id"] == "demo001"
+    assert summary["skill_idx"] == 3
+
+
+def test_persistent_worker_restart_reason_detects_stale_heartbeat_and_timeouts() -> None:
+    stale_reason = mod.persistent_worker_restart_reason(
+        {"latest_heartbeat_ts": 100.0, "state": "idle", "phase_elapsed_s": 5.0},
+        now=170.0,
+        heartbeat_timeout_s=30.0,
+        task_reload_timeout_s=1800.0,
+        segment_timeout_s=5400.0,
+    )
+    task_reason = mod.persistent_worker_restart_reason(
+        {"latest_heartbeat_ts": 160.0, "state": "task_loading", "phase_elapsed_s": 1900.0},
+        now=170.0,
+        heartbeat_timeout_s=30.0,
+        task_reload_timeout_s=1800.0,
+        segment_timeout_s=5400.0,
+    )
+    segment_reason = mod.persistent_worker_restart_reason(
+        {"latest_heartbeat_ts": 168.0, "state": "segment_running", "phase_elapsed_s": 5500.0},
+        now=170.0,
+        heartbeat_timeout_s=30.0,
+        task_reload_timeout_s=1800.0,
+        segment_timeout_s=5400.0,
+    )
+
+    assert stale_reason == "heartbeat_stale:70.0s"
+    assert task_reason == "task_loading_timeout:1900.0s"
+    assert segment_reason == "segment_timeout:5500.0s"
+
+
+def test_persistent_worker_defaults_include_segment_timeout() -> None:
+    assert persistent_worker_mod.DEFAULT_SEGMENT_TIMEOUT_S == 5400

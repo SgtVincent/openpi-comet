@@ -52,6 +52,7 @@ SHORT_VIDEO_PROBLEM_STEP_THRESHOLD = 150
 TRANSFER_POSE_PROXY_FAMILY = "transfer_pose_proxy"
 CONTACT_EFFECT_PROXY_FAMILY = "contact_effect_proxy"
 ARTICULATION_CLOSE_FAMILY = "articulation_close"
+ARTICULATION_CLOSE_PROXY_FAMILY = "articulation_close_proxy"
 ARTICULATION_OPEN_FAMILY = "articulation_open"
 ARTICULATION_OPEN_PROXY_FAMILY = "articulation_open_proxy"
 GEOMETRY_BASE_FACING_FAMILY = "geometry_base_facing"
@@ -116,6 +117,20 @@ def is_articulation_close_success_unconfirmed(row: Dict[str, Any]) -> bool:
         row.get("result_type") == "predicate_satisfied"
         and bool(row.get("success"))
         and row.get("metric_family") == ARTICULATION_CLOSE_FAMILY
+    )
+
+
+def is_articulation_close_proxy_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat articulation-close proxy successes as review-needed, not clean success.
+
+    `push tray` currently proxies success via `open == False` on the carrier
+    articulation. This is useful for raw analysis but still too weak for the
+    conservative clean-success bucket.
+    """
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ARTICULATION_CLOSE_PROXY_FAMILY
     )
 
 
@@ -523,6 +538,79 @@ def load_jsonl_rows(paths: Iterable[Path]) -> List[Dict[str, Any]]:
     return rows
 
 
+PERSISTENT_WORKER_DONE_EVENTS = {"segment_done", "segment_resume_hit", "segment_skipped_done"}
+
+
+def persistent_worker_status_path(out_dir: Path, worker_rank: int) -> Path:
+    return out_dir / "worker_status" / f"persistent_worker_{int(worker_rank):03d}.jsonl"
+
+
+def summarize_persistent_worker_status(status_path: Path) -> Dict[str, Any]:
+    rows = load_jsonl_rows([status_path])
+    latest_row = rows[-1] if rows else {}
+    latest_heartbeat = next((row for row in reversed(rows) if row.get("event") == "heartbeat"), None)
+    done_count = sum(int(row.get("event") in PERSISTENT_WORKER_DONE_EVENTS) for row in rows)
+    summary = {
+        "status_path": str(status_path),
+        "exists": status_path.exists(),
+        "row_count": len(rows),
+        "done_count": done_count,
+        "latest_event": latest_row.get("event"),
+        "latest_ts": latest_row.get("ts"),
+        "latest_heartbeat_ts": latest_heartbeat.get("ts") if latest_heartbeat else None,
+        "state": None,
+        "phase_elapsed_s": None,
+        "job_key": None,
+        "task_name": None,
+        "demo_id": None,
+        "skill_idx": None,
+    }
+    source = latest_heartbeat or latest_row
+    if source:
+        summary.update(
+            {
+                "state": source.get("state"),
+                "phase_elapsed_s": source.get("phase_elapsed_s"),
+                "job_key": source.get("job_key"),
+                "task_name": source.get("task_name") or source.get("loaded_task"),
+                "demo_id": source.get("demo_id"),
+                "skill_idx": source.get("skill_idx"),
+            }
+        )
+    return summary
+
+
+def persistent_worker_restart_reason(
+    summary: Dict[str, Any],
+    *,
+    now: float,
+    heartbeat_timeout_s: float,
+    task_reload_timeout_s: float,
+    segment_timeout_s: float,
+) -> Optional[str]:
+    last_ts = summary.get("latest_heartbeat_ts") or summary.get("latest_ts")
+    if last_ts is None:
+        return None
+
+    age_s = max(0.0, now - float(last_ts))
+    if age_s > heartbeat_timeout_s:
+        return f"heartbeat_stale:{age_s:.1f}s"
+
+    state = str(summary.get("state") or "")
+    phase_elapsed_s = summary.get("phase_elapsed_s")
+    try:
+        phase_elapsed_s = None if phase_elapsed_s is None else float(phase_elapsed_s)
+    except (TypeError, ValueError):
+        phase_elapsed_s = None
+    if phase_elapsed_s is None:
+        return None
+    if state == "task_loading" and phase_elapsed_s > task_reload_timeout_s:
+        return f"task_loading_timeout:{phase_elapsed_s:.1f}s"
+    if state == "segment_running" and phase_elapsed_s > segment_timeout_s:
+        return f"segment_timeout:{phase_elapsed_s:.1f}s"
+    return None
+
+
 def build_job_key(sample: Dict[str, Any]) -> str:
     return f"{sample['skill']}|{sample['task_name']}|{sample['demo_id']}|{int(sample['skill_idx']):03d}"
 
@@ -798,6 +886,9 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
         "articulation_close_success_unconfirmed": predicate_debug.get(
             "articulation_close_success_unconfirmed"
         ),
+        "articulation_close_proxy_success_unconfirmed": predicate_debug.get(
+            "articulation_close_proxy_success_unconfirmed"
+        ),
         "geometry_base_facing_success_unconfirmed": predicate_debug.get(
             "geometry_base_facing_success_unconfirmed"
         ),
@@ -846,6 +937,7 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
     row["transfer_pose_proxy_success_unconfirmed"] = is_transfer_pose_proxy_success_unconfirmed(row)
     row["contact_effect_proxy_success_unconfirmed"] = is_contact_effect_proxy_success_unconfirmed(row)
     row["articulation_close_success_unconfirmed"] = is_articulation_close_success_unconfirmed(row)
+    row["articulation_close_proxy_success_unconfirmed"] = is_articulation_close_proxy_success_unconfirmed(row)
     row["geometry_base_facing_success_unconfirmed"] = is_geometry_base_facing_success_unconfirmed(row)
     row["relation_transfer_proxy_success_unconfirmed"] = is_relation_transfer_proxy_success_unconfirmed(row)
     row["orientation_proxy_success_unconfirmed"] = is_orientation_proxy_success_unconfirmed(row)
@@ -1128,6 +1220,9 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
     articulation_close_success_unconfirmed = bool(
         row.get("articulation_close_success_unconfirmed")
     ) or is_articulation_close_success_unconfirmed(row)
+    articulation_close_proxy_success_unconfirmed = bool(
+        row.get("articulation_close_proxy_success_unconfirmed")
+    ) or is_articulation_close_proxy_success_unconfirmed(row)
     geometry_base_facing_success_unconfirmed = bool(
         row.get("geometry_base_facing_success_unconfirmed")
     ) or is_geometry_base_facing_success_unconfirmed(row)
@@ -1171,6 +1266,7 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         and not transfer_pose_proxy_success_unconfirmed
         and not contact_effect_proxy_success_unconfirmed
         and not articulation_close_success_unconfirmed
+        and not articulation_close_proxy_success_unconfirmed
         and not geometry_base_facing_success_unconfirmed
         and not relation_transfer_proxy_success_unconfirmed
         and not orientation_proxy_success_unconfirmed
@@ -1217,6 +1313,8 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         and contact_effect_proxy_success_unconfirmed,
         "articulation_close_success_unconfirmed": runtime_pass
         and articulation_close_success_unconfirmed,
+        "articulation_close_proxy_success_unconfirmed": runtime_pass
+        and articulation_close_proxy_success_unconfirmed,
         "geometry_base_facing_success_unconfirmed": runtime_pass
         and geometry_base_facing_success_unconfirmed,
         "relation_transfer_proxy_success_unconfirmed": runtime_pass
@@ -1259,6 +1357,9 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
     articulation_close_success_unconfirmed = sum(
         int(c["articulation_close_success_unconfirmed"]) for c in classes
+    )
+    articulation_close_proxy_success_unconfirmed = sum(
+        int(c["articulation_close_proxy_success_unconfirmed"]) for c in classes
     )
     geometry_base_facing_success_unconfirmed = sum(
         int(c["geometry_base_facing_success_unconfirmed"]) for c in classes
@@ -1327,6 +1428,7 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "transfer_pose_proxy_success_unconfirmed_count": transfer_pose_proxy_success_unconfirmed,
         "contact_effect_proxy_success_unconfirmed_count": contact_effect_proxy_success_unconfirmed,
         "articulation_close_success_unconfirmed_count": articulation_close_success_unconfirmed,
+        "articulation_close_proxy_success_unconfirmed_count": articulation_close_proxy_success_unconfirmed,
         "geometry_base_facing_success_unconfirmed_count": geometry_base_facing_success_unconfirmed,
         "relation_transfer_proxy_success_unconfirmed_count": relation_transfer_proxy_success_unconfirmed,
         "orientation_proxy_success_unconfirmed_count": orientation_proxy_success_unconfirmed,
@@ -1354,6 +1456,28 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "success_count": success_raw,
         "success_rate": success_raw / total if total else 0.0,
     }
+
+
+def build_metric_family_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    family_grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        family = str(row.get("metric_family") or "unknown")
+        family_grouped[family].append(row)
+
+    summary_rows: List[Dict[str, Any]] = []
+    for metric_family, family_rows in sorted(family_grouped.items()):
+        family_summary = summarize_result_rows(family_rows)
+        summary_rows.append(
+            {
+                "metric_family": metric_family,
+                **family_summary,
+                "review_needed_success_count": (
+                    family_summary["policy_success_attemptable_count"]
+                    - family_summary["policy_success_clean_attemptable_count"]
+                ),
+            }
+        )
+    return summary_rows
 
 
 def render_summary_md(summary: Dict[str, Any]) -> str:
@@ -1388,6 +1512,9 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
     )
     lines.append(
         f"- articulation_close_success_unconfirmed: `{summary.get('articulation_close_success_unconfirmed', 0)}`"
+    )
+    lines.append(
+        f"- articulation_close_proxy_success_unconfirmed: `{summary.get('articulation_close_proxy_success_unconfirmed', 0)}`"
     )
     lines.append(
         f"- geometry_base_facing_success_unconfirmed: `{summary.get('geometry_base_facing_success_unconfirmed', 0)}`"
@@ -1439,6 +1566,21 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
         for row in summary["skill_summary"]
     )
     lines.append("")
+    if summary.get("metric_family_summary"):
+        lines.append(
+            "| Metric Family | Segments | Attemptable | Raw Success | Clean Success | Review-needed Success | "
+            "Timeout | Truncated |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        lines.extend(
+            (
+                f"| {row['metric_family']} | {row['segment_count']} | {row['attemptable_segment_count']} | "
+                f"{row['policy_success_attemptable_count']} | {row['policy_success_clean_attemptable_count']} | "
+                f"{row['review_needed_success_count']} | {row['timeout_count']} | {row['truncated_count']} |"
+            )
+            for row in summary["metric_family_summary"]
+        )
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -1492,6 +1634,8 @@ def merge_results(args: argparse.Namespace) -> int:
             }
         )
 
+    metric_family_summary = build_metric_family_summary(rows)
+
     top_summary = summarize_result_rows(rows)
     result_type_counts = dict(sorted(Counter(str(row.get("result_type")) for row in rows).items()))
     summary = {
@@ -1527,6 +1671,9 @@ def merge_results(args: argparse.Namespace) -> int:
         "articulation_close_success_unconfirmed": top_summary[
             "articulation_close_success_unconfirmed_count"
         ],
+        "articulation_close_proxy_success_unconfirmed": top_summary[
+            "articulation_close_proxy_success_unconfirmed_count"
+        ],
         "geometry_base_facing_success_unconfirmed": top_summary[
             "geometry_base_facing_success_unconfirmed_count"
         ],
@@ -1561,6 +1708,7 @@ def merge_results(args: argparse.Namespace) -> int:
         "missing_job_keys": missing_keys,
         "skill_summary": skill_summary,
         "skill_task_summary": skill_task_summary,
+        "metric_family_summary": metric_family_summary,
     }
 
     json_dump(args.out_dir / "multinode_skill_results.json", rows)
@@ -1592,6 +1740,7 @@ def merge_results(args: argparse.Namespace) -> int:
             "transfer_pose_proxy_success_unconfirmed",
             "contact_effect_proxy_success_unconfirmed",
             "articulation_close_success_unconfirmed",
+            "articulation_close_proxy_success_unconfirmed",
             "geometry_base_facing_success_unconfirmed",
             "relation_transfer_proxy_success_unconfirmed",
             "orientation_proxy_success_unconfirmed",
@@ -1655,6 +1804,7 @@ def merge_results(args: argparse.Namespace) -> int:
             "transfer_pose_proxy_success_unconfirmed_count",
             "contact_effect_proxy_success_unconfirmed_count",
             "articulation_close_success_unconfirmed_count",
+            "articulation_close_proxy_success_unconfirmed_count",
             "geometry_base_facing_success_unconfirmed_count",
             "relation_transfer_proxy_success_unconfirmed_count",
             "orientation_proxy_success_unconfirmed_count",
@@ -1706,6 +1856,7 @@ def merge_results(args: argparse.Namespace) -> int:
             "transfer_pose_proxy_success_unconfirmed_count",
             "contact_effect_proxy_success_unconfirmed_count",
             "articulation_close_success_unconfirmed_count",
+            "articulation_close_proxy_success_unconfirmed_count",
             "geometry_base_facing_success_unconfirmed_count",
             "relation_transfer_proxy_success_unconfirmed_count",
             "orientation_proxy_success_unconfirmed_count",
@@ -1729,6 +1880,43 @@ def merge_results(args: argparse.Namespace) -> int:
             "rollout_truncated_flag_count",
             "termination_reason_counts_json",
             "env_termination_reason_counts_json",
+        ],
+    )
+    json_dump(args.out_dir / "metric_family_summary.json", metric_family_summary)
+    write_csv(
+        args.out_dir / "metric_family_summary.csv",
+        metric_family_summary,
+        fieldnames=[
+            "metric_family",
+            "segment_count",
+            "runtime_pass_count",
+            "runtime_fail_count",
+            "attemptable_segment_count",
+            "policy_success_attemptable_count",
+            "policy_success_clean_attemptable_count",
+            "review_needed_success_count",
+            "short_video_problem_count",
+            "early_metric_activation_review_needed_count",
+            "short_proxy_success_count",
+            "likely_proxy_false_positive_count",
+            "transfer_pose_proxy_success_unconfirmed_count",
+            "contact_effect_proxy_success_unconfirmed_count",
+            "articulation_close_success_unconfirmed_count",
+            "articulation_close_proxy_success_unconfirmed_count",
+            "geometry_base_facing_success_unconfirmed_count",
+            "relation_transfer_proxy_success_unconfirmed_count",
+            "orientation_proxy_success_unconfirmed_count",
+            "articulation_open_proxy_success_unconfirmed_count",
+            "articulation_open_success_unconfirmed_count",
+            "can_meat_lid_success_unconfirmed_count",
+            "meaningful_policy_caused_transition_count",
+            "metric_unsatisfied_attemptable_count",
+            "timeout_count",
+            "truncated_count",
+            "env_terminated_metric_unsatisfied_count",
+            "env_task_success_before_segment_success_count",
+            "other_metric_unsatisfied_count",
+            "success_count_raw",
         ],
     )
     (args.out_dir / "multinode_skill_summary.md").write_text(render_summary_md(summary))
@@ -1856,10 +2044,61 @@ def _persistent_worker_env(args: argparse.Namespace, gpu_id: int, port: int) -> 
         "OMNIGIBSON_HEADLESS": "true",
         "OMNIGIBSON_DISABLE_EXTENSION_REGISTRY": "0",
         "OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK": "1",
+        "PERSISTENT_WORKER_HEARTBEAT_S": str(args.persistent_worker_heartbeat_s),
+        "PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S": str(args.persistent_worker_task_reload_timeout),
+        "PERSISTENT_WORKER_SEGMENT_TIMEOUT_S": str(args.persistent_worker_segment_timeout),
     }
     env.pop("OMNIGIBSON_GPU_ID", None)
     env.update(overrides)
     return env
+
+
+def _spawn_persistent_worker(
+    args: argparse.Namespace,
+    *,
+    worker_rank: int,
+    gpu_id: int,
+    jobs_path: Path,
+) -> Tuple[subprocess.Popen[str], Path, Path]:
+    local_rank = worker_rank - args.node_rank * args.gpus_per_node
+    port = args.port_base + local_rank
+    worker_log = args.out_dir / "launcher_logs" / f"persistent_worker{worker_rank:03d}.log"
+    worker_log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = f"""
+set -euo pipefail
+source {q(CONDA_SH)}
+conda activate {q(args.behavior_env)}
+cd {q(REPO_ROOT)}
+python -u {q(str(args.persistent_worker_script))} \\
+  --out-dir {q(args.out_dir)} \\
+  --worker-rank {q(worker_rank)} \\
+  --gpu-id {q(gpu_id)} \\
+  --port-base {q(port)} \\
+  --gpus-per-node {q(args.gpus_per_node)} \\
+  --max-steps {q(args.max_steps)} \\
+  --max-dynamic-steps-cap {q(args.max_dynamic_steps_cap)} \\
+  --server-ready-timeout {q(args.server_ready_timeout)} \\
+  --openpi-env {q(args.openpi_env)} \\
+  --behavior-env {q(args.behavior_env)} \\
+  --config-name {q(args.config_name)} \\
+  --policy-backend {q(args.policy_backend)} \\
+  --ckpt-dir {q(args.ckpt_dir)} \\
+  --behavior-dir {q(args.behavior_dir)} \\
+  --demo-data-path {q(args.demo_data_path)} \\
+  --rawdata-path {q(args.rawdata_path)} \\
+  --launcher-pid {q(os.getpid())}{' --dry-run' if args.dry_run else ''}{' --write-video' if args.write_video else ''}{' --segment-predicate-dump-trace' if args.segment_predicate_dump_trace else ''}{' --resume' if args.resume else ''}
+"""
+    env = _persistent_worker_env(args, gpu_id=gpu_id, port=port)
+    with worker_log.open("a") as f:
+        proc = subprocess.Popen(
+            ["bash", "-lc", cmd],
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+            env=env,
+        )
+    return proc, worker_log, jobs_path
 
 
 def run_persistent_worker_inplace(args: argparse.Namespace) -> int:
@@ -1945,86 +2184,114 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    children: List[Tuple[subprocess.Popen[str], int, int, Path, Path]] = []
+    children: Dict[int, Dict[str, Any]] = {}
     try:
         for plan in plans:
-            local_rank = plan["worker_rank"] - args.node_rank * args.gpus_per_node
-            gpu_id = plan["gpu_id"]
-            port = args.port_base + local_rank
-            worker_log = (
-                args.out_dir
-                / "launcher_logs"
-                / f"persistent_worker{plan['worker_rank']:03d}.log"
+            proc, worker_log, jobs_path = _spawn_persistent_worker(
+                args,
+                worker_rank=int(plan["worker_rank"]),
+                gpu_id=int(plan["gpu_id"]),
+                jobs_path=Path(plan["jobs_path"]),
             )
-            worker_log.parent.mkdir(parents=True, exist_ok=True)
+            worker_rank = int(plan["worker_rank"])
+            children[worker_rank] = {
+                "proc": proc,
+                "worker_rank": worker_rank,
+                "gpu_id": int(plan["gpu_id"]),
+                "log_path": worker_log,
+                "jobs_path": jobs_path,
+                "status_path": persistent_worker_status_path(args.out_dir, worker_rank),
+                "written": int(plan["written"]),
+                "shutdown_appended": False,
+                "restart_count": 0,
+            }
 
-            cmd = f"""
-set -euo pipefail
-source {q(CONDA_SH)}
-conda activate {q(args.behavior_env)}
-cd {q(REPO_ROOT)}
-python -u {q(str(args.persistent_worker_script))} \\
-  --out-dir {q(args.out_dir)} \\
-  --worker-rank {q(plan['worker_rank'])} \\
-  --gpu-id {q(gpu_id)} \\
-  --port-base {q(port)} \\
-  --gpus-per-node {q(args.gpus_per_node)} \\
-  --max-steps {q(args.max_steps)} \\
-  --max-dynamic-steps-cap {q(args.max_dynamic_steps_cap)} \\
-  --server-ready-timeout {q(args.server_ready_timeout)} \\
-  --openpi-env {q(args.openpi_env)} \\
-  --behavior-env {q(args.behavior_env)} \\
-  --config-name {q(args.config_name)} \\
-  --policy-backend {q(args.policy_backend)} \\
-  --ckpt-dir {q(args.ckpt_dir)} \\
-  --behavior-dir {q(args.behavior_dir)} \\
-  --demo-data-path {q(args.demo_data_path)} \\
-  --rawdata-path {q(args.rawdata_path)} \\
-  --launcher-pid {q(os.getpid())}{' --dry-run' if args.dry_run else ''}{' --write-video' if args.write_video else ''}{' --segment-predicate-dump-trace' if args.segment_predicate_dump_trace else ''}{' --resume' if args.resume else ''}
-"""
-            env = _persistent_worker_env(args, gpu_id=gpu_id, port=port)
-            with worker_log.open("w") as f:
-                proc = subprocess.Popen(
-                    ["bash", "-lc", cmd],
-                    stdout=f,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    start_new_session=True,
-                    env=env,
-                )
-            children.append((proc, plan["worker_rank"], gpu_id, worker_log, Path(plan["jobs_path"])))
-
-        # Wait until every worker has consumed its assign lines (i.e. emitted
-        # a matching "segment_done" or "segment_resume_hit" status), then
-        # request shutdown by appending {"action": "shutdown"}.
+        heartbeat_timeout_s = max(
+            float(args.persistent_worker_heartbeat_s) * 3.0,
+            float(args.persistent_worker_heartbeat_s) + 30.0,
+        )
         shutdown_sent = False
         while True:
-            still_running = [c for c in children if c[0].poll() is None]
-            if not still_running:
+            if shutdown_sent and all(child["proc"].poll() is not None for child in children.values()):
                 break
+
+            now = time.time()
             if not shutdown_sent:
-                # Once any worker exits abnormally, shut down the rest cleanly.
-                exited = [c for c in children if c[0].poll() is not None]
-                if exited:
-                    for proc, rank, _, log_path, _ in exited:
-                        if proc.returncode != 0:
-                            print(
-                                f"[launcher-persistent] worker {rank:03d} exited with code "
-                                f"{proc.returncode}; log: {log_path}",
-                                flush=True,
-                            )
-                            print(tail_text(log_path))
-                # Append shutdown after a grace period so workers see assign lines first.
-                # We just send shutdown immediately: workers process all queued assigns
-                # before reading the shutdown line because the queue is read in order.
-                for _, _, _, _, jobs_path in children:
-                    append_jsonl(jobs_path, {"action": "shutdown"})
-                shutdown_sent = True
+                all_done = True
+                for rank, child in children.items():
+                    summary = summarize_persistent_worker_status(child["status_path"])
+                    child["status_summary"] = summary
+                    done_count = int(summary.get("done_count", 0))
+                    if done_count < int(child["written"]):
+                        all_done = False
+
+                    proc = child["proc"]
+                    restart_reason = persistent_worker_restart_reason(
+                        summary,
+                        now=now,
+                        heartbeat_timeout_s=heartbeat_timeout_s,
+                        task_reload_timeout_s=float(args.persistent_worker_task_reload_timeout),
+                        segment_timeout_s=float(args.persistent_worker_segment_timeout),
+                    )
+                    if proc.poll() is None and restart_reason:
+                        print(
+                            f"[launcher-persistent] worker {rank:03d} stalled ({restart_reason}); restarting. "
+                            f"status={summary}",
+                            flush=True,
+                        )
+                        stop_process(proc)
+                        proc, worker_log, jobs_path = _spawn_persistent_worker(
+                            args,
+                            worker_rank=rank,
+                            gpu_id=int(child["gpu_id"]),
+                            jobs_path=Path(child["jobs_path"]),
+                        )
+                        child.update(
+                            {
+                                "proc": proc,
+                                "log_path": worker_log,
+                                "jobs_path": jobs_path,
+                                "restart_count": int(child["restart_count"]) + 1,
+                            }
+                        )
+                        continue
+
+                    if proc.poll() is not None and done_count < int(child["written"]):
+                        print(
+                            f"[launcher-persistent] worker {rank:03d} exited early with code {proc.returncode}; "
+                            f"restarting. log: {child['log_path']}",
+                            flush=True,
+                        )
+                        print(tail_text(Path(child["log_path"])))
+                        proc, worker_log, jobs_path = _spawn_persistent_worker(
+                            args,
+                            worker_rank=rank,
+                            gpu_id=int(child["gpu_id"]),
+                            jobs_path=Path(child["jobs_path"]),
+                        )
+                        child.update(
+                            {
+                                "proc": proc,
+                                "log_path": worker_log,
+                                "jobs_path": jobs_path,
+                                "restart_count": int(child["restart_count"]) + 1,
+                            }
+                        )
+                        all_done = False
+
+                if all_done:
+                    for child in children.values():
+                        if not child["shutdown_appended"]:
+                            append_jsonl(Path(child["jobs_path"]), {"action": "shutdown"})
+                            child["shutdown_appended"] = True
+                    shutdown_sent = True
             time.sleep(2.0)
 
         # Drain final return codes.
         any_failed = False
-        for proc, rank, _, log_path, _ in children:
+        for rank, child in children.items():
+            proc = child["proc"]
+            log_path = Path(child["log_path"])
             code = proc.poll() if proc.poll() is not None else proc.wait(timeout=args.persistent_worker_shutdown_timeout)
             if code != 0:
                 any_failed = True
@@ -2036,8 +2303,8 @@ python -u {q(str(args.persistent_worker_script))} \\
         return 1 if any_failed else 0
     finally:
         # SIGTERM/SIGKILL anyone still alive past the deadline.
-        for proc, _, _, _, _ in children:
-            stop_process(proc)
+        for child in children.values():
+            stop_process(child.get("proc"))
 
 
 
@@ -2243,6 +2510,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=900,
         help="seconds to wait after appending {action: shutdown} before SIGTERM/SIGKILL",
+    )
+    parser.add_argument(
+        "--persistent-worker-heartbeat-s",
+        type=float,
+        default=float(os.environ.get("PERSISTENT_WORKER_HEARTBEAT_S", "60")),
+        help="expected persistent-worker heartbeat interval in seconds",
+    )
+    parser.add_argument(
+        "--persistent-worker-task-reload-timeout",
+        type=int,
+        default=int(os.environ.get("PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S", "1800")),
+        help="watchdog timeout for task loading / server startup before restarting a worker",
+    )
+    parser.add_argument(
+        "--persistent-worker-segment-timeout",
+        type=int,
+        default=int(os.environ.get("PERSISTENT_WORKER_SEGMENT_TIMEOUT_S", "5400")),
+        help="watchdog timeout for a single persistent segment run before restarting a worker",
     )
     args = parser.parse_args()
 

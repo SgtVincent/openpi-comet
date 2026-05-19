@@ -38,6 +38,7 @@ import signal
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -57,6 +58,7 @@ logger = logging.getLogger("persistent_skill_eval_worker")
 DEFAULT_HEARTBEAT_S = 60.0
 DEFAULT_MAX_SEGMENTS_BEFORE_RESTART = 64
 DEFAULT_TASK_RELOAD_TIMEOUT_S = 1800
+DEFAULT_SEGMENT_TIMEOUT_S = 5400
 DEFAULT_WATCHDOG_POLL_S = 5.0
 _GM_FLAGS_APPLIED = False
 
@@ -181,6 +183,12 @@ class PersistentWorker:
                 DEFAULT_TASK_RELOAD_TIMEOUT_S,
             )
         )
+        self.segment_timeout_s: int = int(
+            os.environ.get(
+                "PERSISTENT_WORKER_SEGMENT_TIMEOUT_S",
+                DEFAULT_SEGMENT_TIMEOUT_S,
+            )
+        )
 
         self.launcher_pid: Optional[int] = (
             int(args.launcher_pid) if args.launcher_pid and int(args.launcher_pid) > 0 else None
@@ -188,6 +196,12 @@ class PersistentWorker:
 
         self._segments_since_boot = 0
         self._last_heartbeat = 0.0
+        self._state_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._state = "booting"
+        self._state_fields: Dict[str, Any] = {}
+        self._state_started_at = time.time()
 
         self._evaluator = None  # type: ignore[assignment]
         self._evaluator_ctx = None  # context manager (with ... as evaluator) entered manually
@@ -224,17 +238,57 @@ class PersistentWorker:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to append status event %s: %s", event, exc)
 
-    def _maybe_heartbeat(self, **fields: Any) -> None:
+    def _set_state(self, state: str, **fields: Any) -> None:
         now = time.time()
-        if now - self._last_heartbeat < self.heartbeat_s:
+        with self._state_lock:
+            self._state = state
+            self._state_fields = dict(fields)
+            self._state_started_at = now
+
+    def _heartbeat_payload(self) -> Dict[str, Any]:
+        now = time.time()
+        with self._state_lock:
+            state = self._state
+            state_started_at = self._state_started_at
+            state_fields = dict(self._state_fields)
+        return {
+            "state": state,
+            "state_started_at": state_started_at,
+            "phase_elapsed_s": max(0.0, now - state_started_at),
+            "loaded_task": self._loaded_task_name,
+            "segments_since_boot": self._segments_since_boot,
+            **state_fields,
+        }
+
+    def _emit_heartbeat(self, *, force: bool = False, **fields: Any) -> None:
+        now = time.time()
+        if not force and now - self._last_heartbeat < self.heartbeat_s:
             return
         self._last_heartbeat = now
-        self._emit_status(
-            "heartbeat",
-            loaded_task=self._loaded_task_name,
-            segments_since_boot=self._segments_since_boot,
-            **fields,
-        )
+        payload = self._heartbeat_payload()
+        payload.update(fields)
+        self._emit_status("heartbeat", **payload)
+
+    def _maybe_heartbeat(self, **fields: Any) -> None:
+        self._emit_heartbeat(force=False, **fields)
+
+    def _start_heartbeat_thread(self) -> None:
+        if self._heartbeat_thread is not None:
+            return
+
+        def _loop() -> None:
+            while not self._heartbeat_stop.wait(self.heartbeat_s):
+                self._emit_heartbeat(force=True)
+
+        self._heartbeat_thread = threading.Thread(target=_loop, name=f"persistent-heartbeat-{self.rank}", daemon=True)
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat_thread(self) -> None:
+        self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=min(5.0, self.heartbeat_s + 1.0))
+        self._heartbeat_thread = None
 
     # ----------------------------------------------------------- queue tailing
 
@@ -424,6 +478,15 @@ class PersistentWorker:
         # Apply gm flags before importing the evaluator (no-op on subsequent calls).
         _apply_gm_flags()
 
+        self._set_state(
+            "task_loading",
+            task_name=task_name,
+            job_key=sample.get("job_key"),
+            demo_id=sample.get("demo_id"),
+            skill_idx=sample.get("skill_idx"),
+            timeout_s=self.task_reload_timeout_s,
+        )
+
         self._start_server(task_name)
 
         cfg = self._build_eval_cfg(task_name, sample)
@@ -446,6 +509,7 @@ class PersistentWorker:
         self._evaluator = evaluator
         self._loaded_task_name = task_name
         self._emit_status("task_loaded", task_name=task_name)
+        self._set_state("idle")
 
     # --------------------------------------------------------- per-segment run
 
@@ -526,6 +590,15 @@ class PersistentWorker:
         returncode = 0
         metrics_path: Optional[Path] = None
         try:
+            self._set_state(
+                "segment_running",
+                job_key=sample.get("job_key"),
+                task_name=task_name,
+                demo_id=demo_id,
+                skill_idx=skill_idx,
+                dynamic_max_steps=dynamic_max_steps,
+                timeout_s=self.segment_timeout_s,
+            )
             self._emit_status(
                 "segment_start",
                 job_key=sample.get("job_key"),
@@ -556,6 +629,7 @@ class PersistentWorker:
             raise
         finally:
             elapsed = time.time() - t0
+            self._set_state("idle")
 
             if metrics_path is not None:
                 row = launcher.load_metrics_row(metrics_path, sample, runtime_ok, returncode, segment_log)
@@ -619,13 +693,18 @@ class PersistentWorker:
     # ----------------------------------------------------------------- main loop
 
     def run(self) -> int:
+        self._set_state("idle")
         self._emit_status(
             "started",
             jobs_path=str(self.jobs_path),
             results_path=str(self.results_path),
             launcher_pid=self.launcher_pid,
             max_segments_before_restart=self.max_segments_before_restart,
+            task_reload_timeout_s=self.task_reload_timeout_s,
+            segment_timeout_s=self.segment_timeout_s,
         )
+        self._start_heartbeat_thread()
+        self._emit_heartbeat(force=True)
 
         cursor = 0
         # Skip past any already-processed assign lines tracked in done_keys.
@@ -647,9 +726,11 @@ class PersistentWorker:
                 action = str(entry.get("action", "")).lower()
                 if action == "shutdown":
                     self._emit_status("shutdown_requested")
+                    self._set_state("shutdown")
                     self._unload_evaluator()
                     self._stop_server()
-                    self._emit_status("heartbeat", state="shutdown")
+                    self._emit_heartbeat(force=True)
+                    self._stop_heartbeat_thread()
                     return 0
 
                 if action != "assign":
@@ -688,6 +769,9 @@ class PersistentWorker:
 
         self._unload_evaluator()
         self._stop_server()
+        self._set_state("stopped")
+        self._emit_heartbeat(force=True)
+        self._stop_heartbeat_thread()
         return 0
 
 
@@ -727,7 +811,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _ensure_isaac_env()
 
     # Ignore SIGPIPE so a closed launcher pipe never crashes us mid-segment.
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
     worker = PersistentWorker(args)
     try:
@@ -736,6 +820,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         worker._emit_status("interrupted")
         worker._unload_evaluator()
         worker._stop_server()
+        worker._stop_heartbeat_thread()
         return 130
 
 

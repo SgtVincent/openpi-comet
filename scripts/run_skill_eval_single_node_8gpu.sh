@@ -73,6 +73,8 @@ Optional env overrides:
       # heartbeat cadence for worker_status/persistent_worker_*.jsonl.
   PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S=1800
       # max seconds to wait when switching tasks before considering the load failed.
+  PERSISTENT_WORKER_SEGMENT_TIMEOUT_S=5400
+      # max seconds to wait for a single segment heartbeat/progress before restart.
   PERSISTENT_WORKER_SHUTDOWN_TIMEOUT=900
       # seconds the launcher waits for clean worker exit after sending shutdown.
 
@@ -207,6 +209,7 @@ EVAL_MODE="${EVAL_MODE:-persistent}"
 PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART="${PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART:-64}"
 PERSISTENT_WORKER_HEARTBEAT_S="${PERSISTENT_WORKER_HEARTBEAT_S:-60}"
 PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S="${PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S:-1800}"
+PERSISTENT_WORKER_SEGMENT_TIMEOUT_S="${PERSISTENT_WORKER_SEGMENT_TIMEOUT_S:-5400}"
 PERSISTENT_WORKER_SHUTDOWN_TIMEOUT="${PERSISTENT_WORKER_SHUTDOWN_TIMEOUT:-900}"
 case "${EVAL_MODE}" in
   persistent|process_per_segment) ;;
@@ -220,6 +223,7 @@ esac
 export PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART
 export PERSISTENT_WORKER_HEARTBEAT_S
 export PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S
+export PERSISTENT_WORKER_SEGMENT_TIMEOUT_S
 
 if [[ "${EVAL_MODE}" == "persistent" ]]; then
   LAUNCH_MODE_FLAG="launch-persistent"
@@ -291,13 +295,16 @@ if [[ "${REBUILD_MANIFEST}" == "1" ]]; then
 fi
 if [[ "${EVAL_MODE}" == "persistent" ]]; then
   PY_ARGS+=(--persistent-worker-shutdown-timeout "${PERSISTENT_WORKER_SHUTDOWN_TIMEOUT}")
+  PY_ARGS+=(--persistent-worker-heartbeat-s "${PERSISTENT_WORKER_HEARTBEAT_S}")
+  PY_ARGS+=(--persistent-worker-task-reload-timeout "${PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S}")
+  PY_ARGS+=(--persistent-worker-segment-timeout "${PERSISTENT_WORKER_SEGMENT_TIMEOUT_S}")
 fi
 
 log "node_rank: ${NODE_RANK} num_nodes: ${NUM_NODES}"
 log "gpus_per_node: ${GPUS_PER_NODE} local_gpu_ids: ${LOCAL_GPU_IDS}"
 log "skills: ${SKILLS:-<all>}"
 log "eval_mode: ${EVAL_MODE} (mode_flag=${LAUNCH_MODE_FLAG})"
-log "persistent_worker: max_segments_before_restart=${PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART} heartbeat_s=${PERSISTENT_WORKER_HEARTBEAT_S} task_reload_timeout_s=${PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S} shutdown_timeout=${PERSISTENT_WORKER_SHUTDOWN_TIMEOUT}"
+log "persistent_worker: max_segments_before_restart=${PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART} heartbeat_s=${PERSISTENT_WORKER_HEARTBEAT_S} task_reload_timeout_s=${PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S} segment_timeout_s=${PERSISTENT_WORKER_SEGMENT_TIMEOUT_S} shutdown_timeout=${PERSISTENT_WORKER_SHUTDOWN_TIMEOUT}"
 log "max_samples_per_skill: ${MAX_SAMPLES_PER_SKILL} max_samples_per_skill_task: ${MAX_SAMPLES_PER_SKILL_TASK} max_total_jobs: ${MAX_TOTAL_JOBS}"
 log "max_steps: ${MAX_STEPS} server_ready_timeout: ${SERVER_READY_TIMEOUT} prepare_timeout: ${PREPARE_TIMEOUT}"
 log "max_dynamic_steps_cap: ${MAX_DYNAMIC_STEPS_CAP}"

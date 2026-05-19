@@ -38,6 +38,7 @@ SHORT_VIDEO_PROBLEM_STEP_THRESHOLD = 150
 TRANSFER_POSE_PROXY_FAMILY = "transfer_pose_proxy"
 CONTACT_EFFECT_PROXY_FAMILY = "contact_effect_proxy"
 ARTICULATION_CLOSE_FAMILY = "articulation_close"
+ARTICULATION_CLOSE_PROXY_FAMILY = "articulation_close_proxy"
 ARTICULATION_OPEN_FAMILY = "articulation_open"
 ARTICULATION_OPEN_PROXY_FAMILY = "articulation_open_proxy"
 GEOMETRY_BASE_FACING_FAMILY = "geometry_base_facing"
@@ -78,6 +79,11 @@ OVERALL_ROWS: list[tuple[str, str, bool]] = [
     (
         "articulation_close_success_unconfirmed",
         "articulation_close_success_unconfirmed",
+        False,
+    ),
+    (
+        "articulation_close_proxy_success_unconfirmed",
+        "articulation_close_proxy_success_unconfirmed",
         False,
     ),
     (
@@ -154,6 +160,11 @@ SKILL_METRICS: list[tuple[str, str, bool]] = [
     (
         "articulation_close_success_unconfirmed",
         "articulation_close_success_unconfirmed_count",
+        False,
+    ),
+    (
+        "articulation_close_proxy_success_unconfirmed",
+        "articulation_close_proxy_success_unconfirmed_count",
         False,
     ),
     (
@@ -237,6 +248,14 @@ def is_articulation_close_success_unconfirmed(row: dict[str, Any]) -> bool:
         row.get("result_type") == "predicate_satisfied"
         and bool(row.get("success"))
         and row.get("metric_family") == ARTICULATION_CLOSE_FAMILY
+    )
+
+
+def is_articulation_close_proxy_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ARTICULATION_CLOSE_PROXY_FAMILY
     )
 
 
@@ -388,6 +407,9 @@ def classify_result_row(row: dict[str, Any]) -> dict[str, bool]:
     articulation_close_success_unconfirmed = bool(
         row.get("articulation_close_success_unconfirmed")
     ) or is_articulation_close_success_unconfirmed(row)
+    articulation_close_proxy_success_unconfirmed = bool(
+        row.get("articulation_close_proxy_success_unconfirmed")
+    ) or is_articulation_close_proxy_success_unconfirmed(row)
     geometry_base_facing_success_unconfirmed = bool(
         row.get("geometry_base_facing_success_unconfirmed")
     ) or is_geometry_base_facing_success_unconfirmed(row)
@@ -431,6 +453,7 @@ def classify_result_row(row: dict[str, Any]) -> dict[str, bool]:
         and not transfer_pose_proxy_success_unconfirmed
         and not contact_effect_proxy_success_unconfirmed
         and not articulation_close_success_unconfirmed
+        and not articulation_close_proxy_success_unconfirmed
         and not geometry_base_facing_success_unconfirmed
         and not relation_transfer_proxy_success_unconfirmed
         and not orientation_proxy_success_unconfirmed
@@ -474,6 +497,8 @@ def classify_result_row(row: dict[str, Any]) -> dict[str, bool]:
         "transfer_pose_proxy_success_unconfirmed": runtime_pass and transfer_pose_proxy_success_unconfirmed,
         "contact_effect_proxy_success_unconfirmed": runtime_pass and contact_effect_proxy_success_unconfirmed,
         "articulation_close_success_unconfirmed": runtime_pass and articulation_close_success_unconfirmed,
+        "articulation_close_proxy_success_unconfirmed": runtime_pass
+        and articulation_close_proxy_success_unconfirmed,
         "geometry_base_facing_success_unconfirmed": runtime_pass and geometry_base_facing_success_unconfirmed,
         "relation_transfer_proxy_success_unconfirmed": runtime_pass and relation_transfer_proxy_success_unconfirmed,
         "orientation_proxy_success_unconfirmed": runtime_pass and orientation_proxy_success_unconfirmed,
@@ -514,6 +539,9 @@ def summarize_result_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     articulation_close_success_unconfirmed = sum(
         int(c["articulation_close_success_unconfirmed"]) for c in classes
+    )
+    articulation_close_proxy_success_unconfirmed = sum(
+        int(c["articulation_close_proxy_success_unconfirmed"]) for c in classes
     )
     geometry_base_facing_success_unconfirmed = sum(
         int(c["geometry_base_facing_success_unconfirmed"]) for c in classes
@@ -574,6 +602,7 @@ def summarize_result_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "transfer_pose_proxy_success_unconfirmed_count": transfer_pose_proxy_success_unconfirmed,
         "contact_effect_proxy_success_unconfirmed_count": contact_effect_proxy_success_unconfirmed,
         "articulation_close_success_unconfirmed_count": articulation_close_success_unconfirmed,
+        "articulation_close_proxy_success_unconfirmed_count": articulation_close_proxy_success_unconfirmed,
         "geometry_base_facing_success_unconfirmed_count": geometry_base_facing_success_unconfirmed,
         "relation_transfer_proxy_success_unconfirmed_count": relation_transfer_proxy_success_unconfirmed,
         "orientation_proxy_success_unconfirmed_count": orientation_proxy_success_unconfirmed,
@@ -684,6 +713,9 @@ def build_partial_summary(run_dir: Path) -> dict[str, Any]:
         ],
         "articulation_close_success_unconfirmed": top_summary[
             "articulation_close_success_unconfirmed_count"
+        ],
+        "articulation_close_proxy_success_unconfirmed": top_summary[
+            "articulation_close_proxy_success_unconfirmed_count"
         ],
         "geometry_base_facing_success_unconfirmed": top_summary[
             "geometry_base_facing_success_unconfirmed_count"
