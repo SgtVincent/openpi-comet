@@ -33,6 +33,7 @@ Optional env overrides:
   EXTRA_BASHRC=/mnt/bn/navigation-hl/mlx/users/chenjunting/repo/extra_bashrc.sh
   SKIP_EXTRA_BASHRC=0|1
   CONDA_SH=/path/to/conda.sh
+  PYTHONNOUSERSITE=1
 
   RUN_TAG=custom_tag
   OUT_DIR=/abs/path/to/output_dir
@@ -42,6 +43,7 @@ Optional env overrides:
 
   CKPT_DIR=/abs/path/to/checkpoint_dir
   CONFIG_NAME=pi05_b1k_skill-pt50_pretrain_lr1e-4_2ep
+  POLICY_BACKEND=auto|torch|jax
 
   SKILLS="move to,open door"   (optional subset)
   MAX_SAMPLES_PER_SKILL=4
@@ -49,6 +51,7 @@ Optional env overrides:
   MAX_TOTAL_JOBS=0
 
   MAX_STEPS=120
+  MAX_DYNAMIC_STEPS_CAP=0|<int>      # optional cap for duration-derived segment_max_steps
   SERVER_READY_TIMEOUT=1800
   PREPARE_TIMEOUT=3600
   SERVER_START_STAGGER_S=10
@@ -59,8 +62,27 @@ Optional env overrides:
   SEGMENT_PREDICATE_DUMP_TRACE=0
   REBUILD_MANIFEST=0
 
+  EVAL_MODE=persistent|process_per_segment
+      # `persistent` (default) keeps one Isaac Sim per GPU alive across segments via
+      # scripts/persistent_skill_eval_worker.py; saves the ~600s per-segment startup.
+      # `process_per_segment` falls back to the legacy per-segment subprocess path.
+  PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART=64
+      # number of segments per Isaac boot before the persistent worker soft-restarts
+      # (os.execv) to purge leaked extension state.
+  PERSISTENT_WORKER_HEARTBEAT_S=60
+      # heartbeat cadence for worker_status/persistent_worker_*.jsonl.
+  PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S=1800
+      # max seconds to wait when switching tasks before considering the load failed.
+  PERSISTENT_WORKER_SHUTDOWN_TIMEOUT=900
+      # seconds the launcher waits for clean worker exit after sending shutdown.
+
   TEE_LAUNCHER_LOG=0|1
   CONSOLE_LOG=/abs/path/to/launcher_console.log
+
+  POST_MERGE_BUILD_REVIEW_SET=0|1
+  REVIEW_TARGET_SKILLS="move to,open door"   (optional; defaults to SKILLS when unset)
+  REVIEW_SAMPLES_PER_SKILL=8
+  REVIEW_HOLDOUT_PER_SKILL=2
 EOF
 }
 
@@ -123,6 +145,10 @@ else
   echo "[Warn] CONDA_SH not found: ${CONDA_SH}" >&2
 fi
 
+# Isaac Sim can accidentally import user-level site packages (for example from ~/.local),
+# which causes ABI/version conflicts such as cffi/_cffi_backend mismatch on shutdown.
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+
 PYTHON_BIN="$(find_first_executable \
   "/mnt/bn/behavior-data-hl/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python" \
   "/mnt/bn/navigation-hl/mlx/users/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python" \
@@ -156,6 +182,7 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 LOCAL_GPU_IDS="${LOCAL_GPU_IDS:-0,1,2,3,4,5,6,7}"
 
 MAX_STEPS="${MAX_STEPS:-120}"
+MAX_DYNAMIC_STEPS_CAP="${MAX_DYNAMIC_STEPS_CAP:-0}"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1800}"
 PREPARE_TIMEOUT="${PREPARE_TIMEOUT:-3600}"
 SERVER_START_STAGGER_S="${SERVER_START_STAGGER_S:-10}"
@@ -164,7 +191,8 @@ MAX_SAMPLES_PER_SKILL="${MAX_SAMPLES_PER_SKILL:-4}"
 MAX_SAMPLES_PER_SKILL_TASK="${MAX_SAMPLES_PER_SKILL_TASK:-0}"
 MAX_TOTAL_JOBS="${MAX_TOTAL_JOBS:-0}"
 
-CONFIG_NAME="${CONFIG_NAME:-pi05_b1k_skill-pt50_pretrain_lr1e-4_2ep}"
+CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-pt50_cs32_bs64_lr2.5e-5_step50k}"
+POLICY_BACKEND="${POLICY_BACKEND:-auto}"
 CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints/openpi_comet/pi05-b1kpt50-cs32}"
 BEHAVIOR_DIR="${BEHAVIOR_DIR:-/mnt/bn/navigation-hl/mlx/users/chenjunting/repo/BEHAVIOR-1K}"
 DEMO_DATA_PATH="${DEMO_DATA_PATH:-/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos}"
@@ -175,7 +203,34 @@ DRY_RUN="${DRY_RUN:-0}"
 WRITE_VIDEO="${WRITE_VIDEO:-1}"
 SEGMENT_PREDICATE_DUMP_TRACE="${SEGMENT_PREDICATE_DUMP_TRACE:-0}"
 REBUILD_MANIFEST="${REBUILD_MANIFEST:-0}"
+EVAL_MODE="${EVAL_MODE:-persistent}"
+PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART="${PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART:-64}"
+PERSISTENT_WORKER_HEARTBEAT_S="${PERSISTENT_WORKER_HEARTBEAT_S:-60}"
+PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S="${PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S:-1800}"
+PERSISTENT_WORKER_SHUTDOWN_TIMEOUT="${PERSISTENT_WORKER_SHUTDOWN_TIMEOUT:-900}"
+case "${EVAL_MODE}" in
+  persistent|process_per_segment) ;;
+  *)
+    echo "[Error] unsupported EVAL_MODE: ${EVAL_MODE} (expected: persistent | process_per_segment)" >&2
+    exit 1
+    ;;
+esac
+
+# Export persistent-worker knobs so the worker subprocess sees them.
+export PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART
+export PERSISTENT_WORKER_HEARTBEAT_S
+export PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S
+
+if [[ "${EVAL_MODE}" == "persistent" ]]; then
+  LAUNCH_MODE_FLAG="launch-persistent"
+else
+  LAUNCH_MODE_FLAG="launch"
+fi
 SKILLS="${SKILLS:-}"
+POST_MERGE_BUILD_REVIEW_SET="${POST_MERGE_BUILD_REVIEW_SET:-0}"
+REVIEW_TARGET_SKILLS="${REVIEW_TARGET_SKILLS:-${SKILLS}}"
+REVIEW_SAMPLES_PER_SKILL="${REVIEW_SAMPLES_PER_SKILL:-8}"
+REVIEW_HOLDOUT_PER_SKILL="${REVIEW_HOLDOUT_PER_SKILL:-2}"
 
 log "=== Single-node 8-GPU Skill Eval ==="
 log "host: $(hostname)"
@@ -186,6 +241,7 @@ log "console_log: ${CONSOLE_LOG}"
 log "python_bin: ${PYTHON_BIN}"
 log "python -V: $("${PYTHON_BIN}" -V 2>&1 || true)"
 log "conda env: ${CONDA_DEFAULT_ENV:-<unset>}"
+log "PYTHONNOUSERSITE: ${PYTHONNOUSERSITE}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   log "nvidia-smi -L:"
   nvidia-smi -L || true
@@ -200,10 +256,12 @@ PY_ARGS=(
   --gpus-per-node "${GPUS_PER_NODE}"
   --local-gpu-ids "${LOCAL_GPU_IDS}"
   --max-steps "${MAX_STEPS}"
+  --max-dynamic-steps-cap "${MAX_DYNAMIC_STEPS_CAP}"
   --server-ready-timeout "${SERVER_READY_TIMEOUT}"
   --server-start-stagger-s "${SERVER_START_STAGGER_S}"
   --prepare-timeout "${PREPARE_TIMEOUT}"
   --config-name "${CONFIG_NAME}"
+  --policy-backend "${POLICY_BACKEND}"
   --ckpt-dir "${CKPT_DIR}"
   --behavior-dir "${BEHAVIOR_DIR}"
   --demo-data-path "${DEMO_DATA_PATH}"
@@ -231,15 +289,25 @@ fi
 if [[ "${REBUILD_MANIFEST}" == "1" ]]; then
   PY_ARGS+=(--rebuild-manifest)
 fi
+if [[ "${EVAL_MODE}" == "persistent" ]]; then
+  PY_ARGS+=(--persistent-worker-shutdown-timeout "${PERSISTENT_WORKER_SHUTDOWN_TIMEOUT}")
+fi
 
 log "node_rank: ${NODE_RANK} num_nodes: ${NUM_NODES}"
 log "gpus_per_node: ${GPUS_PER_NODE} local_gpu_ids: ${LOCAL_GPU_IDS}"
 log "skills: ${SKILLS:-<all>}"
+log "eval_mode: ${EVAL_MODE} (mode_flag=${LAUNCH_MODE_FLAG})"
+log "persistent_worker: max_segments_before_restart=${PERSISTENT_WORKER_MAX_SEGMENTS_BEFORE_RESTART} heartbeat_s=${PERSISTENT_WORKER_HEARTBEAT_S} task_reload_timeout_s=${PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S} shutdown_timeout=${PERSISTENT_WORKER_SHUTDOWN_TIMEOUT}"
 log "max_samples_per_skill: ${MAX_SAMPLES_PER_SKILL} max_samples_per_skill_task: ${MAX_SAMPLES_PER_SKILL_TASK} max_total_jobs: ${MAX_TOTAL_JOBS}"
 log "max_steps: ${MAX_STEPS} server_ready_timeout: ${SERVER_READY_TIMEOUT} prepare_timeout: ${PREPARE_TIMEOUT}"
+log "max_dynamic_steps_cap: ${MAX_DYNAMIC_STEPS_CAP}"
 log "server_start_stagger_s: ${SERVER_START_STAGGER_S}"
 log "write_video: ${WRITE_VIDEO} segment_predicate_dump_trace: ${SEGMENT_PREDICATE_DUMP_TRACE}"
+log "post_merge_build_review_set: ${POST_MERGE_BUILD_REVIEW_SET}"
+log "review_target_skills: ${REVIEW_TARGET_SKILLS:-<same as eval selection>}"
+log "review_samples_per_skill: ${REVIEW_SAMPLES_PER_SKILL} review_holdout_per_skill: ${REVIEW_HOLDOUT_PER_SKILL}"
 log "config_name: ${CONFIG_NAME}"
+log "policy_backend: ${POLICY_BACKEND}"
 log "ckpt_dir: ${CKPT_DIR}"
 log "behavior_dir: ${BEHAVIOR_DIR}"
 log "demo_data_path: ${DEMO_DATA_PATH}"
@@ -254,16 +322,40 @@ fi
 if [[ "${PHASE}" == "merge" ]]; then
   log "Running: merge"
   "${PYTHON_BIN}" -u scripts/run_skill_metric_multinode_sweep.py --mode merge "${PY_ARGS[@]}"
+  if [[ "${POST_MERGE_BUILD_REVIEW_SET}" == "1" ]]; then
+    REVIEW_ARGS=(
+      --run-dir "${OUT_DIR}"
+      --samples-per-skill "${REVIEW_SAMPLES_PER_SKILL}"
+      --holdout-per-skill "${REVIEW_HOLDOUT_PER_SKILL}"
+    )
+    if [[ -n "${REVIEW_TARGET_SKILLS}" ]]; then
+      REVIEW_ARGS+=(--skills "${REVIEW_TARGET_SKILLS}")
+    fi
+    log "Running: build review set"
+    "${PYTHON_BIN}" -u scripts/build_skill_metric_review_set.py "${REVIEW_ARGS[@]}"
+  fi
   exit 0
 fi
 
 if [[ "${PHASE}" == "launch+merge" ]]; then
-  log "Running: launch"
-  "${PYTHON_BIN}" -u scripts/run_skill_metric_multinode_sweep.py --mode launch "${PY_ARGS[@]}"
+  log "Running: launch (--mode ${LAUNCH_MODE_FLAG})"
+  "${PYTHON_BIN}" -u scripts/run_skill_metric_multinode_sweep.py --mode "${LAUNCH_MODE_FLAG}" "${PY_ARGS[@]}"
   log "Running: merge"
   "${PYTHON_BIN}" -u scripts/run_skill_metric_multinode_sweep.py --mode merge "${PY_ARGS[@]}"
+  if [[ "${POST_MERGE_BUILD_REVIEW_SET}" == "1" ]]; then
+    REVIEW_ARGS=(
+      --run-dir "${OUT_DIR}"
+      --samples-per-skill "${REVIEW_SAMPLES_PER_SKILL}"
+      --holdout-per-skill "${REVIEW_HOLDOUT_PER_SKILL}"
+    )
+    if [[ -n "${REVIEW_TARGET_SKILLS}" ]]; then
+      REVIEW_ARGS+=(--skills "${REVIEW_TARGET_SKILLS}")
+    fi
+    log "Running: build review set"
+    "${PYTHON_BIN}" -u scripts/build_skill_metric_review_set.py "${REVIEW_ARGS[@]}"
+  fi
   exit 0
 fi
 
-log "Running: launch"
-"${PYTHON_BIN}" -u scripts/run_skill_metric_multinode_sweep.py --mode launch "${PY_ARGS[@]}"
+log "Running: launch (--mode ${LAUNCH_MODE_FLAG})"
+"${PYTHON_BIN}" -u scripts/run_skill_metric_multinode_sweep.py --mode "${LAUNCH_MODE_FLAG}" "${PY_ARGS[@]}"

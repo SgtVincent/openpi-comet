@@ -36,6 +36,13 @@ RESULT_LIKELY_PROXY_FALSE_POSITIVE = "likely_proxy_false_positive"
 RESULT_SHORT_VIDEO_PROBLEM = "short_video_problem"
 SHORT_VIDEO_PROBLEM_STEP_THRESHOLD = 150
 TRANSFER_POSE_PROXY_FAMILY = "transfer_pose_proxy"
+CONTACT_EFFECT_PROXY_FAMILY = "contact_effect_proxy"
+ARTICULATION_CLOSE_FAMILY = "articulation_close"
+ARTICULATION_OPEN_FAMILY = "articulation_open"
+ARTICULATION_OPEN_PROXY_FAMILY = "articulation_open_proxy"
+GEOMETRY_BASE_FACING_FAMILY = "geometry_base_facing"
+ORIENTATION_PROXY_FAMILY = "orientation_proxy"
+RELATION_TRANSFER_PROXY_FAMILY = "relation_transfer_proxy"
 
 
 OVERALL_ROWS: list[tuple[str, str, bool]] = [
@@ -61,6 +68,46 @@ OVERALL_ROWS: list[tuple[str, str, bool]] = [
     (
         "transfer_pose_proxy_success_unconfirmed",
         "transfer_pose_proxy_success_unconfirmed",
+        False,
+    ),
+    (
+        "contact_effect_proxy_success_unconfirmed",
+        "contact_effect_proxy_success_unconfirmed",
+        False,
+    ),
+    (
+        "articulation_close_success_unconfirmed",
+        "articulation_close_success_unconfirmed",
+        False,
+    ),
+    (
+        "geometry_base_facing_success_unconfirmed",
+        "geometry_base_facing_success_unconfirmed",
+        False,
+    ),
+    (
+        "relation_transfer_proxy_success_unconfirmed",
+        "relation_transfer_proxy_success_unconfirmed",
+        False,
+    ),
+    (
+        "orientation_proxy_success_unconfirmed",
+        "orientation_proxy_success_unconfirmed",
+        False,
+    ),
+    (
+        "articulation_open_proxy_success_unconfirmed",
+        "articulation_open_proxy_success_unconfirmed",
+        False,
+    ),
+    (
+        "articulation_open_success_unconfirmed",
+        "articulation_open_success_unconfirmed",
+        False,
+    ),
+    (
+        "can_meat_lid_success_unconfirmed",
+        "can_meat_lid_success_unconfirmed",
         False,
     ),
     (
@@ -100,6 +147,46 @@ SKILL_METRICS: list[tuple[str, str, bool]] = [
         False,
     ),
     (
+        "contact_effect_proxy_success_unconfirmed",
+        "contact_effect_proxy_success_unconfirmed_count",
+        False,
+    ),
+    (
+        "articulation_close_success_unconfirmed",
+        "articulation_close_success_unconfirmed_count",
+        False,
+    ),
+    (
+        "geometry_base_facing_success_unconfirmed",
+        "geometry_base_facing_success_unconfirmed_count",
+        False,
+    ),
+    (
+        "relation_transfer_proxy_success_unconfirmed",
+        "relation_transfer_proxy_success_unconfirmed_count",
+        False,
+    ),
+    (
+        "orientation_proxy_success_unconfirmed",
+        "orientation_proxy_success_unconfirmed_count",
+        False,
+    ),
+    (
+        "articulation_open_proxy_success_unconfirmed",
+        "articulation_open_proxy_success_unconfirmed_count",
+        False,
+    ),
+    (
+        "articulation_open_success_unconfirmed",
+        "articulation_open_success_unconfirmed_count",
+        False,
+    ),
+    (
+        "can_meat_lid_success_unconfirmed",
+        "can_meat_lid_success_unconfirmed_count",
+        False,
+    ),
+    (
         "meaningful_policy_caused_transition",
         "meaningful_policy_caused_transition_count",
         False,
@@ -134,6 +221,73 @@ def is_transfer_pose_proxy_success_unconfirmed(row: dict[str, Any]) -> bool:
         row.get("result_type") == "predicate_satisfied"
         and bool(row.get("success"))
         and row.get("metric_family") == TRANSFER_POSE_PROXY_FAMILY
+    )
+
+
+def is_contact_effect_proxy_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == CONTACT_EFFECT_PROXY_FAMILY
+    )
+
+
+def is_articulation_close_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ARTICULATION_CLOSE_FAMILY
+    )
+
+
+def is_geometry_base_facing_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == GEOMETRY_BASE_FACING_FAMILY
+    )
+
+
+def is_relation_transfer_proxy_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == RELATION_TRANSFER_PROXY_FAMILY
+    )
+
+
+def is_orientation_proxy_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ORIENTATION_PROXY_FAMILY
+    )
+
+
+def is_articulation_open_proxy_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ARTICULATION_OPEN_PROXY_FAMILY
+    )
+
+
+def is_articulation_open_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ARTICULATION_OPEN_FAMILY
+        and row.get("skill") in {"open door", "open drawer"}
+    )
+
+
+def is_can_meat_lid_success_unconfirmed(row: dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("task_name") == "can_meat"
+        and row.get("skill") in {"open lid", "close lid"}
+        and row.get("metric_family") in {ARTICULATION_OPEN_FAMILY, ARTICULATION_CLOSE_FAMILY}
     )
 
 
@@ -202,6 +356,19 @@ def load_jsonl_rows(paths: list[Path]) -> list[dict[str, Any]]:
     return rows
 
 
+def iter_result_jsonl_paths(results_dir: Path) -> list[Path]:
+    return sorted(list(results_dir.glob("worker_*.jsonl")) + list(results_dir.glob("persistent_worker_*.jsonl")))
+
+
+def _worker_rank_token(path: Path) -> str:
+    stem = path.stem
+    for prefix in ("persistent_worker_", "worker_"):
+        if stem.startswith(prefix):
+            tail = stem[len(prefix) :]
+            return tail.split(".", 1)[0]
+    return stem
+
+
 def classify_result_row(row: dict[str, Any]) -> dict[str, bool]:
     runtime_pass = bool(row.get("runtime_ok"))
     result_type = row.get("result_type")
@@ -215,6 +382,30 @@ def classify_result_row(row: dict[str, Any]) -> dict[str, bool]:
     transfer_pose_proxy_success_unconfirmed = bool(
         row.get("transfer_pose_proxy_success_unconfirmed")
     ) or is_transfer_pose_proxy_success_unconfirmed(row)
+    contact_effect_proxy_success_unconfirmed = bool(
+        row.get("contact_effect_proxy_success_unconfirmed")
+    ) or is_contact_effect_proxy_success_unconfirmed(row)
+    articulation_close_success_unconfirmed = bool(
+        row.get("articulation_close_success_unconfirmed")
+    ) or is_articulation_close_success_unconfirmed(row)
+    geometry_base_facing_success_unconfirmed = bool(
+        row.get("geometry_base_facing_success_unconfirmed")
+    ) or is_geometry_base_facing_success_unconfirmed(row)
+    relation_transfer_proxy_success_unconfirmed = bool(
+        row.get("relation_transfer_proxy_success_unconfirmed")
+    ) or is_relation_transfer_proxy_success_unconfirmed(row)
+    orientation_proxy_success_unconfirmed = bool(
+        row.get("orientation_proxy_success_unconfirmed")
+    ) or is_orientation_proxy_success_unconfirmed(row)
+    articulation_open_proxy_success_unconfirmed = bool(
+        row.get("articulation_open_proxy_success_unconfirmed")
+    ) or is_articulation_open_proxy_success_unconfirmed(row)
+    articulation_open_success_unconfirmed = bool(
+        row.get("articulation_open_success_unconfirmed")
+    ) or is_articulation_open_success_unconfirmed(row)
+    can_meat_lid_success_unconfirmed = bool(
+        row.get("can_meat_lid_success_unconfirmed")
+    ) or is_can_meat_lid_success_unconfirmed(row)
     short_video_problem = (
         result_type == RESULT_SHORT_VIDEO_PROBLEM
         or bool(row.get("short_video_problem"))
@@ -238,6 +429,14 @@ def classify_result_row(row: dict[str, Any]) -> dict[str, bool]:
         and not short_proxy_success
         and not short_video_problem
         and not transfer_pose_proxy_success_unconfirmed
+        and not contact_effect_proxy_success_unconfirmed
+        and not articulation_close_success_unconfirmed
+        and not geometry_base_facing_success_unconfirmed
+        and not relation_transfer_proxy_success_unconfirmed
+        and not orientation_proxy_success_unconfirmed
+        and not articulation_open_proxy_success_unconfirmed
+        and not articulation_open_success_unconfirmed
+        and not can_meat_lid_success_unconfirmed
         and not early_metric_activation_review_needed
     )
     meaningful_policy_caused_transition = (
@@ -273,6 +472,15 @@ def classify_result_row(row: dict[str, Any]) -> dict[str, bool]:
         "short_proxy_success": runtime_pass and short_proxy_success,
         "likely_proxy_false_positive": runtime_pass and likely_proxy_false_positive,
         "transfer_pose_proxy_success_unconfirmed": runtime_pass and transfer_pose_proxy_success_unconfirmed,
+        "contact_effect_proxy_success_unconfirmed": runtime_pass and contact_effect_proxy_success_unconfirmed,
+        "articulation_close_success_unconfirmed": runtime_pass and articulation_close_success_unconfirmed,
+        "geometry_base_facing_success_unconfirmed": runtime_pass and geometry_base_facing_success_unconfirmed,
+        "relation_transfer_proxy_success_unconfirmed": runtime_pass and relation_transfer_proxy_success_unconfirmed,
+        "orientation_proxy_success_unconfirmed": runtime_pass and orientation_proxy_success_unconfirmed,
+        "articulation_open_proxy_success_unconfirmed": runtime_pass
+        and articulation_open_proxy_success_unconfirmed,
+        "articulation_open_success_unconfirmed": runtime_pass and articulation_open_success_unconfirmed,
+        "can_meat_lid_success_unconfirmed": runtime_pass and can_meat_lid_success_unconfirmed,
         "meaningful_policy_caused_transition": runtime_pass and meaningful_policy_caused_transition,
         "timeout": timeout,
         "truncated": truncated,
@@ -300,6 +508,30 @@ def summarize_result_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     likely_proxy_false_positive = sum(int(c["likely_proxy_false_positive"]) for c in classes)
     transfer_pose_proxy_success_unconfirmed = sum(
         int(c["transfer_pose_proxy_success_unconfirmed"]) for c in classes
+    )
+    contact_effect_proxy_success_unconfirmed = sum(
+        int(c["contact_effect_proxy_success_unconfirmed"]) for c in classes
+    )
+    articulation_close_success_unconfirmed = sum(
+        int(c["articulation_close_success_unconfirmed"]) for c in classes
+    )
+    geometry_base_facing_success_unconfirmed = sum(
+        int(c["geometry_base_facing_success_unconfirmed"]) for c in classes
+    )
+    relation_transfer_proxy_success_unconfirmed = sum(
+        int(c["relation_transfer_proxy_success_unconfirmed"]) for c in classes
+    )
+    orientation_proxy_success_unconfirmed = sum(
+        int(c["orientation_proxy_success_unconfirmed"]) for c in classes
+    )
+    articulation_open_proxy_success_unconfirmed = sum(
+        int(c["articulation_open_proxy_success_unconfirmed"]) for c in classes
+    )
+    articulation_open_success_unconfirmed = sum(
+        int(c["articulation_open_success_unconfirmed"]) for c in classes
+    )
+    can_meat_lid_success_unconfirmed = sum(
+        int(c["can_meat_lid_success_unconfirmed"]) for c in classes
     )
     meaningful_policy_caused_transition = sum(int(c["meaningful_policy_caused_transition"]) for c in classes)
     metric_unsatisfied_attemptable = sum(int(c["metric_unsatisfied_attemptable"]) for c in classes)
@@ -340,6 +572,14 @@ def summarize_result_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "short_proxy_success_count": short_proxy_success,
         "likely_proxy_false_positive_count": likely_proxy_false_positive,
         "transfer_pose_proxy_success_unconfirmed_count": transfer_pose_proxy_success_unconfirmed,
+        "contact_effect_proxy_success_unconfirmed_count": contact_effect_proxy_success_unconfirmed,
+        "articulation_close_success_unconfirmed_count": articulation_close_success_unconfirmed,
+        "geometry_base_facing_success_unconfirmed_count": geometry_base_facing_success_unconfirmed,
+        "relation_transfer_proxy_success_unconfirmed_count": relation_transfer_proxy_success_unconfirmed,
+        "orientation_proxy_success_unconfirmed_count": orientation_proxy_success_unconfirmed,
+        "articulation_open_proxy_success_unconfirmed_count": articulation_open_proxy_success_unconfirmed,
+        "articulation_open_success_unconfirmed_count": articulation_open_success_unconfirmed,
+        "can_meat_lid_success_unconfirmed_count": can_meat_lid_success_unconfirmed,
         "meaningful_policy_caused_transition_count": meaningful_policy_caused_transition,
         "metric_unsatisfied_attemptable_count": metric_unsatisfied_attemptable,
         "timeout_count": timeout,
@@ -375,7 +615,7 @@ def build_partial_summary(run_dir: Path) -> dict[str, Any]:
     planned_jobs = manifest.get("jobs", [])
     planned_by_key = {row["job_key"]: row for row in planned_jobs if "job_key" in row}
 
-    result_rows = load_jsonl_rows(sorted((run_dir / "worker_results").glob("worker_*.jsonl")))
+    result_rows = load_jsonl_rows(iter_result_jsonl_paths(run_dir / "worker_results"))
     deduped: dict[str, dict[str, Any]] = {}
     for row in result_rows:
         deduped[row["job_key"]] = row
@@ -439,6 +679,28 @@ def build_partial_summary(run_dir: Path) -> dict[str, Any]:
         "transfer_pose_proxy_success_unconfirmed": top_summary[
             "transfer_pose_proxy_success_unconfirmed_count"
         ],
+        "contact_effect_proxy_success_unconfirmed": top_summary[
+            "contact_effect_proxy_success_unconfirmed_count"
+        ],
+        "articulation_close_success_unconfirmed": top_summary[
+            "articulation_close_success_unconfirmed_count"
+        ],
+        "geometry_base_facing_success_unconfirmed": top_summary[
+            "geometry_base_facing_success_unconfirmed_count"
+        ],
+        "relation_transfer_proxy_success_unconfirmed": top_summary[
+            "relation_transfer_proxy_success_unconfirmed_count"
+        ],
+        "orientation_proxy_success_unconfirmed": top_summary[
+            "orientation_proxy_success_unconfirmed_count"
+        ],
+        "articulation_open_proxy_success_unconfirmed": top_summary[
+            "articulation_open_proxy_success_unconfirmed_count"
+        ],
+        "articulation_open_success_unconfirmed": top_summary[
+            "articulation_open_success_unconfirmed_count"
+        ],
+        "can_meat_lid_success_unconfirmed": top_summary["can_meat_lid_success_unconfirmed_count"],
         "meaningful_policy_caused_transition": top_summary["meaningful_policy_caused_transition_count"],
         "metric_unsatisfied_attemptable": top_summary["metric_unsatisfied_attemptable_count"],
         "timeout": top_summary["timeout_count"],
@@ -460,6 +722,15 @@ def build_partial_summary(run_dir: Path) -> dict[str, Any]:
     }
 
 
+def load_summary_if_exists(summary_path: Path) -> dict[str, Any] | None:
+    if not summary_path.exists():
+        return None
+    summary = load_json(summary_path)
+    if summary.get("schema_version") != 2:
+        raise SystemExit(f"Expected schema_version=2 in {summary_path}, got {summary.get('schema_version')}")
+    return summary
+
+
 def load_side(path_text: str, label: str) -> dict[str, Any]:
     run_dir, summary_path = resolve_input(path_text)
     state: dict[str, Any] = {
@@ -475,21 +746,47 @@ def load_side(path_text: str, label: str) -> dict[str, Any]:
 
     status_dir = run_dir / "worker_status"
     if status_dir.exists():
-        state["worker_started"] = len(list(status_dir.glob("worker_*.started.json")))
-        state["worker_done"] = len(list(status_dir.glob("worker_*.done.json")))
+        started_names = {_worker_rank_token(path) for path in status_dir.glob("worker_*.started.json")}
+        started_names.update(_worker_rank_token(path) for path in status_dir.glob("persistent_worker_*.jsonl"))
+        done_names = {_worker_rank_token(path) for path in status_dir.glob("worker_*.done.json")}
+        done_names.update(_worker_rank_token(path) for path in status_dir.glob("persistent_worker_*.done.json"))
+        state["worker_started"] = len(started_names)
+        state["worker_done"] = len(done_names)
 
-    if summary_path.exists():
-        summary = load_json(summary_path)
-        if summary.get("schema_version") != 2:
-            raise SystemExit(f"Expected schema_version=2 in {summary_path}, got {summary.get('schema_version')}")
+    summary = load_summary_if_exists(summary_path)
+    manifest_exists = (run_dir / "manifest.json").exists()
+    live_summary = build_partial_summary(run_dir) if manifest_exists else None
+
+    if live_summary is not None:
+        if summary is None:
+            state["status"] = "pending"
+            state["summary"] = live_summary
+            state["note"] = f"summary not ready: {summary_path}"
+            return state
+
+        summary_completed = int(summary.get("completed_jobs", 0) or 0)
+        live_completed = int(live_summary.get("completed_jobs", 0) or 0)
+        workers_active = state["worker_started"] > state["worker_done"]
+        summary_complete = int(summary.get("missing_jobs", 0) or 0) == 0
+        live_is_fresher = live_completed > summary_completed
+        should_prefer_live = live_is_fresher or (workers_active and not summary_complete)
+
+        if should_prefer_live:
+            state["status"] = "pending"
+            state["summary"] = live_summary
+            reasons = []
+            if live_is_fresher:
+                reasons.append(f"live results ahead of summary ({live_completed}>{summary_completed})")
+            if workers_active and not summary_complete:
+                reasons.append(
+                    f"workers still active ({state['worker_done']}/{state['worker_started']} done)"
+                )
+            state["note"] = "; ".join(reasons) if reasons else "using live partial summary"
+            return state
+
+    if summary is not None:
         state["status"] = "complete" if summary.get("missing_jobs", 0) == 0 else "partial_summary"
         state["summary"] = summary
-        return state
-
-    if (run_dir / "manifest.json").exists():
-        state["status"] = "pending"
-        state["summary"] = build_partial_summary(run_dir)
-        state["note"] = f"summary not ready: {summary_path}"
         return state
 
     state["note"] = f"run metadata not found under {run_dir}"

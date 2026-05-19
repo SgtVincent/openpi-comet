@@ -173,6 +173,278 @@ def test_transfer_pose_proxy_success_requires_review_not_clean_success() -> None
     assert summary["transfer_pose_proxy_success_unconfirmed_count"] == 1
 
 
+def test_contact_effect_proxy_success_requires_review_not_clean_success() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "contact_effect_proxy",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["attemptable"] is True
+    assert classes["policy_success_attemptable"] is True
+    assert classes["contact_effect_proxy_success_unconfirmed"] is True
+    assert classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["contact_effect_proxy_success_unconfirmed_count"] == 1
+
+
+def test_articulation_close_success_requires_review_not_clean_success() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "articulation_close",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["attemptable"] is True
+    assert classes["policy_success_attemptable"] is True
+    assert classes["articulation_close_success_unconfirmed"] is True
+    assert classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["articulation_close_success_unconfirmed_count"] == 1
+
+
+def test_geometry_base_facing_success_requires_review_not_clean_success() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "geometry_base_facing",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["attemptable"] is True
+    assert classes["policy_success_attemptable"] is True
+    assert classes["geometry_base_facing_success_unconfirmed"] is True
+    assert classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["geometry_base_facing_success_unconfirmed_count"] == 1
+
+
+def test_relation_transfer_proxy_success_requires_review_not_clean_success() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "relation_transfer_proxy",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["attemptable"] is True
+    assert classes["policy_success_attemptable"] is True
+    assert classes["relation_transfer_proxy_success_unconfirmed"] is True
+    assert classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["relation_transfer_proxy_success_unconfirmed_count"] == 1
+
+
+def test_orientation_proxy_success_requires_review_not_clean_success() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "orientation_proxy",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["attemptable"] is True
+    assert classes["policy_success_attemptable"] is True
+    assert classes["orientation_proxy_success_unconfirmed"] is True
+    assert classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["orientation_proxy_success_unconfirmed_count"] == 1
+
+
+def test_articulation_open_proxy_success_requires_review_not_clean_success() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "articulation_open_proxy",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["attemptable"] is True
+    assert classes["policy_success_attemptable"] is True
+    assert classes["articulation_open_proxy_success_unconfirmed"] is True
+    assert classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["articulation_open_proxy_success_unconfirmed_count"] == 1
+
+
+def test_articulation_open_door_drawer_success_requires_review_not_clean_success() -> None:
+    open_door = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "task_name": "cleaning_up_plates_and_food",
+        "skill": "open door",
+        "metric_family": "articulation_open",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+    open_drawer = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "task_name": "putting_away_Halloween_decorations",
+        "skill": "open drawer",
+        "metric_family": "articulation_open",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    door_classes = mod.classify_result_row(open_door)
+    drawer_classes = mod.classify_result_row(open_drawer)
+    summary = mod.summarize_result_rows([open_door, open_drawer])
+
+    assert door_classes["policy_success_attemptable"] is True
+    assert door_classes["articulation_open_success_unconfirmed"] is True
+    assert door_classes["policy_success_clean_attemptable"] is False
+    assert drawer_classes["policy_success_attemptable"] is True
+    assert drawer_classes["articulation_open_success_unconfirmed"] is True
+    assert drawer_classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 2
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["articulation_open_success_unconfirmed_count"] == 2
+
+
+def test_can_meat_lid_success_requires_review_separately_from_open_door_drawer_guard() -> None:
+    can_meat_open_lid = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "task_name": "can_meat",
+        "skill": "open lid",
+        "metric_family": "articulation_open",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+    open_drawer = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "task_name": "putting_away_Halloween_decorations",
+        "skill": "open drawer",
+        "metric_family": "articulation_open",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    can_classes = mod.classify_result_row(can_meat_open_lid)
+    drawer_classes = mod.classify_result_row(open_drawer)
+    summary = mod.summarize_result_rows([can_meat_open_lid, open_drawer])
+
+    assert can_classes["policy_success_attemptable"] is True
+    assert can_classes["can_meat_lid_success_unconfirmed"] is True
+    assert can_classes["articulation_open_success_unconfirmed"] is False
+    assert can_classes["policy_success_clean_attemptable"] is False
+    assert drawer_classes["policy_success_attemptable"] is True
+    assert drawer_classes["can_meat_lid_success_unconfirmed"] is False
+    assert drawer_classes["articulation_open_success_unconfirmed"] is True
+    assert drawer_classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 2
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["can_meat_lid_success_unconfirmed_count"] == 1
+    assert summary["articulation_open_success_unconfirmed_count"] == 1
+
+
+def test_compare_summary_uses_same_new_proxy_guards() -> None:
+    can_meat_row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "task_name": "can_meat",
+        "skill": "open lid",
+        "metric_family": "articulation_open",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+    orientation_row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "orientation_proxy",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+    articulation_open_proxy_row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "metric_family": "articulation_open_proxy",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+    open_drawer_row = {
+        "runtime_ok": True,
+        "success": True,
+        "result_type": "predicate_satisfied",
+        "task_name": "putting_away_Halloween_decorations",
+        "skill": "open drawer",
+        "metric_family": "articulation_open",
+        "rollout_attempted": True,
+        "final_step": 188,
+    }
+
+    can_classes = compare_mod.classify_result_row(can_meat_row)
+    orientation_classes = compare_mod.classify_result_row(orientation_row)
+    articulation_open_proxy_classes = compare_mod.classify_result_row(articulation_open_proxy_row)
+    open_drawer_classes = compare_mod.classify_result_row(open_drawer_row)
+    summary = compare_mod.summarize_result_rows(
+        [can_meat_row, orientation_row, articulation_open_proxy_row, open_drawer_row]
+    )
+
+    assert can_classes["policy_success_attemptable"] is True
+    assert can_classes["can_meat_lid_success_unconfirmed"] is True
+    assert can_classes["policy_success_clean_attemptable"] is False
+    assert orientation_classes["orientation_proxy_success_unconfirmed"] is True
+    assert orientation_classes["policy_success_clean_attemptable"] is False
+    assert articulation_open_proxy_classes["articulation_open_proxy_success_unconfirmed"] is True
+    assert articulation_open_proxy_classes["policy_success_clean_attemptable"] is False
+    assert open_drawer_classes["articulation_open_success_unconfirmed"] is True
+    assert open_drawer_classes["policy_success_clean_attemptable"] is False
+    assert summary["policy_success_attemptable_count"] == 4
+    assert summary["policy_success_clean_attemptable_count"] == 0
+    assert summary["can_meat_lid_success_unconfirmed_count"] == 1
+    assert summary["orientation_proxy_success_unconfirmed_count"] == 1
+    assert summary["articulation_open_proxy_success_unconfirmed_count"] == 1
+    assert summary["articulation_open_success_unconfirmed_count"] == 1
+
+
 def test_early_metric_activation_review_needed_is_not_clean_or_meaningful() -> None:
     row = {
         "runtime_ok": True,
@@ -466,6 +738,30 @@ def test_compare_partial_summary_matches_new_review_and_transition_schema(tmp_pa
                 "task_name": "task_alpha",
                 "demo_id": "demo002",
             },
+            {
+                "job_key": "skill_a|task_alpha|demo003|003",
+                "skill": "skill_a",
+                "task_name": "task_alpha",
+                "demo_id": "demo003",
+            },
+            {
+                "job_key": "skill_b|task_beta|demo004|004",
+                "skill": "skill_b",
+                "task_name": "task_beta",
+                "demo_id": "demo004",
+            },
+            {
+                "job_key": "skill_c|task_gamma|demo005|005",
+                "skill": "skill_c",
+                "task_name": "task_gamma",
+                "demo_id": "demo005",
+            },
+            {
+                "job_key": "open lid|can_meat|demo006|006",
+                "skill": "open lid",
+                "task_name": "can_meat",
+                "demo_id": "demo006",
+            },
         ]
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest))
@@ -506,6 +802,96 @@ def test_compare_partial_summary_matches_new_review_and_transition_schema(tmp_pa
                         "termination_reason": "predicate_satisfied",
                     }
                 ),
+                json.dumps(
+                    {
+                        "job_key": "skill_a|task_alpha|demo003|003",
+                        "skill": "skill_a",
+                        "task_name": "task_alpha",
+                        "demo_id": "demo003",
+                        "runtime_ok": True,
+                        "success": True,
+                        "result_type": "predicate_satisfied",
+                        "metric_family": "relation_transfer_proxy",
+                        "rollout_attempted": True,
+                        "start_all_satisfied": False,
+                        "min_success_steps": 150,
+                        "first_predicate_satisfied_step": 170,
+                        "early_predicate_satisfied_steps": 0,
+                        "termination_reason": "predicate_satisfied",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "job_key": "skill_b|task_beta|demo004|004",
+                        "skill": "skill_b",
+                        "task_name": "task_beta",
+                        "demo_id": "demo004",
+                        "runtime_ok": True,
+                        "success": True,
+                        "result_type": "predicate_satisfied",
+                        "metric_family": "orientation_proxy",
+                        "rollout_attempted": True,
+                        "start_all_satisfied": False,
+                        "min_success_steps": 150,
+                        "first_predicate_satisfied_step": 170,
+                        "early_predicate_satisfied_steps": 0,
+                        "termination_reason": "predicate_satisfied",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "job_key": "skill_c|task_gamma|demo005|005",
+                        "skill": "skill_c",
+                        "task_name": "task_gamma",
+                        "demo_id": "demo005",
+                        "runtime_ok": True,
+                        "success": True,
+                        "result_type": "predicate_satisfied",
+                        "metric_family": "articulation_open_proxy",
+                        "rollout_attempted": True,
+                        "start_all_satisfied": False,
+                        "min_success_steps": 150,
+                        "first_predicate_satisfied_step": 170,
+                        "early_predicate_satisfied_steps": 0,
+                        "termination_reason": "predicate_satisfied",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "job_key": "open lid|can_meat|demo006|006",
+                        "skill": "open lid",
+                        "task_name": "can_meat",
+                        "demo_id": "demo006",
+                        "runtime_ok": True,
+                        "success": True,
+                        "result_type": "predicate_satisfied",
+                        "metric_family": "articulation_open",
+                        "rollout_attempted": True,
+                        "start_all_satisfied": False,
+                        "min_success_steps": 150,
+                        "first_predicate_satisfied_step": 170,
+                        "early_predicate_satisfied_steps": 0,
+                        "termination_reason": "predicate_satisfied",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "job_key": "open drawer|task_delta|demo007|007",
+                        "skill": "open drawer",
+                        "task_name": "task_delta",
+                        "demo_id": "demo007",
+                        "runtime_ok": True,
+                        "success": True,
+                        "result_type": "predicate_satisfied",
+                        "metric_family": "articulation_open",
+                        "rollout_attempted": True,
+                        "start_all_satisfied": False,
+                        "min_success_steps": 150,
+                        "first_predicate_satisfied_step": 170,
+                        "early_predicate_satisfied_steps": 0,
+                        "termination_reason": "predicate_satisfied",
+                    }
+                ),
             ]
         )
         + "\n"
@@ -513,10 +899,32 @@ def test_compare_partial_summary_matches_new_review_and_transition_schema(tmp_pa
 
     summary = compare_mod.build_partial_summary(run_dir)
 
-    assert summary["policy_success_attemptable"] == 2
+    assert summary["policy_success_attemptable"] == 7
     assert summary["policy_success_clean_attemptable"] == 1
     assert summary["early_metric_activation_review_needed"] == 1
-    assert summary["meaningful_policy_caused_transition"] == 1
-    assert summary["skill_task_summary"][0]["task_name"] == "task_alpha"
-    assert summary["skill_task_summary"][0]["early_metric_activation_review_needed_count"] == 1
-    assert summary["skill_task_summary"][0]["meaningful_policy_caused_transition_count"] == 1
+    assert summary["relation_transfer_proxy_success_unconfirmed"] == 1
+    assert summary["orientation_proxy_success_unconfirmed"] == 1
+    assert summary["articulation_open_proxy_success_unconfirmed"] == 1
+    assert summary["articulation_open_success_unconfirmed"] == 1
+    assert summary["can_meat_lid_success_unconfirmed"] == 1
+    assert summary["meaningful_policy_caused_transition"] == 6
+    task_alpha = next(row for row in summary["skill_task_summary"] if row["task_name"] == "task_alpha")
+    assert task_alpha["early_metric_activation_review_needed_count"] == 1
+    assert task_alpha["relation_transfer_proxy_success_unconfirmed_count"] == 1
+    assert task_alpha["meaningful_policy_caused_transition_count"] == 2
+    assert any(
+        row["task_name"] == "task_beta" and row["orientation_proxy_success_unconfirmed_count"] == 1
+        for row in summary["skill_task_summary"]
+    )
+    assert any(
+        row["task_name"] == "task_gamma" and row["articulation_open_proxy_success_unconfirmed_count"] == 1
+        for row in summary["skill_task_summary"]
+    )
+    assert any(
+        row["task_name"] == "task_delta" and row["articulation_open_success_unconfirmed_count"] == 1
+        for row in summary["skill_task_summary"]
+    )
+    assert any(
+        row["task_name"] == "can_meat" and row["can_meat_lid_success_unconfirmed_count"] == 1
+        for row in summary["skill_task_summary"]
+    )

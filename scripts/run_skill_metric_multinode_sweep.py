@@ -50,6 +50,13 @@ RESULT_LIKELY_PROXY_FALSE_POSITIVE = "likely_proxy_false_positive"
 RESULT_SHORT_VIDEO_PROBLEM = "short_video_problem"
 SHORT_VIDEO_PROBLEM_STEP_THRESHOLD = 150
 TRANSFER_POSE_PROXY_FAMILY = "transfer_pose_proxy"
+CONTACT_EFFECT_PROXY_FAMILY = "contact_effect_proxy"
+ARTICULATION_CLOSE_FAMILY = "articulation_close"
+ARTICULATION_OPEN_FAMILY = "articulation_open"
+ARTICULATION_OPEN_PROXY_FAMILY = "articulation_open_proxy"
+GEOMETRY_BASE_FACING_FAMILY = "geometry_base_facing"
+ORIENTATION_PROXY_FAMILY = "orientation_proxy"
+RELATION_TRANSFER_PROXY_FAMILY = "relation_transfer_proxy"
 
 
 def is_short_video_problem_row(row: Dict[str, Any]) -> bool:
@@ -81,6 +88,112 @@ def is_transfer_pose_proxy_success_unconfirmed(row: Dict[str, Any]) -> bool:
         row.get("result_type") == "predicate_satisfied"
         and bool(row.get("success"))
         and row.get("metric_family") == TRANSFER_POSE_PROXY_FAMILY
+    )
+
+
+def is_contact_effect_proxy_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat contact/effect proxy successes as review-needed, not clean success.
+
+    Manual video audit found `contact_effect_proxy` metrics can be satisfied by
+    brief or static tool-object contact without completing the intended semantic
+    action (for example, a scrub brush merely touching a trumpet instead of
+    visibly wiping it).
+    """
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == CONTACT_EFFECT_PROXY_FAMILY
+    )
+
+
+def is_articulation_close_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat articulation-close successes as review-needed, not clean success.
+
+    Manual review of can_meat close-lid videos found `open == False` can be
+    satisfied without a stable semantic lid/container close.
+    """
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ARTICULATION_CLOSE_FAMILY
+    )
+
+
+def is_geometry_base_facing_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat base-facing geometry successes as review-needed, not clean success.
+
+    This family only checks a yaw-facing proxy against a demo-derived target,
+    so it is useful as a raw metric but too weak for conservative clean success.
+    """
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == GEOMETRY_BASE_FACING_FAMILY
+    )
+
+
+def is_relation_transfer_proxy_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat relation-transfer proxy successes as review-needed, not clean success.
+
+    Pour/transfer relation proxies can collapse rich transfer semantics into a
+    loose `ontop`/`inside` relation, sometimes with payload roles falling back to
+    the manipulated object.
+    """
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == RELATION_TRANSFER_PROXY_FAMILY
+    )
+
+
+def is_orientation_proxy_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat orientation-only proxy successes as review-needed, not clean success."""
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ORIENTATION_PROXY_FAMILY
+    )
+
+
+def is_articulation_open_proxy_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat articulation-open proxy successes as review-needed, not clean success."""
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ARTICULATION_OPEN_PROXY_FAMILY
+    )
+
+
+def is_articulation_open_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat ordinary open-door/drawer articulation successes as review-needed.
+
+    Manual review found fridge-door and cabinet/drawer `open(...)` successes can
+    enter conservative clean success even when final videos still look closed.
+    Keep the raw articulation-open metric, but exclude these high-risk skills
+    from the conservative clean-success count until the articulation predicate
+    can be strengthened with final-state / magnitude checks.
+    """
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("metric_family") == ARTICULATION_OPEN_FAMILY
+        and row.get("skill") in {"open door", "open drawer"}
+    )
+
+
+def is_can_meat_lid_success_unconfirmed(row: Dict[str, Any]) -> bool:
+    """Treat can_meat lid articulation successes as review-needed.
+
+    Manual video audit found can_meat lid metrics can be satisfied even when
+    the lid/can is dropped or does not remain in a semantically valid terminal
+    state. Keep the raw metric but exclude it from conservative clean success.
+    """
+    return (
+        row.get("result_type") == "predicate_satisfied"
+        and bool(row.get("success"))
+        and row.get("task_name") == "can_meat"
+        and row.get("skill") in {"open lid", "close lid"}
+        and row.get("metric_family") in {ARTICULATION_OPEN_FAMILY, ARTICULATION_CLOSE_FAMILY}
     )
 
 
@@ -679,6 +792,28 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
         "transfer_pose_proxy_success_unconfirmed": predicate_debug.get(
             "transfer_pose_proxy_success_unconfirmed"
         ),
+        "contact_effect_proxy_success_unconfirmed": predicate_debug.get(
+            "contact_effect_proxy_success_unconfirmed"
+        ),
+        "articulation_close_success_unconfirmed": predicate_debug.get(
+            "articulation_close_success_unconfirmed"
+        ),
+        "geometry_base_facing_success_unconfirmed": predicate_debug.get(
+            "geometry_base_facing_success_unconfirmed"
+        ),
+        "relation_transfer_proxy_success_unconfirmed": predicate_debug.get(
+            "relation_transfer_proxy_success_unconfirmed"
+        ),
+        "orientation_proxy_success_unconfirmed": predicate_debug.get(
+            "orientation_proxy_success_unconfirmed"
+        ),
+        "articulation_open_proxy_success_unconfirmed": predicate_debug.get(
+            "articulation_open_proxy_success_unconfirmed"
+        ),
+        "articulation_open_success_unconfirmed": predicate_debug.get(
+            "articulation_open_success_unconfirmed"
+        ),
+        "can_meat_lid_success_unconfirmed": predicate_debug.get("can_meat_lid_success_unconfirmed"),
         "metrics_short_video_problem": predicate_debug.get("short_video_problem"),
         "short_success_required_step": predicate_debug.get("short_success_required_step"),
         "min_success_steps": predicate_debug.get("min_success_steps"),
@@ -709,6 +844,14 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
     }
     row["short_video_problem"] = is_short_video_problem_row(row)
     row["transfer_pose_proxy_success_unconfirmed"] = is_transfer_pose_proxy_success_unconfirmed(row)
+    row["contact_effect_proxy_success_unconfirmed"] = is_contact_effect_proxy_success_unconfirmed(row)
+    row["articulation_close_success_unconfirmed"] = is_articulation_close_success_unconfirmed(row)
+    row["geometry_base_facing_success_unconfirmed"] = is_geometry_base_facing_success_unconfirmed(row)
+    row["relation_transfer_proxy_success_unconfirmed"] = is_relation_transfer_proxy_success_unconfirmed(row)
+    row["orientation_proxy_success_unconfirmed"] = is_orientation_proxy_success_unconfirmed(row)
+    row["articulation_open_proxy_success_unconfirmed"] = is_articulation_open_proxy_success_unconfirmed(row)
+    row["articulation_open_success_unconfirmed"] = is_articulation_open_success_unconfirmed(row)
+    row["can_meat_lid_success_unconfirmed"] = is_can_meat_lid_success_unconfirmed(row)
     row["early_metric_activation_review_needed"] = is_early_metric_activation_review_needed(row)
     row["meaningful_policy_caused_transition"] = has_meaningful_policy_caused_transition(row)
     return row
@@ -979,6 +1122,30 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
     transfer_pose_proxy_success_unconfirmed = bool(
         row.get("transfer_pose_proxy_success_unconfirmed")
     ) or is_transfer_pose_proxy_success_unconfirmed(row)
+    contact_effect_proxy_success_unconfirmed = bool(
+        row.get("contact_effect_proxy_success_unconfirmed")
+    ) or is_contact_effect_proxy_success_unconfirmed(row)
+    articulation_close_success_unconfirmed = bool(
+        row.get("articulation_close_success_unconfirmed")
+    ) or is_articulation_close_success_unconfirmed(row)
+    geometry_base_facing_success_unconfirmed = bool(
+        row.get("geometry_base_facing_success_unconfirmed")
+    ) or is_geometry_base_facing_success_unconfirmed(row)
+    relation_transfer_proxy_success_unconfirmed = bool(
+        row.get("relation_transfer_proxy_success_unconfirmed")
+    ) or is_relation_transfer_proxy_success_unconfirmed(row)
+    orientation_proxy_success_unconfirmed = bool(
+        row.get("orientation_proxy_success_unconfirmed")
+    ) or is_orientation_proxy_success_unconfirmed(row)
+    articulation_open_proxy_success_unconfirmed = bool(
+        row.get("articulation_open_proxy_success_unconfirmed")
+    ) or is_articulation_open_proxy_success_unconfirmed(row)
+    articulation_open_success_unconfirmed = bool(
+        row.get("articulation_open_success_unconfirmed")
+    ) or is_articulation_open_success_unconfirmed(row)
+    can_meat_lid_success_unconfirmed = bool(
+        row.get("can_meat_lid_success_unconfirmed")
+    ) or is_can_meat_lid_success_unconfirmed(row)
     short_video_problem = (
         result_type == RESULT_SHORT_VIDEO_PROBLEM
         or bool(row.get("short_video_problem"))
@@ -1002,6 +1169,14 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         and not short_proxy_success
         and not short_video_problem
         and not transfer_pose_proxy_success_unconfirmed
+        and not contact_effect_proxy_success_unconfirmed
+        and not articulation_close_success_unconfirmed
+        and not geometry_base_facing_success_unconfirmed
+        and not relation_transfer_proxy_success_unconfirmed
+        and not orientation_proxy_success_unconfirmed
+        and not articulation_open_proxy_success_unconfirmed
+        and not articulation_open_success_unconfirmed
+        and not can_meat_lid_success_unconfirmed
         and not early_metric_activation_review_needed
     )
     meaningful_policy_caused_transition = (
@@ -1038,6 +1213,19 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         "likely_proxy_false_positive": runtime_pass and likely_proxy_false_positive,
         "transfer_pose_proxy_success_unconfirmed": runtime_pass
         and transfer_pose_proxy_success_unconfirmed,
+        "contact_effect_proxy_success_unconfirmed": runtime_pass
+        and contact_effect_proxy_success_unconfirmed,
+        "articulation_close_success_unconfirmed": runtime_pass
+        and articulation_close_success_unconfirmed,
+        "geometry_base_facing_success_unconfirmed": runtime_pass
+        and geometry_base_facing_success_unconfirmed,
+        "relation_transfer_proxy_success_unconfirmed": runtime_pass
+        and relation_transfer_proxy_success_unconfirmed,
+        "orientation_proxy_success_unconfirmed": runtime_pass and orientation_proxy_success_unconfirmed,
+        "articulation_open_proxy_success_unconfirmed": runtime_pass
+        and articulation_open_proxy_success_unconfirmed,
+        "articulation_open_success_unconfirmed": runtime_pass and articulation_open_success_unconfirmed,
+        "can_meat_lid_success_unconfirmed": runtime_pass and can_meat_lid_success_unconfirmed,
         "meaningful_policy_caused_transition": runtime_pass and meaningful_policy_caused_transition,
         "timeout": timeout,
         "truncated": truncated,
@@ -1065,6 +1253,30 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     likely_proxy_false_positive = sum(int(c["likely_proxy_false_positive"]) for c in classes)
     transfer_pose_proxy_success_unconfirmed = sum(
         int(c["transfer_pose_proxy_success_unconfirmed"]) for c in classes
+    )
+    contact_effect_proxy_success_unconfirmed = sum(
+        int(c["contact_effect_proxy_success_unconfirmed"]) for c in classes
+    )
+    articulation_close_success_unconfirmed = sum(
+        int(c["articulation_close_success_unconfirmed"]) for c in classes
+    )
+    geometry_base_facing_success_unconfirmed = sum(
+        int(c["geometry_base_facing_success_unconfirmed"]) for c in classes
+    )
+    relation_transfer_proxy_success_unconfirmed = sum(
+        int(c["relation_transfer_proxy_success_unconfirmed"]) for c in classes
+    )
+    orientation_proxy_success_unconfirmed = sum(
+        int(c["orientation_proxy_success_unconfirmed"]) for c in classes
+    )
+    articulation_open_proxy_success_unconfirmed = sum(
+        int(c["articulation_open_proxy_success_unconfirmed"]) for c in classes
+    )
+    articulation_open_success_unconfirmed = sum(
+        int(c["articulation_open_success_unconfirmed"]) for c in classes
+    )
+    can_meat_lid_success_unconfirmed = sum(
+        int(c["can_meat_lid_success_unconfirmed"]) for c in classes
     )
     meaningful_policy_caused_transition = sum(int(c["meaningful_policy_caused_transition"]) for c in classes)
     metric_unsatisfied_attemptable = sum(int(c["metric_unsatisfied_attemptable"]) for c in classes)
@@ -1113,6 +1325,14 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "short_proxy_success_count": short_proxy_success,
         "likely_proxy_false_positive_count": likely_proxy_false_positive,
         "transfer_pose_proxy_success_unconfirmed_count": transfer_pose_proxy_success_unconfirmed,
+        "contact_effect_proxy_success_unconfirmed_count": contact_effect_proxy_success_unconfirmed,
+        "articulation_close_success_unconfirmed_count": articulation_close_success_unconfirmed,
+        "geometry_base_facing_success_unconfirmed_count": geometry_base_facing_success_unconfirmed,
+        "relation_transfer_proxy_success_unconfirmed_count": relation_transfer_proxy_success_unconfirmed,
+        "orientation_proxy_success_unconfirmed_count": orientation_proxy_success_unconfirmed,
+        "articulation_open_proxy_success_unconfirmed_count": articulation_open_proxy_success_unconfirmed,
+        "articulation_open_success_unconfirmed_count": articulation_open_success_unconfirmed,
+        "can_meat_lid_success_unconfirmed_count": can_meat_lid_success_unconfirmed,
         "meaningful_policy_caused_transition_count": meaningful_policy_caused_transition,
         "metric_unsatisfied_attemptable_count": metric_unsatisfied_attemptable,
         "timeout_count": timeout,
@@ -1161,6 +1381,33 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
     lines.append(f"- short_proxy_success: `{summary.get('short_proxy_success', 0)}`")
     lines.append(f"- likely_proxy_false_positive: `{summary.get('likely_proxy_false_positive', 0)}`")
     lines.append(
+        f"- transfer_pose_proxy_success_unconfirmed: `{summary.get('transfer_pose_proxy_success_unconfirmed', 0)}`"
+    )
+    lines.append(
+        f"- contact_effect_proxy_success_unconfirmed: `{summary.get('contact_effect_proxy_success_unconfirmed', 0)}`"
+    )
+    lines.append(
+        f"- articulation_close_success_unconfirmed: `{summary.get('articulation_close_success_unconfirmed', 0)}`"
+    )
+    lines.append(
+        f"- geometry_base_facing_success_unconfirmed: `{summary.get('geometry_base_facing_success_unconfirmed', 0)}`"
+    )
+    lines.append(
+        f"- relation_transfer_proxy_success_unconfirmed: `{summary.get('relation_transfer_proxy_success_unconfirmed', 0)}`"
+    )
+    lines.append(
+        f"- orientation_proxy_success_unconfirmed: `{summary.get('orientation_proxy_success_unconfirmed', 0)}`"
+    )
+    lines.append(
+        f"- articulation_open_proxy_success_unconfirmed: "
+        f"`{summary.get('articulation_open_proxy_success_unconfirmed', 0)}`"
+    )
+    lines.append(
+        f"- articulation_open_success_unconfirmed: "
+        f"`{summary.get('articulation_open_success_unconfirmed', 0)}`"
+    )
+    lines.append(f"- can_meat_lid_success_unconfirmed: `{summary.get('can_meat_lid_success_unconfirmed', 0)}`")
+    lines.append(
         f"- meaningful_policy_caused_transition: `{summary.get('meaningful_policy_caused_transition', 0)}`"
     )
     lines.append(f"- metric_unsatisfied_attemptable: `{summary['metric_unsatisfied_attemptable']}`")
@@ -1203,12 +1450,19 @@ def merge_results(args: argparse.Namespace) -> int:
     planned_jobs = manifest.get("jobs", [])
     planned_by_key = {row["job_key"]: row for row in planned_jobs}
 
-    result_rows = load_jsonl_rows(sorted((args.out_dir / "worker_results").glob("worker_*.jsonl")))
+    result_rows = load_jsonl_rows(
+        sorted(
+            list((args.out_dir / "worker_results").glob("worker_*.jsonl"))
+            + list((args.out_dir / "worker_results").glob("persistent_worker_*.jsonl"))
+        )
+    )
     deduped: Dict[str, Dict[str, Any]] = {}
     for row in result_rows:
         deduped[row["job_key"]] = row
     rows = [deduped[key] for key in sorted(deduped)]
     missing_keys = sorted(set(planned_by_key) - set(deduped))
+    for row in rows:
+        row.update(classify_result_row(row))
 
     skill_grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     skill_task_grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
@@ -1267,6 +1521,28 @@ def merge_results(args: argparse.Namespace) -> int:
         "transfer_pose_proxy_success_unconfirmed": top_summary[
             "transfer_pose_proxy_success_unconfirmed_count"
         ],
+        "contact_effect_proxy_success_unconfirmed": top_summary[
+            "contact_effect_proxy_success_unconfirmed_count"
+        ],
+        "articulation_close_success_unconfirmed": top_summary[
+            "articulation_close_success_unconfirmed_count"
+        ],
+        "geometry_base_facing_success_unconfirmed": top_summary[
+            "geometry_base_facing_success_unconfirmed_count"
+        ],
+        "relation_transfer_proxy_success_unconfirmed": top_summary[
+            "relation_transfer_proxy_success_unconfirmed_count"
+        ],
+        "orientation_proxy_success_unconfirmed": top_summary[
+            "orientation_proxy_success_unconfirmed_count"
+        ],
+        "articulation_open_proxy_success_unconfirmed": top_summary[
+            "articulation_open_proxy_success_unconfirmed_count"
+        ],
+        "articulation_open_success_unconfirmed": top_summary[
+            "articulation_open_success_unconfirmed_count"
+        ],
+        "can_meat_lid_success_unconfirmed": top_summary["can_meat_lid_success_unconfirmed_count"],
         "meaningful_policy_caused_transition": top_summary["meaningful_policy_caused_transition_count"],
         "metric_unsatisfied_attemptable": top_summary["metric_unsatisfied_attemptable_count"],
         "timeout": top_summary["timeout_count"],
@@ -1303,6 +1579,9 @@ def merge_results(args: argparse.Namespace) -> int:
             "runtime_ok",
             "success",
             "result_type",
+            "attemptable",
+            "policy_success_attemptable",
+            "policy_success_clean_attemptable",
             "metric_family",
             "start_all_satisfied",
             "short_video_problem",
@@ -1311,6 +1590,14 @@ def merge_results(args: argparse.Namespace) -> int:
             "short_proxy_success",
             "likely_proxy_false_positive",
             "transfer_pose_proxy_success_unconfirmed",
+            "contact_effect_proxy_success_unconfirmed",
+            "articulation_close_success_unconfirmed",
+            "geometry_base_facing_success_unconfirmed",
+            "relation_transfer_proxy_success_unconfirmed",
+            "orientation_proxy_success_unconfirmed",
+            "articulation_open_proxy_success_unconfirmed",
+            "articulation_open_success_unconfirmed",
+            "can_meat_lid_success_unconfirmed",
             "short_success_required_step",
             "min_success_steps",
             "first_predicate_satisfied_step",
@@ -1366,6 +1653,14 @@ def merge_results(args: argparse.Namespace) -> int:
             "short_proxy_success_count",
             "likely_proxy_false_positive_count",
             "transfer_pose_proxy_success_unconfirmed_count",
+            "contact_effect_proxy_success_unconfirmed_count",
+            "articulation_close_success_unconfirmed_count",
+            "geometry_base_facing_success_unconfirmed_count",
+            "relation_transfer_proxy_success_unconfirmed_count",
+            "orientation_proxy_success_unconfirmed_count",
+            "articulation_open_proxy_success_unconfirmed_count",
+            "articulation_open_success_unconfirmed_count",
+            "can_meat_lid_success_unconfirmed_count",
             "meaningful_policy_caused_transition_count",
             "metric_unsatisfied_attemptable_count",
             "timeout_count",
@@ -1409,6 +1704,14 @@ def merge_results(args: argparse.Namespace) -> int:
             "short_proxy_success_count",
             "likely_proxy_false_positive_count",
             "transfer_pose_proxy_success_unconfirmed_count",
+            "contact_effect_proxy_success_unconfirmed_count",
+            "articulation_close_success_unconfirmed_count",
+            "geometry_base_facing_success_unconfirmed_count",
+            "relation_transfer_proxy_success_unconfirmed_count",
+            "orientation_proxy_success_unconfirmed_count",
+            "articulation_open_proxy_success_unconfirmed_count",
+            "articulation_open_success_unconfirmed_count",
+            "can_meat_lid_success_unconfirmed_count",
             "meaningful_policy_caused_transition_count",
             "metric_unsatisfied_attemptable_count",
             "timeout_count",
@@ -1431,6 +1734,311 @@ def merge_results(args: argparse.Namespace) -> int:
     (args.out_dir / "multinode_skill_summary.md").write_text(render_summary_md(summary))
     print(json.dumps(summary, indent=2))
     return 0
+
+
+def materialize_persistent_jobs(args: argparse.Namespace, jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Write per-GPU JSONL job queues for persistent workers.
+
+    Reuses :func:`build_worker_assignments` so every contiguous run of segments
+    on a worker shares ``task_name`` (task-affinity scheduling). Honours
+    ``--resume`` by skipping any ``job_key`` whose ``metrics/*.json`` already
+    exists. Each segment is augmented with a precomputed ``dynamic_max_steps``
+    so the worker does not need to reparse ``frame_duration``.
+
+    Returns a list of per-worker plan dicts (rank, gpu_id, jobs_path, count).
+    """
+    total_workers = args.num_nodes * args.gpus_per_node
+    worker_jobs = build_worker_assignments(jobs, total_workers)
+    jobs_dir = args.out_dir / "worker_jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    plans: List[Dict[str, Any]] = []
+    for local_rank, gpu_id in enumerate(args.local_gpu_ids):
+        worker_rank = args.node_rank * args.gpus_per_node + local_rank
+        jobs_path = jobs_dir / f"persistent_worker_{worker_rank:03d}.jobs.jsonl"
+        # Truncate any stale queue from a previous launch so we cannot
+        # accidentally replay shutdown lines from yesterday.
+        if jobs_path.exists():
+            jobs_path.unlink()
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.touch()
+
+        assignments = worker_jobs[worker_rank]
+        written = 0
+        skipped_resume = 0
+        for sample in assignments:
+            if args.resume:
+                metrics_dir = (
+                    args.out_dir
+                    / "raw"
+                    / sample["task_name"]
+                    / f"demo_{sample['demo_id']}"
+                    / f"skill_{int(sample['skill_idx']):03d}"
+                    / "metrics"
+                )
+                if metrics_dir.exists() and any(metrics_dir.glob("*.json")):
+                    skipped_resume += 1
+                    continue
+            payload = dict(sample)
+            payload["dynamic_max_steps"] = get_dynamic_max_steps(
+                sample.get("frame_duration"),
+                fallback=int(args.max_steps),
+                cap=max(0, int(args.max_dynamic_steps_cap or 0)),
+            )
+            append_jsonl(jobs_path, {"action": "assign", "sample": payload})
+            written += 1
+
+        plans.append(
+            {
+                "worker_rank": worker_rank,
+                "gpu_id": int(gpu_id),
+                "jobs_path": str(jobs_path),
+                "assigned": len(assignments),
+                "skipped_resume": skipped_resume,
+                "written": written,
+            }
+        )
+
+    write_csv(
+        args.out_dir / "persistent_worker_plan.csv",
+        plans,
+        fieldnames=["worker_rank", "gpu_id", "jobs_path", "assigned", "skipped_resume", "written"],
+    )
+    return plans
+
+
+def _persistent_worker_env(args: argparse.Namespace, gpu_id: int, port: int) -> Dict[str, str]:
+    """Build the env dict for a persistent worker subprocess (mirrors run_segment_eval)."""
+    env = os.environ.copy()
+    og_appdata_base = Path(env.get("OMNIGIBSON_APPDATA_PATH_BASE", "/tmp/omnigibson-appdata"))
+    og_user = env.get("USER", "user")
+    og_appdata_scope = env.get("OMNIGIBSON_APPDATA_SCOPE", "gpu")
+    if og_appdata_scope == "gpu":
+        og_appdata = og_appdata_base / og_user / f"gpu{gpu_id}"
+    elif og_appdata_scope == "gpu_port":
+        og_appdata = og_appdata_base / og_user / f"gpu{gpu_id}_p{port}"
+    elif og_appdata_scope == "run_gpu_port":
+        og_appdata = og_appdata_base / og_user / args.out_dir.name / f"gpu{gpu_id}_p{port}"
+    else:
+        raise RuntimeError(
+            "invalid OMNIGIBSON_APPDATA_SCOPE; expected one of: gpu, gpu_port, run_gpu_port"
+        )
+    og_appdata.mkdir(parents=True, exist_ok=True)
+
+    pythonpath = ":".join(
+        [
+            str(REPO_ROOT / "src"),
+            str(args.behavior_dir / "joylo"),
+            str(args.behavior_dir / "OmniGibson"),
+            str(args.behavior_dir / "bddl3"),
+        ]
+    )
+    if env.get("PYTHONPATH"):
+        pythonpath = pythonpath + ":" + env["PYTHONPATH"]
+
+    no_proxy = env.get("NO_PROXY", "")
+    no_proxy_chunks = ["localhost", "127.0.0.1", "::1"]
+    if no_proxy:
+        no_proxy_chunks.append(no_proxy)
+    no_proxy_value = ",".join(no_proxy_chunks)
+
+    overrides = {
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": pythonpath,
+        "NO_PROXY": no_proxy_value,
+        "no_proxy": no_proxy_value,
+        "CUDA_VISIBLE_DEVICES": str(gpu_id),
+        "OMNIGIBSON_DATA_PATH": str(args.behavior_dir / "datasets"),
+        "OMNIGIBSON_APPDATA_PATH": str(og_appdata),
+        "MPLBACKEND": env.get("MPLBACKEND", "Agg"),
+        "TORCHDYNAMO_DISABLE": env.get("TORCHDYNAMO_DISABLE", "1"),
+        "TORCHINDUCTOR_DISABLE": env.get("TORCHINDUCTOR_DISABLE", "1"),
+        "OMNIGIBSON_HEADLESS": "true",
+        "OMNIGIBSON_DISABLE_EXTENSION_REGISTRY": "0",
+        "OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK": "1",
+    }
+    env.pop("OMNIGIBSON_GPU_ID", None)
+    env.update(overrides)
+    return env
+
+
+def run_persistent_worker_inplace(args: argparse.Namespace) -> int:
+    """Re-exec ``persistent_skill_eval_worker.py`` so ``--mode persistent-worker`` is a thin wrapper."""
+    if args.worker_rank < 0 or args.gpu_id < 0:
+        raise RuntimeError("persistent-worker mode requires --worker-rank and --gpu-id")
+    cmd = [
+        sys.executable,
+        "-u",
+        str(args.persistent_worker_script),
+        "--out-dir",
+        str(args.out_dir),
+        "--worker-rank",
+        str(args.worker_rank),
+        "--gpu-id",
+        str(args.gpu_id),
+        "--port-base",
+        str(args.port_base),
+        "--gpus-per-node",
+        str(args.gpus_per_node),
+        "--max-steps",
+        str(args.max_steps),
+        "--max-dynamic-steps-cap",
+        str(args.max_dynamic_steps_cap),
+        "--server-ready-timeout",
+        str(args.server_ready_timeout),
+        "--openpi-env",
+        args.openpi_env,
+        "--behavior-env",
+        args.behavior_env,
+        "--config-name",
+        args.config_name,
+        "--policy-backend",
+        args.policy_backend,
+        "--ckpt-dir",
+        str(args.ckpt_dir),
+        "--behavior-dir",
+        str(args.behavior_dir),
+        "--demo-data-path",
+        str(args.demo_data_path),
+        "--rawdata-path",
+        str(args.rawdata_path),
+        "--launcher-pid",
+        str(int(os.environ.get("PERSISTENT_LAUNCHER_PID", os.getppid()))),
+    ]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.write_video:
+        cmd.append("--write-video")
+    if args.segment_predicate_dump_trace:
+        cmd.append("--segment-predicate-dump-trace")
+    if args.resume:
+        cmd.append("--resume")
+    os.execv(cmd[0], cmd)
+    return 0  # unreachable
+
+
+def launch_node_persistent(args: argparse.Namespace) -> int:
+    """Spawn 8 persistent per-GPU workers and feed them via task-affinity JSONL queues."""
+    manifest_path = args.out_dir / "manifest.json"
+    if args.node_rank == 0 and (args.rebuild_manifest or not manifest_path.exists()):
+        registry = load_registry(args.behavior_dir / REGISTRY_REL_PATH)
+        jobs = collect_skill_jobs(
+            registry=registry,
+            demo_data_path=args.demo_data_path,
+            skills_filter=args.skills_filter,
+            max_samples_per_skill=args.max_samples_per_skill,
+            max_samples_per_skill_task=args.max_samples_per_skill_task,
+            max_total_jobs=args.max_total_jobs,
+        )
+        write_manifest(args, jobs)
+    else:
+        wait_for_path(manifest_path, args.prepare_timeout)
+
+    if args.mode == "prepare":
+        return 0
+
+    manifest = json.loads(manifest_path.read_text())
+    plans = materialize_persistent_jobs(args, manifest.get("jobs", []))
+    print(
+        f"[launcher-persistent] materialized jobs: "
+        + ", ".join(f"r{p['worker_rank']:03d}={p['written']}" for p in plans),
+        flush=True,
+    )
+
+    children: List[Tuple[subprocess.Popen[str], int, int, Path, Path]] = []
+    try:
+        for plan in plans:
+            local_rank = plan["worker_rank"] - args.node_rank * args.gpus_per_node
+            gpu_id = plan["gpu_id"]
+            port = args.port_base + local_rank
+            worker_log = (
+                args.out_dir
+                / "launcher_logs"
+                / f"persistent_worker{plan['worker_rank']:03d}.log"
+            )
+            worker_log.parent.mkdir(parents=True, exist_ok=True)
+
+            cmd = f"""
+set -euo pipefail
+source {q(CONDA_SH)}
+conda activate {q(args.behavior_env)}
+cd {q(REPO_ROOT)}
+python -u {q(str(args.persistent_worker_script))} \\
+  --out-dir {q(args.out_dir)} \\
+  --worker-rank {q(plan['worker_rank'])} \\
+  --gpu-id {q(gpu_id)} \\
+  --port-base {q(port)} \\
+  --gpus-per-node {q(args.gpus_per_node)} \\
+  --max-steps {q(args.max_steps)} \\
+  --max-dynamic-steps-cap {q(args.max_dynamic_steps_cap)} \\
+  --server-ready-timeout {q(args.server_ready_timeout)} \\
+  --openpi-env {q(args.openpi_env)} \\
+  --behavior-env {q(args.behavior_env)} \\
+  --config-name {q(args.config_name)} \\
+  --policy-backend {q(args.policy_backend)} \\
+  --ckpt-dir {q(args.ckpt_dir)} \\
+  --behavior-dir {q(args.behavior_dir)} \\
+  --demo-data-path {q(args.demo_data_path)} \\
+  --rawdata-path {q(args.rawdata_path)} \\
+  --launcher-pid {q(os.getpid())}{' --dry-run' if args.dry_run else ''}{' --write-video' if args.write_video else ''}{' --segment-predicate-dump-trace' if args.segment_predicate_dump_trace else ''}{' --resume' if args.resume else ''}
+"""
+            env = _persistent_worker_env(args, gpu_id=gpu_id, port=port)
+            with worker_log.open("w") as f:
+                proc = subprocess.Popen(
+                    ["bash", "-lc", cmd],
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                    env=env,
+                )
+            children.append((proc, plan["worker_rank"], gpu_id, worker_log, Path(plan["jobs_path"])))
+
+        # Wait until every worker has consumed its assign lines (i.e. emitted
+        # a matching "segment_done" or "segment_resume_hit" status), then
+        # request shutdown by appending {"action": "shutdown"}.
+        shutdown_sent = False
+        while True:
+            still_running = [c for c in children if c[0].poll() is None]
+            if not still_running:
+                break
+            if not shutdown_sent:
+                # Once any worker exits abnormally, shut down the rest cleanly.
+                exited = [c for c in children if c[0].poll() is not None]
+                if exited:
+                    for proc, rank, _, log_path, _ in exited:
+                        if proc.returncode != 0:
+                            print(
+                                f"[launcher-persistent] worker {rank:03d} exited with code "
+                                f"{proc.returncode}; log: {log_path}",
+                                flush=True,
+                            )
+                            print(tail_text(log_path))
+                # Append shutdown after a grace period so workers see assign lines first.
+                # We just send shutdown immediately: workers process all queued assigns
+                # before reading the shutdown line because the queue is read in order.
+                for _, _, _, _, jobs_path in children:
+                    append_jsonl(jobs_path, {"action": "shutdown"})
+                shutdown_sent = True
+            time.sleep(2.0)
+
+        # Drain final return codes.
+        any_failed = False
+        for proc, rank, _, log_path, _ in children:
+            code = proc.poll() if proc.poll() is not None else proc.wait(timeout=args.persistent_worker_shutdown_timeout)
+            if code != 0:
+                any_failed = True
+                print(
+                    f"[launcher-persistent] worker {rank:03d} final exit code {code}; log: {log_path}",
+                    flush=True,
+                )
+                print(tail_text(log_path))
+        return 1 if any_failed else 0
+    finally:
+        # SIGTERM/SIGKILL anyone still alive past the deadline.
+        for proc, _, _, _, _ in children:
+            stop_process(proc)
+
 
 
 def launch_node(args: argparse.Namespace) -> int:
@@ -1558,7 +2166,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Multinode segment/skill sweep for BEHAVIOR-1K skill success evaluation."
     )
-    parser.add_argument("--mode", choices=["launch", "prepare", "merge", "worker"], default="launch")
+    parser.add_argument(
+        "--mode",
+        choices=["launch", "prepare", "merge", "worker", "launch-persistent", "persistent-worker"],
+        default="launch",
+    )
     parser.add_argument(
         "--out-dir",
         type=Path,
@@ -1619,6 +2231,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-rank", type=int, default=-1)
     parser.add_argument("--gpu-id", type=int, default=-1)
     parser.add_argument("--port", type=int, default=-1)
+    # Persistent-worker mode knobs.
+    parser.add_argument(
+        "--persistent-worker-script",
+        type=Path,
+        default=Path(__file__).resolve().parent / "persistent_skill_eval_worker.py",
+        help="path to the per-GPU persistent worker entrypoint",
+    )
+    parser.add_argument(
+        "--persistent-worker-shutdown-timeout",
+        type=int,
+        default=900,
+        help="seconds to wait after appending {action: shutdown} before SIGTERM/SIGKILL",
+    )
     args = parser.parse_args()
 
     args.out_dir = args.out_dir.resolve()
@@ -1656,6 +2281,12 @@ def main() -> int:
         if args.worker_rank < 0 or args.gpu_id < 0 or args.port < 0:
             raise RuntimeError("worker mode requires --worker-rank, --gpu-id and --port")
         return run_worker(args)
+    if args.mode == "persistent-worker":
+        # Thin wrapper that re-exec's the dedicated persistent worker entrypoint so
+        # the launcher binary is the single CLI users learn.
+        return run_persistent_worker_inplace(args)
+    if args.mode == "launch-persistent":
+        return launch_node_persistent(args)
     return launch_node(args)
 
 
