@@ -109,9 +109,10 @@ python scripts/run_skill_metric_multinode_sweep.py \
 MAX_SAMPLES_PER_SKILL=96
 MAX_SAMPLES_PER_SKILL_TASK=2
 MAX_TOTAL_JOBS=0
+EVAL_MODE=persistent
 ```
 
-这组默认值的设计目标是把总 job 数压到 `~3k` 量级，适合作为 `32 x L20` 的一晚或半晚规模实验。
+这组默认值的设计目标是把总 job 数压到 `~3k` 量级，适合作为 `32 x L20` 的一晚或半晚规模实验。注意，我们现在默认使用 `persistent` 模式，它会保持 OmniGibson 和 policy server 常驻，实现数倍的加速。
 
 #### Node 0
 
@@ -122,48 +123,16 @@ cd /mnt/bn/navigation-hl/mlx/users/chenjunting/repo/openpi-comet
 
 NODE_RANK=0 NUM_NODES=4 GPUS_PER_NODE=8 LOCAL_GPU_IDS=0,1,2,3,4,5,6,7 \
 python scripts/run_skill_metric_multinode_sweep.py \
-  --mode launch \
+  --mode launch-persistent \
   --out-dir "$RUN_DIR" \
   --num-nodes 4 \
   --gpus-per-node 8 \
   --resume
 ```
 
-#### Node 1
+#### Node 1, 2, 3
 
-```bash
-NODE_RANK=1 NUM_NODES=4 GPUS_PER_NODE=8 LOCAL_GPU_IDS=0,1,2,3,4,5,6,7 \
-python scripts/run_skill_metric_multinode_sweep.py \
-  --mode launch \
-  --out-dir "$RUN_DIR" \
-  --num-nodes 4 \
-  --gpus-per-node 8 \
-  --resume
-```
-
-#### Node 2
-
-```bash
-NODE_RANK=2 NUM_NODES=4 GPUS_PER_NODE=8 LOCAL_GPU_IDS=0,1,2,3,4,5,6,7 \
-python scripts/run_skill_metric_multinode_sweep.py \
-  --mode launch \
-  --out-dir "$RUN_DIR" \
-  --num-nodes 4 \
-  --gpus-per-node 8 \
-  --resume
-```
-
-#### Node 3
-
-```bash
-NODE_RANK=3 NUM_NODES=4 GPUS_PER_NODE=8 LOCAL_GPU_IDS=0,1,2,3,4,5,6,7 \
-python scripts/run_skill_metric_multinode_sweep.py \
-  --mode launch \
-  --out-dir "$RUN_DIR" \
-  --num-nodes 4 \
-  --gpus-per-node 8 \
-  --resume
-```
+以此类推，修改 `NODE_RANK` 并保持 `--mode launch-persistent` 运行。
 
 ### Step 3. Merge Final Results
 
