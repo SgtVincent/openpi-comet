@@ -96,6 +96,16 @@ EVAL_EXTRA_OVERRIDES="${EVAL_EXTRA_OVERRIDES:-}"
 HEADLESS="${HEADLESS:-true}"
 WRITE_VIDEO="${WRITE_VIDEO:-false}"
 MAX_STEPS="${MAX_STEPS:-}"
+PARTIAL_SCENE_LOAD="${PARTIAL_SCENE_LOAD:-true}"
+MAX_STEPS_HUMAN_MULTIPLIER="${MAX_STEPS_HUMAN_MULTIPLIER:-1.2}"
+VIDEO_ON_REPLAN_ONLY="${VIDEO_ON_REPLAN_ONLY:-true}"
+STUCK_MOTION_WINDOW="${STUCK_MOTION_WINDOW:-2000}"
+STUCK_MIN_STEPS="${STUCK_MIN_STEPS:-5000}"
+STUCK_MOTION_THRESHOLD="${STUCK_MOTION_THRESHOLD:-0.75}"
+RENDER_VIEWER_CAMERA="${RENDER_VIEWER_CAMERA:-true}"
+GUI_VIEWPORT_ONLY="${GUI_VIEWPORT_ONLY:-false}"
+VIEWER_WIDTH="${VIEWER_WIDTH:-1280}"
+VIEWER_HEIGHT="${VIEWER_HEIGHT:-720}"
 SIM_DISPLAY="${SIM_DISPLAY:-}"
 SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-10}"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-$SERVER_STARTUP_WAIT}"
@@ -107,6 +117,10 @@ OMNIGIBSON_DISABLE_EXTENSION_REGISTRY="${OMNIGIBSON_DISABLE_EXTENSION_REGISTRY:-
 OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK="${OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK:-1}"
 MIN_GPU_FREE_MB="${MIN_GPU_FREE_MB:-20000}"
 ENV_WRAPPER_TARGET="${ENV_WRAPPER_TARGET:-omnigibson.learning.wrappers.RGBWrapper}"
+CPU_AFFINITY_MODE="${CPU_AFFINITY_MODE:-none}"
+CPU_AFFINITY_CPUS_PER_WORKER="${CPU_AFFINITY_CPUS_PER_WORKER:-0}"
+WARMUP_CACHE_TAR="${WARMUP_CACHE_TAR:-}"
+RESTORE_CACHE_BEFORE_EVAL="${RESTORE_CACHE_BEFORE_EVAL:-false}"
 PROFILE="${PROFILE:-0}"
 SAVE_SUBTASK_PREDICTIONS="${SAVE_SUBTASK_PREDICTIONS:-false}"
 OPENPI_SERVER_RECORD="${OPENPI_SERVER_RECORD:-false}"
@@ -151,6 +165,10 @@ parse_csv_ints() {
   (( ${#out_ref[@]} > 0 )) || die "empty integer list from csv: $csv"
 }
 
+is_true_like() {
+  [[ "${1,,}" =~ ^(1|true|yes|y|on)$ ]]
+}
+
 wait_for_port() {
   local host="$1"
   local port="$2"
@@ -165,10 +183,18 @@ wait_for_server_ready() {
   local start_ts
   start_ts="$(date +%s)"
   while true; do
-    if [[ -f "$log_file" ]] && grep -qE "server listening on 0\\.0\\.0\\.0:${port}" "$log_file"; then
-      return 0
+    if [[ -f "$log_file" ]]; then
+      # Prefer log-based readiness to avoid being fooled by stale processes
+      # already binding the same port.
+      if grep -qE "(server listening on 0\\.0\\.0\\.0:${port}|Starting websocket server on 0\\.0\\.0\\.0:${port})" "$log_file"; then
+        return 0
+      fi
+      if grep -qE "(OSError: \\[Errno 98\\]|address already in use|Traceback)" "$log_file"; then
+        return 1
+      fi
     fi
-    if wait_for_port 127.0.0.1 "$port"; then
+    # Fallback: port open check (best-effort) for cases where logs are delayed.
+    if [[ ! -f "$log_file" ]] && wait_for_port 127.0.0.1 "$port"; then
       return 0
     fi
     local now
@@ -178,6 +204,61 @@ wait_for_server_ready() {
     fi
     sleep "$SERVER_READY_POLL_INTERVAL"
   done
+}
+
+build_cpu_affinity_cmd() {
+  local worker_idx="$1"
+  if [[ "$CPU_AFFINITY_MODE" == "none" ]]; then
+    return 0
+  fi
+  if [[ "$CPU_AFFINITY_MODE" != "compact" ]]; then
+    warn "unsupported CPU_AFFINITY_MODE=$CPU_AFFINITY_MODE, skipping affinity"
+    return 0
+  fi
+  if ! is_positive_int "$CPU_AFFINITY_CPUS_PER_WORKER"; then
+    warn "CPU_AFFINITY_CPUS_PER_WORKER must be a positive int when affinity is enabled"
+    return 0
+  fi
+  command -v taskset >/dev/null 2>&1 || {
+    warn "taskset not found, skipping CPU affinity"
+    return 0
+  }
+  local total_cpus
+  total_cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  [[ "$total_cpus" =~ ^[0-9]+$ ]] || total_cpus=0
+  if (( total_cpus <= 0 )); then
+    warn "failed to detect CPU count, skipping CPU affinity"
+    return 0
+  fi
+  local start_cpu=$(( worker_idx * CPU_AFFINITY_CPUS_PER_WORKER ))
+  local end_cpu=$(( start_cpu + CPU_AFFINITY_CPUS_PER_WORKER - 1 ))
+  if (( end_cpu >= total_cpus )); then
+    warn "CPU affinity slice ${start_cpu}-${end_cpu} exceeds detected CPUs=${total_cpus}, skipping affinity for worker ${worker_idx}"
+    return 0
+  fi
+  printf 'taskset -c %d-%d' "$start_cpu" "$end_cpu"
+}
+
+restore_warmup_cache_if_needed() {
+  is_true_like "$RESTORE_CACHE_BEFORE_EVAL" || return 0
+  [[ -n "$WARMUP_CACHE_TAR" ]] || die "RESTORE_CACHE_BEFORE_EVAL=true but WARMUP_CACHE_TAR is empty"
+  [[ -f "$WARMUP_CACHE_TAR" ]] || die "warmup cache tar not found: $WARMUP_CACHE_TAR"
+  local extract_root
+  extract_root="$(dirname "$OMNIGIBSON_APPDATA_PATH_BASE")"
+  mkdir -p "$OMNIGIBSON_APPDATA_PATH_BASE"
+  if [[ "$OMNIGIBSON_APPDATA_PATH_MODE" != "per_gpu" ]]; then
+    warn "warmup cache restore is optimized for OMNIGIBSON_APPDATA_PATH_MODE=per_gpu, current=${OMNIGIBSON_APPDATA_PATH_MODE}"
+  fi
+  local stamp_name="${WARMUP_CACHE_TAR##*/}"
+  stamp_name="${stamp_name//[^A-Za-z0-9._-]/_}"
+  local stamp_file="$OMNIGIBSON_APPDATA_PATH_BASE/.restored_${stamp_name}.stamp"
+  if [[ -f "$stamp_file" && "$stamp_file" -nt "$WARMUP_CACHE_TAR" ]]; then
+    log "Warmup cache already restored: $WARMUP_CACHE_TAR"
+    return 0
+  fi
+  log "Restoring warmup cache tar to $(dirname "$OMNIGIBSON_APPDATA_PATH_BASE"): $WARMUP_CACHE_TAR"
+  tar -xzf "$WARMUP_CACHE_TAR" -C "$extract_root"
+  touch "$stamp_file"
 }
 
 read_checkpoint_list_file() {
@@ -328,9 +409,12 @@ assign_eval_ids() {
 }
 
 launch_server() {
-  local gpu="$1"
-  local port="$2"
-  local log_file="$3"
+  local worker_idx="$1"
+  local gpu="$2"
+  local port="$3"
+  local log_file="$4"
+  local affinity_cmd=""
+  affinity_cmd="$(build_cpu_affinity_cmd "$worker_idx")"
 
   setsid -w bash -c "
     set -euo pipefail
@@ -355,10 +439,11 @@ launch_server() {
     if [[ -n \"$PROMPT_OVERRIDE\" ]]; then
       prompt_override_args+=(--prompt_override=\"$PROMPT_OVERRIDE\")
     fi
+    affinity_cmd=\"$affinity_cmd\"
     if [[ \"$USE_CONDA_OPENPI\" == \"1\" && -f \"$PREFERRED_CONDA_SH\" ]]; then
       source \"$PREFERRED_CONDA_SH\"
       conda activate \"$OPENPI_ENV\"
-      exec python scripts/serve_b1k.py \
+      exec \$affinity_cmd python scripts/serve_b1k.py \
         --task_name=\"$TASK_NAME\" \
         --control_mode=\"$CONTROL_MODE\" \
         --max_len=\"$MAX_LEN\" \
@@ -369,7 +454,7 @@ launch_server() {
         --policy.config=\"$OPENPI_CONFIG_NAME\" \
         --policy.dir=\"$CKPT_DIR\"
     else
-      exec \"$OPENPI_PYTHON\" scripts/serve_b1k.py \
+      exec \$affinity_cmd \"$OPENPI_PYTHON\" scripts/serve_b1k.py \
         --task_name=\"$TASK_NAME\" \
         --control_mode=\"$CONTROL_MODE\" \
         --max_len=\"$MAX_LEN\" \
@@ -385,9 +470,10 @@ launch_server() {
 }
 
 launch_eval() {
-  local gpu="$1"
-  local port="$2"
-  local ids_csv="$3"
+  local worker_idx="$1"
+  local gpu="$2"
+  local port="$3"
+  local ids_csv="$4"
 
   local eval_log="$OUT_DIR/eval_gpu${gpu}_p${port}.log"
   local eval_out="$OUT_DIR/eval_gpu${gpu}_p${port}"
@@ -396,12 +482,20 @@ launch_eval() {
   local max_steps_arg=""
   local env_wrapper_arg=""
   local eval_custom_args=""
+  local feature_args=""
+  local affinity_cmd=""
 
   [[ -n "$MAX_STEPS" ]] && max_steps_arg="max_steps=$MAX_STEPS"
   [[ -n "$ENV_WRAPPER_TARGET" ]] && env_wrapper_arg="env_wrapper._target_=$ENV_WRAPPER_TARGET"
+  affinity_cmd="$(build_cpu_affinity_cmd "$worker_idx")"
+
+  if is_true_like "$PARTIAL_SCENE_LOAD"; then
+    feature_args="partial_scene_load=true"
+  fi
+  feature_args="$feature_args render_viewer_camera=$RENDER_VIEWER_CAMERA gui_viewport_only=$GUI_VIEWPORT_ONLY viewer_width=$VIEWER_WIDTH viewer_height=$VIEWER_HEIGHT"
 
   if [[ "$EVAL_ENTRYPOINT" == "eval_custom.py" ]]; then
-    eval_custom_args="use_parallel_evaluator=false save_rollout=$SAVE_ROLLOUT save_subtask_predictions=$SAVE_SUBTASK_PREDICTIONS perturb_pose=$PERTURB_POSE perturb_pose_seed=$PERTURB_POSE_SEED parallel_evaluator_start_idx=$PARALLEL_EVALUATOR_START_IDX parallel_evaluator_end_idx=$PARALLEL_EVALUATOR_END_IDX"
+    eval_custom_args="use_parallel_evaluator=false save_rollout=$SAVE_ROLLOUT save_subtask_predictions=$SAVE_SUBTASK_PREDICTIONS perturb_pose=$PERTURB_POSE perturb_pose_seed=$PERTURB_POSE_SEED parallel_evaluator_start_idx=$PARALLEL_EVALUATOR_START_IDX parallel_evaluator_end_idx=$PARALLEL_EVALUATOR_END_IDX max_steps_human_multiplier=$MAX_STEPS_HUMAN_MULTIPLIER video_on_replan_only=$VIDEO_ON_REPLAN_ONLY stuck_motion_window=$STUCK_MOTION_WINDOW stuck_min_steps=$STUCK_MIN_STEPS stuck_motion_threshold=$STUCK_MOTION_THRESHOLD"
   fi
 
   setsid -w bash -c "
@@ -412,7 +506,8 @@ launch_eval() {
     if [[ -n \"$BEHAVIOR_PYTHONPATH\" ]]; then
       export PYTHONPATH=\"$BEHAVIOR_PYTHONPATH\${PYTHONPATH:+:\$PYTHONPATH}\"
     fi
-    export OMNIGIBSON_GPU_ID=\"$gpu\"
+    export CUDA_VISIBLE_DEVICES=\"$gpu\"
+    unset OMNIGIBSON_GPU_ID
     export OMNIGIBSON_DATA_PATH=\"\${OMNIGIBSON_DATA_PATH:-$BEHAVIOR_DIR/datasets}\"
     export OMNIGIBSON_DISABLE_EXTENSION_REGISTRY=\"$OMNIGIBSON_DISABLE_EXTENSION_REGISTRY\"
     export OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK=\"$OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK\"
@@ -428,6 +523,7 @@ launch_eval() {
     export TORCHDYNAMO_DISABLE=\"\${TORCHDYNAMO_DISABLE:-1}\"
     export TORCHINDUCTOR_DISABLE=\"\${TORCHINDUCTOR_DISABLE:-1}\"
     export OMNIGIBSON_HEADLESS=\"$HEADLESS\"
+    affinity_cmd=\"$affinity_cmd\"
     if [[ -n \"$SIM_DISPLAY\" ]]; then
       export DISPLAY=\"$SIM_DISPLAY\"
     else
@@ -436,7 +532,7 @@ launch_eval() {
     if [[ \"$USE_CONDA_BEHAVIOR\" == \"1\" && -f \"$PREFERRED_CONDA_SH\" ]]; then
       source \"$PREFERRED_CONDA_SH\"
       conda activate \"$BEHAVIOR_ENV\"
-      exec python \"OmniGibson/omnigibson/learning/$EVAL_ENTRYPOINT\" \
+      exec \$affinity_cmd python \"OmniGibson/omnigibson/learning/$EVAL_ENTRYPOINT\" \
         policy=websocket \
         task.name=\"$TASK_NAME\" \
         log_path=\"$eval_out\" \
@@ -446,11 +542,12 @@ launch_eval() {
         model.port=\"$port\" \
         $max_steps_arg \
         $env_wrapper_arg \
+        $feature_args \
         $eval_custom_args \
         $EVAL_EXTRA_OVERRIDES \
         eval_instance_ids=\"[$ids_csv]\"
     else
-      exec \"$BEHAVIOR_PYTHON\" \"OmniGibson/omnigibson/learning/$EVAL_ENTRYPOINT\" \
+      exec \$affinity_cmd \"$BEHAVIOR_PYTHON\" \"OmniGibson/omnigibson/learning/$EVAL_ENTRYPOINT\" \
         policy=websocket \
         task.name=\"$TASK_NAME\" \
         log_path=\"$eval_out\" \
@@ -460,6 +557,7 @@ launch_eval() {
         model.port=\"$port\" \
         $max_steps_arg \
         $env_wrapper_arg \
+        $feature_args \
         $eval_custom_args \
         $EVAL_EXTRA_OVERRIDES \
         eval_instance_ids=\"[$ids_csv]\"
@@ -510,6 +608,7 @@ run_single_checkpoint_mode() {
   WORKER_GPUS=()
   resolve_gpu_pool WORKER_GPUS
   validate_gpu_memory
+  restore_warmup_cache_if_needed
 
   parse_csv_ints "$EVAL_INSTANCE_IDS" EVAL_IDS
   local eval_id_upper=9
@@ -533,6 +632,7 @@ run_single_checkpoint_mode() {
   log "Writing outputs to: $OUT_DIR"
   log "Task=$TASK_NAME Checkpoint=$CKPT_DIR"
   log "Worker GPUs=[${WORKER_GPUS[*]}] Eval IDs=[${EVAL_IDS[*]}]"
+  log "Optimization knobs: partial_scene_load=$PARTIAL_SCENE_LOAD max_steps_human_multiplier=$MAX_STEPS_HUMAN_MULTIPLIER video_on_replan_only=$VIDEO_ON_REPLAN_ONLY stuck_motion_window=$STUCK_MOTION_WINDOW stuck_min_steps=$STUCK_MIN_STEPS stuck_motion_threshold=$STUCK_MOTION_THRESHOLD render_viewer_camera=$RENDER_VIEWER_CAMERA gui_viewport_only=$GUI_VIEWPORT_ONLY viewer_width=$VIEWER_WIDTH viewer_height=$VIEWER_HEIGHT cpu_affinity_mode=$CPU_AFFINITY_MODE cpu_affinity_cpus_per_worker=$CPU_AFFINITY_CPUS_PER_WORKER restore_cache_before_eval=$RESTORE_CACHE_BEFORE_EVAL warmup_cache_tar=${WARMUP_CACHE_TAR:-<none>}"
 
   local i
   for ((i=0; i<${#WORKER_TO_IDS[@]}; i++)); do
@@ -543,6 +643,12 @@ run_single_checkpoint_mode() {
   if [[ "$DRY_RUN" == "true" ]]; then
     log "Dry-run only: no process started. OUT_DIR=$OUT_DIR"
     return 0
+  fi
+
+  if [[ "$STOP_STALE_ON_START" == "true" ]]; then
+    # Keep single-checkpoint behavior consistent with multi mode.
+    pkill -f 'scripts/serve_b1k.py|OmniGibson/omnigibson/learning/eval_custom.py|OmniGibson/omnigibson/learning/eval.py' >/dev/null 2>&1 || true
+    sleep 2
   fi
 
   SERVER_PIDS=()
@@ -557,7 +663,7 @@ run_single_checkpoint_mode() {
     [[ -z "${WORKER_TO_IDS[i]}" ]] && continue
     local worker_port=$((PORT_BASE + i))
     local server_log="$OUT_DIR/server_gpu${WORKER_GPUS[i]}_p${worker_port}.log"
-    launch_server "${WORKER_GPUS[i]}" "$worker_port" "$server_log"
+    launch_server "$i" "${WORKER_GPUS[i]}" "$worker_port" "$server_log"
     if [[ "$PROFILE" == "1" ]]; then
       (nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total --format=csv,noheader -l 1 -i "${WORKER_GPUS[i]}" >"$OUT_DIR/gpu${WORKER_GPUS[i]}_util.csv") &
       SMI_PIDS+=("$!")
@@ -581,7 +687,7 @@ run_single_checkpoint_mode() {
   for ((i=0; i<${#WORKER_TO_IDS[@]}; i++)); do
     [[ -z "${WORKER_TO_IDS[i]}" ]] && continue
     local worker_port=$((PORT_BASE + i))
-    launch_eval "${WORKER_GPUS[i]}" "$worker_port" "${WORKER_TO_IDS[i]}"
+    launch_eval "$i" "${WORKER_GPUS[i]}" "$worker_port" "${WORKER_TO_IDS[i]}"
     if (( i + 1 < ${#WORKER_TO_IDS[@]} )) && (( EVAL_LAUNCH_STAGGER > 0 )); then
       log "Staggering evaluator launch by ${EVAL_LAUNCH_STAGGER}s..."
       sleep "$EVAL_LAUNCH_STAGGER"
