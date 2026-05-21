@@ -6,6 +6,7 @@ import csv
 import importlib.util
 import json
 import os
+import random
 import shlex
 import socket
 import subprocess
@@ -122,6 +123,59 @@ def wait_for_server(port: int, timeout_s: int) -> None:
     raise TimeoutError(f"server not ready on port {port} after {timeout_s}s")
 
 
+def is_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", int(port)))
+        except OSError:
+            return False
+        return True
+
+
+def find_free_port(preferred: int, *, stride: int = 1, max_tries: int = 50) -> int:
+    preferred = int(preferred)
+    stride = max(1, int(stride))
+    for attempt in range(max(1, int(max_tries))):
+        candidate = preferred + attempt * stride
+        if is_port_free(candidate):
+            return candidate
+    raise RuntimeError(f"no free port found near {preferred} (stride={stride}, max_tries={max_tries})")
+
+
+def tail_text(path: Path, max_lines: int = 80) -> str:
+    if not path.exists():
+        return f"log file does not exist yet: {path}"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as exc:  # noqa: BLE001
+        return f"failed to read log tail from {path}: {exc}"
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join(["..."] + lines[-max_lines:])
+
+
+def wait_for_server_proc(*, proc: subprocess.Popen[str], port: int, timeout_s: int, log_file: Path) -> None:
+    start = time.time()
+    last_exc: Optional[BaseException] = None
+    while time.time() - start < timeout_s:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"server process exited before becoming ready (code={proc.returncode}). log: {log_file}\n"
+                + tail_text(log_file)
+            )
+        try:
+            wait_for_server(port, timeout_s=10)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            time.sleep(1.0)
+    raise TimeoutError(
+        f"server not ready on port {port} after {timeout_s}s. last_error={last_exc}. log: {log_file}\n"
+        + tail_text(log_file)
+    )
+
+
 def start_server(
     *,
     task_name: str,
@@ -132,7 +186,7 @@ def start_server(
     openpi_env: str,
     behavior_dir: Path,
     out_dir: Path,
-) -> subprocess.Popen[str]:
+) -> tuple[subprocess.Popen[str], Path]:
     log_file = out_dir / f"server_{task_name}_gpu{gpu_id}_p{port}.log"
     cmd = f"""
 set -euo pipefail
@@ -149,7 +203,7 @@ python scripts/serve_b1k.py --task_name={q(task_name)} --control_mode=receeding_
 """
     with log_file.open("w") as f:
         proc = subprocess.Popen(["bash", "-lc", cmd], stdout=f, stderr=subprocess.STDOUT, text=True, preexec_fn=os.setsid)
-    return proc
+    return proc, log_file
 
 
 def stop_process(proc: Optional[subprocess.Popen[str]]) -> None:
@@ -201,7 +255,8 @@ export PYTHONUNBUFFERED=1
 export PYTHONPATH={q(str(behavior_dir / 'joylo'))}:{q(str(behavior_dir / 'OmniGibson'))}:{q(str(behavior_dir / 'bddl3'))}${{PYTHONPATH:+:$PYTHONPATH}}
 export NO_PROXY="localhost,127.0.0.1,::1${{NO_PROXY:+,}}$NO_PROXY"
 export no_proxy="localhost,127.0.0.1,::1${{no_proxy:+,}}$no_proxy"
-export OMNIGIBSON_GPU_ID={q(gpu_id)}
+export CUDA_VISIBLE_DEVICES={q(gpu_id)}
+unset OMNIGIBSON_GPU_ID
 export OMNIGIBSON_HEADLESS=true
 export OMNIGIBSON_DISABLE_EXTENSION_REGISTRY=0
 export OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK=1
@@ -224,7 +279,8 @@ python OmniGibson/omnigibson/learning/eval_segment.py \\
   model.port={q(port)} \\
   env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper \\
   partial_scene_load=true \\
-  segment_predicate_window_mode=anytime \\
+  segment_predicate_window_mode=consecutive \\
+  segment_predicate_min_consecutive=3 \\
   segment_predicate_dump_trace=true
 """
     with segment_log.open("w") as f:
@@ -304,7 +360,12 @@ def write_reports(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-id", type=int, default=3)
-    parser.add_argument("--port-base", type=int, default=15020)
+    parser.add_argument(
+        "--port-base",
+        type=int,
+        default=0,
+        help="base port for task servers; 0 picks a random safe base automatically",
+    )
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--server-ready-timeout", type=int, default=900)
     parser.add_argument("--openpi-env", default="openpi-comet-nas")
@@ -317,6 +378,10 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "segment_eval_runs" / f"skill_trace_eval_{time.strftime('%Y%m%d_%H%M%S')}")
     parser.add_argument("--skills", default="move to,sweep surface,open door", help="comma-separated subset of skill names to run")
     args = parser.parse_args()
+
+    if int(args.port_base) <= 0:
+        rng = random.SystemRandom()
+        args.port_base = rng.randint(20000, 60000)
 
     target_skills = [s.strip() for s in args.skills.split(",") if s.strip()]
     print(f"Target skills for trace evaluation: {target_skills}")
@@ -333,11 +398,15 @@ def main() -> int:
 
     results: List[Dict[str, Any]] = []
     for task_offset, task_name in enumerate(sorted(grouped)):
-        port = args.port_base + task_offset
+        preferred_port = args.port_base + task_offset
+        port = find_free_port(preferred_port, stride=1, max_tries=200)
         server_proc: Optional[subprocess.Popen[str]] = None
+        server_log: Optional[Path] = None
         try:
             print(f"\n=== Starting server for task: {task_name} (port {port}) ===")
-            server_proc = start_server(
+            if port != preferred_port:
+                print(f"(preferred port {preferred_port} was busy; using {port})")
+            server_proc, server_log = start_server(
                 task_name=task_name,
                 port=port,
                 gpu_id=args.gpu_id,
@@ -347,7 +416,7 @@ def main() -> int:
                 behavior_dir=args.behavior_dir,
                 out_dir=args.out_dir,
             )
-            wait_for_server(port, args.server_ready_timeout)
+            wait_for_server_proc(proc=server_proc, port=port, timeout_s=args.server_ready_timeout, log_file=server_log)
             print(f"Server ready for {task_name}")
 
             for sample in grouped[task_name]:

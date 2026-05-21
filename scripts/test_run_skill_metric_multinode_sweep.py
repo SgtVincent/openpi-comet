@@ -695,6 +695,7 @@ def test_env_task_success_before_segment_success_is_attemptable_not_success() ->
         "rollout_attempted": True,
         "env_done_success": True,
         "rollout_terminated": True,
+        "metric_family": "grasp_release",
     }
 
     classes = mod.classify_result_row(row)
@@ -702,12 +703,14 @@ def test_env_task_success_before_segment_success_is_attemptable_not_success() ->
     assert classes["attemptable"] is True
     assert classes["policy_success_attemptable"] is False
     assert classes["env_task_success_before_segment_success"] is True
+    assert classes["env_task_success_grasp_release_review_needed"] is True
     assert classes["other_metric_unsatisfied"] is False
 
     summary = mod.summarize_result_rows([row])
     assert summary["attemptable_segment_count"] == 1
     assert summary["policy_success_attemptable_count"] == 0
     assert summary["env_task_success_before_segment_success_count"] == 1
+    assert summary["env_task_success_grasp_release_review_needed_count"] == 1
     assert summary["env_done_success_count"] == 1
 
 
@@ -759,6 +762,110 @@ def test_load_metrics_row_flattens_continued_env_success_telemetry(tmp_path) -> 
     assert row["first_env_terminated_step"] == 1
     assert row["first_env_done_success_step"] == 1
     assert row["env_task_success_before_segment_success"] is True
+
+
+def test_load_metrics_row_flattens_rawdata_restore_failure_and_fallback(tmp_path) -> None:
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "success": False,
+                "result_type": "pre_satisfied_start",
+                "restore": {
+                    "start": {
+                        "restored": True,
+                        "method": "robot",
+                        "debug": {
+                            "selected_method": "robot",
+                            "fallback_used": True,
+                            "rawdata": {
+                                "attempted": True,
+                                "restored": False,
+                                "reason": "exception",
+                            },
+                        },
+                    },
+                    "end": {
+                        "restored": True,
+                        "method": "rawdata",
+                        "debug": {
+                            "selected_method": "rawdata",
+                            "fallback_used": False,
+                            "rawdata": {
+                                "attempted": True,
+                                "restored": True,
+                            },
+                        },
+                    },
+                    "rollout_start": {
+                        "restored": True,
+                        "method": "cache",
+                        "debug": {
+                            "selected_method": "cache",
+                            "fallback_used": True,
+                            "rawdata": {
+                                "attempted": True,
+                                "restored": False,
+                                "reason": "exception",
+                            },
+                        },
+                    },
+                },
+                "rollout": {
+                    "rollout_attempted": False,
+                    "termination_reason": "pre_satisfied_start",
+                },
+            }
+        )
+    )
+
+    row = mod.load_metrics_row(
+        metrics_path,
+        sample={
+            "job_key": "push tray|make_pizza|00490010|063",
+            "skill": "push tray",
+            "task_name": "make_pizza",
+            "demo_id": "00490010",
+            "skill_idx": 63,
+            "frame_duration": [14649, 14754],
+        },
+        runtime_ok=True,
+        returncode=0,
+        segment_log=tmp_path / "segment_eval.log",
+    )
+
+    assert row["restore_start_method"] == "robot"
+    assert row["restore_end_method"] == "rawdata"
+    assert row["restore_rollout_start_method"] == "cache"
+    assert row["rawdata_restore_start_failed"] is True
+    assert row["rawdata_restore_end_failed"] is False
+    assert row["rawdata_restore_rollout_start_failed"] is True
+    assert row["rawdata_restore_start_fallback"] is True
+    assert row["rawdata_restore_rollout_start_fallback"] is True
+    assert row["rawdata_restore_failure_count"] == 2
+    assert row["rawdata_restore_fallback_count"] == 2
+    assert row["rawdata_restore_failed"] is True
+    assert row["rawdata_restore_fallback"] is True
+
+
+def test_classify_result_row_marks_rawdata_restore_review_needed() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": False,
+        "result_type": "pre_satisfied_start",
+        "rawdata_restore_failed": True,
+        "rawdata_restore_fallback": True,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["rawdata_restore_failed"] is True
+    assert classes["rawdata_restore_fallback"] is True
+    assert classes["rawdata_restore_review_needed"] is True
+    assert summary["rawdata_restore_failed_count"] == 1
+    assert summary["rawdata_restore_fallback_count"] == 1
+    assert summary["rawdata_restore_review_needed_count"] == 1
 
 
 def test_compare_partial_summary_matches_new_review_and_transition_schema(tmp_path) -> None:

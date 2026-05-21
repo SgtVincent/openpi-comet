@@ -7,6 +7,31 @@ cd "${REPO_ROOT}"
 
 source /mnt/bn/mllm-data-yg/chenjunting/miniconda3/etc/profile.d/conda.sh
 conda activate openpi-comet-nas
+ensure_yaml_available() {
+  if python - <<'PY' >/dev/null 2>&1
+import importlib.util
+raise SystemExit(0 if importlib.util.find_spec("yaml") else 1)
+PY
+  then
+    return 0
+  fi
+
+  echo "[bootstrap] missing python module 'yaml' in env ${CONDA_DEFAULT_ENV:-unknown}; attempting repair" >&2
+  if conda install -y pyyaml; then
+    :
+  elif python -m pip install PyYAML; then
+    :
+  else
+    echo "[bootstrap] failed to install PyYAML" >&2
+    return 1
+  fi
+
+  python - <<'PY'
+import yaml
+print(f"[bootstrap] PyYAML ready: {yaml.__file__}")
+PY
+}
+ensure_yaml_available
 export PYTHONPATH="/mnt/bn/mllm-data-yg/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python:$PYTHONPATH"
 export LD_LIBRARY_PATH="/mnt/bn/mllm-data-yg/chenjunting/miniconda3/envs/openpi-comet-nas/lib:$LD_LIBRARY_PATH"
 

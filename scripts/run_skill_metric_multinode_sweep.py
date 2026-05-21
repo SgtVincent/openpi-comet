@@ -249,6 +249,47 @@ def has_meaningful_policy_caused_transition(row: Dict[str, Any]) -> bool:
     return first_hit >= min_steps
 
 
+def _restore_entry_rawdata_failed(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    debug = entry.get("debug")
+    rawdata = debug.get("rawdata") if isinstance(debug, dict) else None
+    return bool(isinstance(rawdata, dict) and rawdata.get("attempted") and not rawdata.get("restored"))
+
+
+def _restore_entry_rawdata_fallback(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    debug = entry.get("debug")
+    if not isinstance(debug, dict):
+        return False
+    rawdata = debug.get("rawdata")
+    return bool(
+        isinstance(rawdata, dict)
+        and rawdata.get("attempted")
+        and not rawdata.get("restored")
+        and debug.get("selected_method") in {"cache", "robot"}
+    )
+
+
+def _restore_entry_selected_method(entry: Any) -> Optional[str]:
+    if not isinstance(entry, dict):
+        return None
+    debug = entry.get("debug")
+    if isinstance(debug, dict) and debug.get("selected_method") is not None:
+        return str(debug.get("selected_method"))
+    method = entry.get("method")
+    return None if method is None else str(method)
+
+
+def is_env_task_success_grasp_release_review_needed(row: Dict[str, Any]) -> bool:
+    return (
+        row.get("result_type") == RESULT_ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS
+        and row.get("metric_family") == "grasp_release"
+        and bool(row.get("attemptable", False))
+    )
+
+
 def q(text: Any) -> str:
     return shlex.quote(str(text))
 
@@ -856,6 +897,10 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
         metrics = json.load(f)
     rollout = metrics.get("rollout", {})
     predicate_debug = metrics.get("predicate_debug", {})
+    restore = metrics.get("restore", {}) if isinstance(metrics.get("restore"), dict) else {}
+    restore_start = restore.get("start") if isinstance(restore.get("start"), dict) else {}
+    restore_end = restore.get("end") if isinstance(restore.get("end"), dict) else {}
+    restore_rollout_start = restore.get("rollout_start") if isinstance(restore.get("rollout_start"), dict) else {}
     env_terminal_debug = rollout.get("env_terminal_debug")
     env_termination_reason = rollout.get("env_termination_reason")
     if env_termination_reason is None and isinstance(env_terminal_debug, dict):
@@ -930,9 +975,36 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
         "rollout_start_all_satisfied": rollout.get("start_all_satisfied"),
         "rollout_require_unsatisfied_at_start": rollout.get("require_unsatisfied_at_start"),
         "rollout_max_steps": rollout.get("max_steps"),
+        "restore_start_method": _restore_entry_selected_method(restore_start),
+        "restore_end_method": _restore_entry_selected_method(restore_end),
+        "restore_rollout_start_method": _restore_entry_selected_method(restore_rollout_start),
+        "rawdata_restore_start_failed": _restore_entry_rawdata_failed(restore_start),
+        "rawdata_restore_end_failed": _restore_entry_rawdata_failed(restore_end),
+        "rawdata_restore_rollout_start_failed": _restore_entry_rawdata_failed(restore_rollout_start),
+        "rawdata_restore_start_fallback": _restore_entry_rawdata_fallback(restore_start),
+        "rawdata_restore_end_fallback": _restore_entry_rawdata_fallback(restore_end),
+        "rawdata_restore_rollout_start_fallback": _restore_entry_rawdata_fallback(restore_rollout_start),
         "metrics_path": str(metrics_path),
         "segment_log": str(segment_log),
     }
+    row["rawdata_restore_failure_count"] = sum(
+        int(row[key])
+        for key in (
+            "rawdata_restore_start_failed",
+            "rawdata_restore_end_failed",
+            "rawdata_restore_rollout_start_failed",
+        )
+    )
+    row["rawdata_restore_fallback_count"] = sum(
+        int(row[key])
+        for key in (
+            "rawdata_restore_start_fallback",
+            "rawdata_restore_end_fallback",
+            "rawdata_restore_rollout_start_fallback",
+        )
+    )
+    row["rawdata_restore_failed"] = row["rawdata_restore_failure_count"] > 0
+    row["rawdata_restore_fallback"] = row["rawdata_restore_fallback_count"] > 0
     row["short_video_problem"] = is_short_video_problem_row(row)
     row["transfer_pose_proxy_success_unconfirmed"] = is_transfer_pose_proxy_success_unconfirmed(row)
     row["contact_effect_proxy_success_unconfirmed"] = is_contact_effect_proxy_success_unconfirmed(row)
@@ -1252,6 +1324,8 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
     )
     metric_invalid_missing_object = result_type == RESULT_METRIC_INVALID_MISSING_OBJECT
     metric_invalid = str(result_type or "").startswith(METRIC_INVALID_PREFIX)
+    rawdata_restore_failed = bool(row.get("rawdata_restore_failed"))
+    rawdata_restore_fallback = bool(row.get("rawdata_restore_fallback"))
     rollout_attempted = row.get("rollout_attempted")
     if rollout_attempted is None:
         policy_attempted = result_type in ATTEMPTABLE_RESULT_TYPES
@@ -1285,6 +1359,10 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
     env_task_success_before_segment_success = (
         attemptable and result_type == RESULT_ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS and not bool(row.get("success"))
     )
+    env_task_success_grasp_release_review_needed = runtime_pass and is_env_task_success_grasp_release_review_needed(
+        {**row, "attemptable": attemptable}
+    )
+    rawdata_restore_review_needed = runtime_pass and (rawdata_restore_failed or rawdata_restore_fallback)
     metric_unsatisfied_attemptable = attemptable and not policy_success_attemptable
     other_metric_unsatisfied = (
         metric_unsatisfied_attemptable
@@ -1300,6 +1378,9 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         "pre_satisfied_start": runtime_pass and pre_satisfied_start,
         "metric_invalid": runtime_pass and metric_invalid,
         "metric_invalid_missing_object": runtime_pass and metric_invalid_missing_object,
+        "rawdata_restore_failed": runtime_pass and rawdata_restore_failed,
+        "rawdata_restore_fallback": runtime_pass and rawdata_restore_fallback,
+        "rawdata_restore_review_needed": rawdata_restore_review_needed,
         "attemptable": attemptable,
         "policy_success_attemptable": policy_success_attemptable,
         "policy_success_clean_attemptable": policy_success_clean_attemptable,
@@ -1329,6 +1410,7 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         "truncated": truncated,
         "env_terminated_metric_unsatisfied": env_terminated_metric_unsatisfied,
         "env_task_success_before_segment_success": env_task_success_before_segment_success,
+        "env_task_success_grasp_release_review_needed": env_task_success_grasp_release_review_needed,
         "metric_unsatisfied_attemptable": metric_unsatisfied_attemptable,
         "other_metric_unsatisfied": other_metric_unsatisfied,
     }
@@ -1342,6 +1424,9 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     pre_satisfied_start = sum(int(c["pre_satisfied_start"]) for c in classes)
     metric_invalid = sum(int(c["metric_invalid"]) for c in classes)
     metric_invalid_missing_object = sum(int(c["metric_invalid_missing_object"]) for c in classes)
+    rawdata_restore_failed = sum(int(c["rawdata_restore_failed"]) for c in classes)
+    rawdata_restore_fallback = sum(int(c["rawdata_restore_fallback"]) for c in classes)
+    rawdata_restore_review_needed = sum(int(c["rawdata_restore_review_needed"]) for c in classes)
     attemptable = sum(int(c["attemptable"]) for c in classes)
     policy_success_attemptable = sum(int(c["policy_success_attemptable"]) for c in classes)
     policy_success_clean_attemptable = sum(int(c["policy_success_clean_attemptable"]) for c in classes)
@@ -1387,6 +1472,9 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     env_task_success_before_segment_success = sum(
         int(c["env_task_success_before_segment_success"]) for c in classes
     )
+    env_task_success_grasp_release_review_needed = sum(
+        int(c["env_task_success_grasp_release_review_needed"]) for c in classes
+    )
     other_unsat = sum(int(c["other_metric_unsatisfied"]) for c in classes)
     success_raw = sum(int(bool(row.get("success"))) for row in rows)
     env_done_success_count = sum(int(row.get("env_done_success") is True) for row in rows)
@@ -1416,6 +1504,9 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "pre_satisfied_start_count": pre_satisfied_start,
         "metric_invalid_count": metric_invalid,
         "metric_invalid_missing_object_count": metric_invalid_missing_object,
+        "rawdata_restore_failed_count": rawdata_restore_failed,
+        "rawdata_restore_fallback_count": rawdata_restore_fallback,
+        "rawdata_restore_review_needed_count": rawdata_restore_review_needed,
         "attemptable_segment_count": attemptable,
         "policy_success_attemptable_count": policy_success_attemptable,
         "policy_success_attemptable_rate": policy_success_attemptable / attemptable if attemptable else 0.0,
@@ -1441,6 +1532,7 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "truncated_count": truncated,
         "env_terminated_metric_unsatisfied_count": env_unsat,
         "env_task_success_before_segment_success_count": env_task_success_before_segment_success,
+        "env_task_success_grasp_release_review_needed_count": env_task_success_grasp_release_review_needed,
         "other_metric_unsatisfied_count": other_unsat,
         "success_count_raw": success_raw,
         "success_rate_raw_completed": success_raw / total if total else 0.0,
@@ -1490,6 +1582,9 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
     lines.append(f"- pre_satisfied_start: `{summary['pre_satisfied_start']}`")
     lines.append(f"- metric_invalid: `{summary.get('metric_invalid', 0)}`")
     lines.append(f"- metric_invalid_missing_object: `{summary.get('metric_invalid_missing_object', 0)}`")
+    lines.append(f"- rawdata_restore_failed: `{summary.get('rawdata_restore_failed', 0)}`")
+    lines.append(f"- rawdata_restore_fallback: `{summary.get('rawdata_restore_fallback', 0)}`")
+    lines.append(f"- rawdata_restore_review_needed: `{summary.get('rawdata_restore_review_needed', 0)}`")
     lines.append(f"- attemptable_segments: `{summary['attemptable_segments']}`")
     lines.append(f"- policy_success_attemptable: `{summary['policy_success_attemptable']}`")
     lines.append(f"- policy_success_attemptable_rate: `{summary['policy_success_attemptable_rate']:.4f}`")
@@ -1543,6 +1638,9 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
     lines.append(f"- env_terminated_metric_unsatisfied: `{summary['env_terminated_metric_unsatisfied']}`")
     lines.append(
         f"- env_task_success_before_segment_success: `{summary.get('env_task_success_before_segment_success', 0)}`"
+    )
+    lines.append(
+        f"- env_task_success_grasp_release_review_needed: `{summary.get('env_task_success_grasp_release_review_needed', 0)}`"
     )
     lines.append(f"- env_done_success_count: `{summary.get('env_done_success_count', 0)}`")
     lines.append(f"- rollout_terminated_count: `{summary.get('rollout_terminated_count', 0)}`")
@@ -1653,6 +1751,9 @@ def merge_results(args: argparse.Namespace) -> int:
         "pre_satisfied_start": top_summary["pre_satisfied_start_count"],
         "metric_invalid": top_summary["metric_invalid_count"],
         "metric_invalid_missing_object": top_summary["metric_invalid_missing_object_count"],
+        "rawdata_restore_failed": top_summary["rawdata_restore_failed_count"],
+        "rawdata_restore_fallback": top_summary["rawdata_restore_fallback_count"],
+        "rawdata_restore_review_needed": top_summary["rawdata_restore_review_needed_count"],
         "attemptable_segments": top_summary["attemptable_segment_count"],
         "policy_success_attemptable": top_summary["policy_success_attemptable_count"],
         "policy_success_attemptable_rate": top_summary["policy_success_attemptable_rate"],
@@ -1696,6 +1797,9 @@ def merge_results(args: argparse.Namespace) -> int:
         "truncated": top_summary["truncated_count"],
         "env_terminated_metric_unsatisfied": top_summary["env_terminated_metric_unsatisfied_count"],
         "env_task_success_before_segment_success": top_summary["env_task_success_before_segment_success_count"],
+        "env_task_success_grasp_release_review_needed": top_summary[
+            "env_task_success_grasp_release_review_needed_count"
+        ],
         "other_metric_unsatisfied": top_summary["other_metric_unsatisfied_count"],
         "env_done_success_count": top_summary["env_done_success_count"],
         "rollout_terminated_count": top_summary["rollout_terminated_count"],
@@ -1765,6 +1869,20 @@ def merge_results(args: argparse.Namespace) -> int:
             "first_env_terminated_step",
             "first_env_done_success_step",
             "env_task_success_before_segment_success",
+            "env_task_success_grasp_release_review_needed",
+            "restore_start_method",
+            "restore_end_method",
+            "restore_rollout_start_method",
+            "rawdata_restore_start_failed",
+            "rawdata_restore_end_failed",
+            "rawdata_restore_rollout_start_failed",
+            "rawdata_restore_start_fallback",
+            "rawdata_restore_end_fallback",
+            "rawdata_restore_rollout_start_fallback",
+            "rawdata_restore_failure_count",
+            "rawdata_restore_fallback_count",
+            "rawdata_restore_failed",
+            "rawdata_restore_fallback",
             "env_terminal_debug_json",
             "rollout_start_all_satisfied",
             "rollout_require_unsatisfied_at_start",
@@ -1792,6 +1910,9 @@ def merge_results(args: argparse.Namespace) -> int:
             "pre_satisfied_start_count",
             "metric_invalid_count",
             "metric_invalid_missing_object_count",
+            "rawdata_restore_failed_count",
+            "rawdata_restore_fallback_count",
+            "rawdata_restore_review_needed_count",
             "attemptable_segment_count",
             "policy_success_attemptable_count",
             "policy_success_attemptable_rate",
@@ -1817,6 +1938,7 @@ def merge_results(args: argparse.Namespace) -> int:
             "truncated_count",
             "env_terminated_metric_unsatisfied_count",
             "env_task_success_before_segment_success_count",
+            "env_task_success_grasp_release_review_needed_count",
             "other_metric_unsatisfied_count",
             "success_count_raw",
             "success_rate_raw_completed",
@@ -1844,6 +1966,9 @@ def merge_results(args: argparse.Namespace) -> int:
             "pre_satisfied_start_count",
             "metric_invalid_count",
             "metric_invalid_missing_object_count",
+            "rawdata_restore_failed_count",
+            "rawdata_restore_fallback_count",
+            "rawdata_restore_review_needed_count",
             "attemptable_segment_count",
             "policy_success_attemptable_count",
             "policy_success_attemptable_rate",
@@ -1869,6 +1994,7 @@ def merge_results(args: argparse.Namespace) -> int:
             "truncated_count",
             "env_terminated_metric_unsatisfied_count",
             "env_task_success_before_segment_success_count",
+            "env_task_success_grasp_release_review_needed_count",
             "other_metric_unsatisfied_count",
             "success_count_raw",
             "success_rate_raw_completed",
@@ -1891,6 +2017,9 @@ def merge_results(args: argparse.Namespace) -> int:
             "segment_count",
             "runtime_pass_count",
             "runtime_fail_count",
+            "rawdata_restore_failed_count",
+            "rawdata_restore_fallback_count",
+            "rawdata_restore_review_needed_count",
             "attemptable_segment_count",
             "policy_success_attemptable_count",
             "policy_success_clean_attemptable_count",
@@ -1915,6 +2044,7 @@ def merge_results(args: argparse.Namespace) -> int:
             "truncated_count",
             "env_terminated_metric_unsatisfied_count",
             "env_task_success_before_segment_success_count",
+            "env_task_success_grasp_release_review_needed_count",
             "other_metric_unsatisfied_count",
             "success_count_raw",
         ],

@@ -67,6 +67,7 @@ BEHAVIOR_PYTHONPATH="${BEHAVIOR_PYTHONPATH:-}"
 BEHAVIOR_DIR="${BEHAVIOR_DIR:-/home/ubuntu/repo/BEHAVIOR-1K}"
 
 OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_b1k-base}"
+POLICY_BACKEND="${POLICY_BACKEND:-auto}"
 CONTROL_MODE="${CONTROL_MODE:-receeding_horizon}"
 MAX_LEN="${MAX_LEN:-32}"
 
@@ -264,6 +265,7 @@ launch_server() {
         --control_mode=\"$CONTROL_MODE\" \
         --max_len=\"$MAX_LEN\" \
         --port=\"$port\" \
+        --policy-backend=\"$POLICY_BACKEND\" \
         policy:checkpoint \
         --policy.config=\"$OPENPI_CONFIG_NAME\" \
         --policy.dir=\"$CKPT_DIR\"
@@ -273,6 +275,7 @@ launch_server() {
         --control_mode=\"$CONTROL_MODE\" \
         --max_len=\"$MAX_LEN\" \
         --port=\"$port\" \
+        --policy-backend=\"$POLICY_BACKEND\" \
         policy:checkpoint \
         --policy.config=\"$OPENPI_CONFIG_NAME\" \
         --policy.dir=\"$CKPT_DIR\"
@@ -295,7 +298,8 @@ launch_segment_worker() {
     fi
     export NO_PROXY=\"localhost,127.0.0.1,::1\${NO_PROXY:+,\$NO_PROXY}\"
     export no_proxy=\"localhost,127.0.0.1,::1\${no_proxy:+,\$no_proxy}\"
-    export OMNIGIBSON_GPU_ID=\"$gpu\"
+    export CUDA_VISIBLE_DEVICES=\"$gpu\"
+    unset OMNIGIBSON_GPU_ID
     export OMNIGIBSON_DATA_PATH=\"\${OMNIGIBSON_DATA_PATH:-$BEHAVIOR_DIR/datasets}\"
     export OMNIGIBSON_DISABLE_EXTENSION_REGISTRY=\"$OMNIGIBSON_DISABLE_EXTENSION_REGISTRY\"
     export OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK=\"$OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK\"

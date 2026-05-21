@@ -125,7 +125,7 @@ if [[ -z "${LOCAL_GPU_IDS:-}" ]]; then
   LOCAL_GPU_IDS="$(seq 0 $((GPUS_PER_NODE - 1)) | paste -sd, -)"
 fi
 
-CONFIG_NAME="${CONFIG_NAME:-pi05_b1k_skill-pt50_pretrain_lr1e-4_2ep}"
+CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-pt50_cs32_bs64_lr2.5e-5_step50k}"
 CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints/openpi_comet/pi05-b1kpt50-cs32}"
 BEHAVIOR_DIR="${BEHAVIOR_DIR:-/mnt/bn/navigation-hl/mlx/users/chenjunting/repo/BEHAVIOR-1K}"
 DEMO_DATA_PATH="${DEMO_DATA_PATH:-/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos}"
