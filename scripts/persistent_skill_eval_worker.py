@@ -435,8 +435,11 @@ class PersistentWorker:
             f"model.expected_task_prompt_sha256={self._server_identity['task_prompt_sha256']}",
             f"model.expected_server_run_id={self._server_identity['server_run_id']}",
             f"model.expected_server_token={self._server_identity['server_token']}",
-            "env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper",
-            "partial_scene_load=true",
+            f"env_wrapper._target_={self.args.env_wrapper_target}",
+            f"partial_scene_load={'true' if self.args.partial_scene_load else 'false'}",
+            f"render_viewer_camera={'true' if self.args.render_viewer_camera else 'false'}",
+            f"gui_viewport_only={'true' if self.args.gui_viewport_only else 'false'}",
+            f"skip_intermediate_obs_in_chunk={'true' if self.args.skip_intermediate_obs_in_chunk else 'false'}",
             "segment_predicate_window_mode=consecutive",
             "segment_predicate_min_consecutive=3",
             f"segment_predicate_dump_trace={'true' if self.args.segment_predicate_dump_trace else 'false'}",
@@ -799,6 +802,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--launcher-pid", default=0, type=int)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--write-video", action="store_true")
+    parser.add_argument("--env-wrapper-target", default="omnigibson.learning.wrappers.RGBWrapper")
+    parser.add_argument("--partial-scene-load", action="store_true")
+    parser.add_argument("--render-viewer-camera", action="store_true")
+    parser.add_argument("--gui-viewport-only", action="store_true")
+    parser.add_argument("--skip-intermediate-obs-in-chunk", action="store_true")
     parser.add_argument("--segment-predicate-dump-trace", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)

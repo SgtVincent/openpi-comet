@@ -2216,7 +2216,7 @@ python -u {q(str(args.persistent_worker_script))} \\
   --behavior-dir {q(args.behavior_dir)} \\
   --demo-data-path {q(args.demo_data_path)} \\
   --rawdata-path {q(args.rawdata_path)} \\
-  --launcher-pid {q(os.getpid())}{' --dry-run' if args.dry_run else ''}{' --write-video' if args.write_video else ''}{' --segment-predicate-dump-trace' if args.segment_predicate_dump_trace else ''}{' --resume' if args.resume else ''}
+  --launcher-pid {q(os.getpid())}{' --dry-run' if args.dry_run else ''}{' --write-video' if args.write_video else ''}{' --partial-scene-load' if args.partial_scene_load else ''}{' --render-viewer-camera' if args.render_viewer_camera else ''}{' --gui-viewport-only' if args.gui_viewport_only else ''}{' --skip-intermediate-obs-in-chunk' if args.skip_intermediate_obs_in_chunk else ''} --env-wrapper-target {q(args.env_wrapper_target)}{' --segment-predicate-dump-trace' if args.segment_predicate_dump_trace else ''}{' --resume' if args.resume else ''}
 """
     env = _persistent_worker_env(args, gpu_id=gpu_id, port=port)
     with worker_log.open("a") as f:
@@ -2278,6 +2278,15 @@ def run_persistent_worker_inplace(args: argparse.Namespace) -> int:
         cmd.append("--dry-run")
     if args.write_video:
         cmd.append("--write-video")
+    if args.partial_scene_load:
+        cmd.append("--partial-scene-load")
+    if args.render_viewer_camera:
+        cmd.append("--render-viewer-camera")
+    if args.gui_viewport_only:
+        cmd.append("--gui-viewport-only")
+    if args.skip_intermediate_obs_in_chunk:
+        cmd.append("--skip-intermediate-obs-in-chunk")
+    cmd.extend(["--env-wrapper-target", args.env_wrapper_target])
     if args.segment_predicate_dump_trace:
         cmd.append("--segment-predicate-dump-trace")
     if args.resume:
@@ -2334,6 +2343,7 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                 "written": int(plan["written"]),
                 "shutdown_appended": False,
                 "restart_count": 0,
+                "last_restart_at": 0.0,
             }
 
         heartbeat_timeout_s = max(
@@ -2363,7 +2373,11 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                         task_reload_timeout_s=float(args.persistent_worker_task_reload_timeout),
                         segment_timeout_s=float(args.persistent_worker_segment_timeout),
                     )
-                    if proc.poll() is None and restart_reason:
+                    if (
+                        proc.poll() is None
+                        and restart_reason
+                        and now - float(child.get("last_restart_at", 0.0)) >= heartbeat_timeout_s
+                    ):
                         print(
                             f"[launcher-persistent] worker {rank:03d} stalled ({restart_reason}); restarting. "
                             f"status={summary}",
@@ -2382,6 +2396,7 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                                 "log_path": worker_log,
                                 "jobs_path": jobs_path,
                                 "restart_count": int(child["restart_count"]) + 1,
+                                "last_restart_at": now,
                             }
                         )
                         continue
@@ -2405,6 +2420,7 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                                 "log_path": worker_log,
                                 "jobs_path": jobs_path,
                                 "restart_count": int(child["restart_count"]) + 1,
+                                "last_restart_at": now,
                             }
                         )
                         all_done = False
@@ -2518,6 +2534,15 @@ def launch_node(args: argparse.Namespace) -> int:
                 cmd.append("--dry-run")
             if args.write_video:
                 cmd.append("--write-video")
+            if args.partial_scene_load:
+                cmd.append("--partial-scene-load")
+            if args.render_viewer_camera:
+                cmd.append("--render-viewer-camera")
+            if args.gui_viewport_only:
+                cmd.append("--gui-viewport-only")
+            if args.skip_intermediate_obs_in_chunk:
+                cmd.append("--skip-intermediate-obs-in-chunk")
+            cmd.extend(["--env-wrapper-target", args.env_wrapper_target])
             if args.segment_predicate_dump_trace:
                 cmd.append("--segment-predicate-dump-trace")
             if args.resume:
@@ -2617,6 +2642,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-total-jobs", type=int, default=0, help="0 means unlimited")
     parser.add_argument("--dry-run", action="store_true", help="pass dry_run=true to eval_segment.py")
     parser.add_argument("--write-video", action="store_true")
+    parser.add_argument("--partial-scene-load", action="store_true")
+    parser.add_argument("--render-viewer-camera", action="store_true")
+    parser.add_argument("--gui-viewport-only", action="store_true")
+    parser.add_argument("--skip-intermediate-obs-in-chunk", action="store_true")
+    parser.add_argument("--env-wrapper-target", default="omnigibson.learning.wrappers.RGBWrapper")
     parser.add_argument("--segment-predicate-dump-trace", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--rebuild-manifest", action="store_true")
