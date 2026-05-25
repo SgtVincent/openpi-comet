@@ -213,7 +213,9 @@ python scripts/train_dist.py ${config_name} --exp_name=${exp_name} --overwrite
 
 To perform RFT, you need to first deploy the finetuned checkpoint, and then rollout the episodes in the BEHAVIOR-1K Simulator. We also observe that the `pose perturbator` helps improve the robustness of the RFT Algorithm. 
 
-1. Copy the files in `openpi-comet/src/behavior/learning` to `BEHAVIOR-1K/OmniGibson/omnigibson/learning`. Be careful to the latest commit of the BEHAVIOR-1K repo and replace the files in the CheckList:
+1. Use a recent `BEHAVIOR-1K` checkout whose `main` already includes the merged `skill_eval` eval pipeline. In that setup, the behavior-side files below are already part of `BEHAVIOR-1K` and can be used directly.
+
+   If you are on an older `BEHAVIOR-1K` revision that predates the merged eval pipeline, manually sync the files in `openpi-comet/src/behavior/learning` to `BEHAVIOR-1K/OmniGibson/omnigibson/learning` as a compatibility fallback:
 
 | Name | Description |
 |-------------------------------|-------------------------------------------------------------------------------------------------------|
@@ -266,7 +268,7 @@ After finetuning, you can run evaluation by following the steps below:
 
 2. Run the evaluation on BEHAVIOR:
 
-    Assume you have behavior env installed (check https://github.com/StanfordVL/BEHAVIOR-1K for more details), run the following command within the BEHAVIOR-1K directory:
+    Assume you have behavior env installed and are using a recent `BEHAVIOR-1K` `main` that already contains the stable eval pipeline (check https://github.com/StanfordVL/BEHAVIOR-1K for more details). Then run the following command within the `BEHAVIOR-1K` directory:
     
     ```bash
     conda activate behavior 
