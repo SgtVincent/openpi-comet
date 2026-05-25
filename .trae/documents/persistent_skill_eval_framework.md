@@ -101,7 +101,7 @@ gm.USE_GPU_DYNAMICS = False
    - `build_server_identity(...)` 生成 `server_run_id` / `server_token` / `task_prompt_sha256`；
    - `start_server(...)` 拉起 `serve_b1k.py`，日志写到 `server_logs/`；
    - `wait_for_server_proc(...)` 用 metadata-bearing health 检查（不是裸 healthz）。
-4. 用 `_build_eval_cfg(...)` 通过 `hydra.initialize_config_dir + compose` 构造 `eval_segment_config.yaml`，注入 `model.expected_*` 四元组（防止打到错的 server）和 `partial_scene_load=true`。
+4. 用 `_build_eval_cfg(...)` 通过 `hydra.initialize_config_dir + compose` 构造 `eval_segment_config.yaml`，注入 `model.expected_*` 四元组（防止打到错的 server）以及当前 launcher 传入的 runtime knobs（默认 `partial_scene_load=false`、`skip_intermediate_obs_in_chunk=true`）。
 5. `SubTaskEvaluator(cfg).__enter__()` 加载场景 + task instance；之后这一份 evaluator 会被同 task 的所有 segment 复用。
 
 「同一个 task 内的所有 segment 复用 evaluator」就是节省 setup 的核心机制。
@@ -210,4 +210,3 @@ OpenSpec 任务 5 已经完成：
 | `openpi-comet/scripts/run_skill_metric_multinode_sweep.py`         | Launcher，新增 `--mode launch-persistent` / `--mode persistent-worker` 与 `materialize_persistent_jobs()` |
 | `openpi-comet/scripts/run_skill_eval_single_node_8gpu.sh`          | 单机 8 卡入口；`EVAL_MODE` 选 persistent / legacy                                                            |
 | `openspec/changes/persistent-skill-eval-framework/`                | 设计文档与任务清单（proposal / design / spec / tasks）                                                           |
-

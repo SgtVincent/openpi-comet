@@ -108,6 +108,23 @@ uv pip install -e bddl3
 uv pip install -e OmniGibson[eval]
 ```
 
+## Repo-local Guides
+
+Besides this README, the repository keeps a small set of operator-facing guides under [`openpi-comet/.trae/documents/`](.trae/documents/):
+
+| 你要做什么 | 直接看这里 |
+| --- | --- |
+| 先了解仓库结构、训练 / 数据 / eval 入口 | [`project_overview.md`](.trae/documents/project_overview.md) |
+| 找最常用的 BEHAVIOR eval 启动命令 | [`eval-quick-reference.md`](.trae/documents/eval-quick-reference.md) |
+| 理解 launcher、多机、persistent worker 的编排方式 | [`behavior_eval_orchestration_guide.md`](.trae/documents/behavior_eval_orchestration_guide.md) |
+| 理解 persistent skill eval 的实现与复用逻辑 | [`persistent_skill_eval_framework.md`](.trae/documents/persistent_skill_eval_framework.md) |
+
+如果你只是想先把基本功能跑起来，建议按这个顺序阅读：
+
+1. 先看本 README 的安装与训练 / rollout / evaluation 章节；
+2. 跑 BEHAVIOR eval 时，再看 [`eval-quick-reference.md`](.trae/documents/eval-quick-reference.md) 抄默认命令；
+3. 需要改 launcher 参数、排查 persistent worker、多机调度时，再看 [`behavior_eval_orchestration_guide.md`](.trae/documents/behavior_eval_orchestration_guide.md)。
+
 ## Model Zoo
 
 We provide a suite of base VLA model checkpoints trained on 1.5K hours robot trajectories, ideal for BEHAVIOR-1K fine-tuning.
@@ -294,4 +311,3 @@ To update submodules to latest remote branch:
 ```bash
 git submodule update --remote --merge
 ```
-

@@ -36,6 +36,7 @@ import logging
 import os
 import signal
 import shlex
+import site
 import subprocess
 import sys
 import threading
@@ -43,6 +44,36 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+def _strip_user_site_packages() -> None:
+    """Keep user-level site-packages from shadowing the conda env.
+
+    Isaac Sim bundles some Python deps (e.g. ``cffi``) inside its extension cache.
+    If the process also sees ``~/.local`` user-site packages, Python can mix the
+    pure-Python package from one location with the binary extension from another,
+    which breaks task loading with version-mismatch errors.
+    """
+
+    os.environ.setdefault("PYTHONNOUSERSITE", "1")
+    candidates = set()
+    try:
+        candidates.update(site.getusersitepackages() if isinstance(site.getusersitepackages(), list) else [site.getusersitepackages()])
+    except Exception:  # noqa: BLE001
+        pass
+    candidates.add(os.path.expanduser(f"~/.local/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"))
+    norm_candidates = {os.path.realpath(path) for path in candidates if path}
+    if not norm_candidates:
+        return
+
+    original = list(sys.path)
+    sys.path[:] = [path for path in sys.path if os.path.realpath(path) not in norm_candidates]
+    if original != sys.path:
+        logger = logging.getLogger("persistent_skill_eval_worker")
+        logger.info("Stripped user site-packages from sys.path: %s", sorted(norm_candidates))
+
+
+_strip_user_site_packages()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "scripts") not in sys.path:
@@ -104,6 +135,24 @@ def _ensure_isaac_env() -> None:
             return
 
 
+def _preload_isaac_modules() -> None:
+    """Best-effort import of Isaac runtime modules once env vars are ready.
+
+    Some OmniGibson codepaths access ``omnigibson.lazy.carb`` during simulator
+    startup. Pre-importing ``carb`` after ``ISAAC_PATH`` / ``EXP_PATH`` are set
+    keeps those accesses on the happy path and avoids depending on a fragile
+    first-touch ordering during persistent worker restarts.
+    """
+
+    try:
+        import isaacsim  # noqa: F401
+        import carb  # noqa: F401
+
+        logger.info("Preloaded Isaac modules: isaacsim, carb")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to preload Isaac runtime modules: %s", exc)
+
+
 def _reexec_in_behavior_env(args: argparse.Namespace, argv: List[str], *, force: bool = False) -> None:
     """Re-exec this worker under the requested BEHAVIOR / OmniGibson env.
 
@@ -153,6 +202,23 @@ def _apply_gm_flags() -> None:
             gm.USE_GPU_DYNAMICS = False
 
     _GM_FLAGS_APPLIED = True
+
+
+def _effective_persistent_viewer_flags(render_viewer_camera: bool, gui_viewport_only: bool) -> tuple[bool, bool]:
+    """Clamp persistent-worker viewer flags to the safe headless subset by default.
+
+    Persistent workers are long-lived Isaac processes. Allowing the eval config to
+    re-enable the viewer camera / full UI after we already forced headless-safe gm
+    defaults can trigger unstable UI / rendering paths, including the property-
+    window tracebacks and Vulkan crashes seen in formal persistent sweeps.
+
+    A rollout can still opt back into the raw flags by setting
+    ``PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS=0`` in the parent environment.
+    """
+
+    if os.environ.get("PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS", "1").lower() in {"1", "true", "yes"}:
+        return False, True
+    return bool(render_viewer_camera), bool(gui_viewport_only)
 
 
 class PersistentWorker:
@@ -413,6 +479,10 @@ class PersistentWorker:
         config_dir = f"{Path(eval_segment_src).parents[0]}/configs"
 
         log_path = Path(str(sample["log_path"]))
+        render_viewer_camera, gui_viewport_only = _effective_persistent_viewer_flags(
+            self.args.render_viewer_camera,
+            self.args.gui_viewport_only,
+        )
 
         overrides = [
             "policy=websocket",
@@ -437,8 +507,8 @@ class PersistentWorker:
             f"model.expected_server_token={self._server_identity['server_token']}",
             f"env_wrapper._target_={self.args.env_wrapper_target}",
             f"partial_scene_load={'true' if self.args.partial_scene_load else 'false'}",
-            f"render_viewer_camera={'true' if self.args.render_viewer_camera else 'false'}",
-            f"gui_viewport_only={'true' if self.args.gui_viewport_only else 'false'}",
+            f"render_viewer_camera={'true' if render_viewer_camera else 'false'}",
+            f"gui_viewport_only={'true' if gui_viewport_only else 'false'}",
             f"skip_intermediate_obs_in_chunk={'true' if self.args.skip_intermediate_obs_in_chunk else 'false'}",
             "segment_predicate_window_mode=consecutive",
             "segment_predicate_min_consecutive=3",
@@ -803,10 +873,20 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--write-video", action="store_true")
     parser.add_argument("--env-wrapper-target", default="omnigibson.learning.wrappers.RGBWrapper")
-    parser.add_argument("--partial-scene-load", action="store_true")
+    parser.add_argument(
+        "--partial-scene-load",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="whether to enable slim_only / task-relevant room loading; defaults to off",
+    )
     parser.add_argument("--render-viewer-camera", action="store_true")
     parser.add_argument("--gui-viewport-only", action="store_true")
-    parser.add_argument("--skip-intermediate-obs-in-chunk", action="store_true")
+    parser.add_argument(
+        "--skip-intermediate-obs-in-chunk",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="whether to enable slim_skipobs / chunk-internal obs skipping; defaults to on",
+    )
     parser.add_argument("--segment-predicate-dump-trace", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
@@ -817,6 +897,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _setup_logging(args.worker_rank)
     _reexec_in_behavior_env(args, list(sys.argv), force=False)
     _ensure_isaac_env()
+    _preload_isaac_modules()
 
     # Ignore SIGPIPE so a closed launcher pipe never crashes us mid-segment.
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
