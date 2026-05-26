@@ -28,6 +28,7 @@ DEMO_DATA_PATH_DEFAULT = Path("/mnt/bn/navigation-hl/mlx/users/chenjunting/data/
 RAWDATA_PATH_DEFAULT = Path("/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-rawdata")
 DEFAULT_CKPT = REPO_ROOT / "checkpoints" / "openpi_comet" / "pi05-b1kpt50-cs32"
 DEFAULT_CONFIG = "pi05_b1k-pt50_cs32_bs64_lr2.5e-5_step50k"
+PERF_OPT_DOC_HINT = "BEHAVIOR-1K/.trae/rules/performance_optimization.md"
 REGISTRY_REL_PATH = Path("OmniGibson/omnigibson/learning/utils/segment_skill_metric_registry.py")
 TASK_MAPPING_PATH = REPO_ROOT / "scripts" / "task_mapping.json"
 CONDA_SH = "/mnt/bn/behavior-data-hl/chenjunting/miniconda3/etc/profile.d/conda.sh"
@@ -1035,6 +1036,8 @@ def run_segment_eval(
     max_dynamic_steps_cap: int,
     dry_run: bool,
     write_video: bool,
+    partial_scene_load: bool,
+    skip_intermediate_obs_in_chunk: bool,
     segment_predicate_dump_trace: bool,
     expected_task_prompt_sha256: str,
     expected_server_run_id: str,
@@ -1119,7 +1122,8 @@ python OmniGibson/omnigibson/learning/eval_segment.py \
   model.expected_server_run_id={q(expected_server_run_id)} \
   model.expected_server_token={q(expected_server_token)} \
   env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper \
-  partial_scene_load=true \
+  partial_scene_load={q(str(partial_scene_load).lower())} \
+  skip_intermediate_obs_in_chunk={q(str(skip_intermediate_obs_in_chunk).lower())} \
   segment_predicate_window_mode=consecutive \
   segment_predicate_min_consecutive=3 \
   segment_predicate_dump_trace={q(str(segment_predicate_dump_trace).lower())}
@@ -1247,6 +1251,8 @@ def run_worker(args: argparse.Namespace) -> int:
                     max_dynamic_steps_cap=args.max_dynamic_steps_cap,
                     dry_run=args.dry_run,
                     write_video=args.write_video,
+                    partial_scene_load=args.partial_scene_load,
+                    skip_intermediate_obs_in_chunk=args.skip_intermediate_obs_in_chunk,
                     segment_predicate_dump_trace=args.segment_predicate_dump_trace,
                     expected_task_prompt_sha256=server_identity["task_prompt_sha256"],
                     expected_server_run_id=server_identity["server_run_id"],
@@ -2162,6 +2168,7 @@ def _persistent_worker_env(args: argparse.Namespace, gpu_id: int, port: int) -> 
 
     overrides = {
         "PYTHONUNBUFFERED": "1",
+        "PYTHONNOUSERSITE": "1",
         "PYTHONPATH": pythonpath,
         "NO_PROXY": no_proxy_value,
         "no_proxy": no_proxy_value,
@@ -2174,6 +2181,21 @@ def _persistent_worker_env(args: argparse.Namespace, gpu_id: int, port: int) -> 
         "OMNIGIBSON_HEADLESS": "true",
         "OMNIGIBSON_DISABLE_EXTENSION_REGISTRY": "0",
         "OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK": "1",
+        # Persistent workers should avoid RGBWrapper's runtime sensor / render-product
+        # reconfiguration by default. That path is not required for the RLinf-style
+        # throughput knobs we care about (partial_scene_load / skip_intermediate_obs_in_chunk),
+        # but it is a known source of slow or unstable task loads in long-lived Isaac processes.
+        "PERSISTENT_EVAL_DISABLE_SENSOR_RECONFIG": env.get("PERSISTENT_EVAL_DISABLE_SENSOR_RECONFIG", "1"),
+        # Keep persistent workers on the safe headless viewer path by default.
+        # Letting eval_segment re-enable the viewer camera / full UI has been a
+        # recurring source of long task loads and GPU / property-window crashes.
+        "PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS": env.get("PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS", "1"),
+        # Some tasks can still wedge inside VisionSensor warmup renders during
+        # env construction even after disabling RGBWrapper reconfiguration and
+        # clamping viewer flags. Skip those eager warmup renders by default for
+        # persistent workers; the simulator can still render later during normal
+        # rollout / observation paths after the env finishes loading.
+        "PERSISTENT_EVAL_SKIP_VISION_SENSOR_WARMUP": env.get("PERSISTENT_EVAL_SKIP_VISION_SENSOR_WARMUP", "1"),
         "PERSISTENT_WORKER_HEARTBEAT_S": str(args.persistent_worker_heartbeat_s),
         "PERSISTENT_WORKER_TASK_RELOAD_TIMEOUT_S": str(args.persistent_worker_task_reload_timeout),
         "PERSISTENT_WORKER_SEGMENT_TIMEOUT_S": str(args.persistent_worker_segment_timeout),
@@ -2216,7 +2238,7 @@ python -u {q(str(args.persistent_worker_script))} \\
   --behavior-dir {q(args.behavior_dir)} \\
   --demo-data-path {q(args.demo_data_path)} \\
   --rawdata-path {q(args.rawdata_path)} \\
-  --launcher-pid {q(os.getpid())}{' --dry-run' if args.dry_run else ''}{' --write-video' if args.write_video else ''}{' --segment-predicate-dump-trace' if args.segment_predicate_dump_trace else ''}{' --resume' if args.resume else ''}
+  --launcher-pid {q(os.getpid())}{' --dry-run' if args.dry_run else ''}{' --write-video' if args.write_video else ''}{' --partial-scene-load' if args.partial_scene_load else ''}{' --render-viewer-camera' if args.render_viewer_camera else ''}{' --gui-viewport-only' if args.gui_viewport_only else ''}{' --skip-intermediate-obs-in-chunk' if args.skip_intermediate_obs_in_chunk else ''} --env-wrapper-target {q(args.env_wrapper_target)}{' --segment-predicate-dump-trace' if args.segment_predicate_dump_trace else ''}{' --resume' if args.resume else ''}
 """
     env = _persistent_worker_env(args, gpu_id=gpu_id, port=port)
     with worker_log.open("a") as f:
@@ -2278,6 +2300,15 @@ def run_persistent_worker_inplace(args: argparse.Namespace) -> int:
         cmd.append("--dry-run")
     if args.write_video:
         cmd.append("--write-video")
+    if args.partial_scene_load:
+        cmd.append("--partial-scene-load")
+    if args.render_viewer_camera:
+        cmd.append("--render-viewer-camera")
+    if args.gui_viewport_only:
+        cmd.append("--gui-viewport-only")
+    if args.skip_intermediate_obs_in_chunk:
+        cmd.append("--skip-intermediate-obs-in-chunk")
+    cmd.extend(["--env-wrapper-target", args.env_wrapper_target])
     if args.segment_predicate_dump_trace:
         cmd.append("--segment-predicate-dump-trace")
     if args.resume:
@@ -2334,6 +2365,7 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                 "written": int(plan["written"]),
                 "shutdown_appended": False,
                 "restart_count": 0,
+                "last_restart_at": 0.0,
             }
 
         heartbeat_timeout_s = max(
@@ -2363,7 +2395,11 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                         task_reload_timeout_s=float(args.persistent_worker_task_reload_timeout),
                         segment_timeout_s=float(args.persistent_worker_segment_timeout),
                     )
-                    if proc.poll() is None and restart_reason:
+                    if (
+                        proc.poll() is None
+                        and restart_reason
+                        and now - float(child.get("last_restart_at", 0.0)) >= heartbeat_timeout_s
+                    ):
                         print(
                             f"[launcher-persistent] worker {rank:03d} stalled ({restart_reason}); restarting. "
                             f"status={summary}",
@@ -2382,6 +2418,7 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                                 "log_path": worker_log,
                                 "jobs_path": jobs_path,
                                 "restart_count": int(child["restart_count"]) + 1,
+                                "last_restart_at": now,
                             }
                         )
                         continue
@@ -2405,6 +2442,7 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                                 "log_path": worker_log,
                                 "jobs_path": jobs_path,
                                 "restart_count": int(child["restart_count"]) + 1,
+                                "last_restart_at": now,
                             }
                         )
                         all_done = False
@@ -2518,6 +2556,15 @@ def launch_node(args: argparse.Namespace) -> int:
                 cmd.append("--dry-run")
             if args.write_video:
                 cmd.append("--write-video")
+            if args.partial_scene_load:
+                cmd.append("--partial-scene-load")
+            if args.render_viewer_camera:
+                cmd.append("--render-viewer-camera")
+            if args.gui_viewport_only:
+                cmd.append("--gui-viewport-only")
+            if args.skip_intermediate_obs_in_chunk:
+                cmd.append("--skip-intermediate-obs-in-chunk")
+            cmd.extend(["--env-wrapper-target", args.env_wrapper_target])
             if args.segment_predicate_dump_trace:
                 cmd.append("--segment-predicate-dump-trace")
             if args.resume:
@@ -2603,7 +2650,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-name", default=DEFAULT_CONFIG)
     parser.add_argument("--policy-backend", choices=["auto", "torch", "jax"], default="auto")
     parser.add_argument("--ckpt-dir", type=Path, default=DEFAULT_CKPT)
-    parser.add_argument("--behavior-dir", type=Path, default=BEHAVIOR_DIR_DEFAULT)
+    parser.add_argument(
+        "--behavior-dir",
+        type=Path,
+        default=BEHAVIOR_DIR_DEFAULT,
+        help=(
+            "BEHAVIOR-1K repo root; this launcher derives OMNIGIBSON_DATA_PATH as <behavior_dir>/datasets. "
+            f"For SSD asset placement and recommended defaults, see {PERF_OPT_DOC_HINT}"
+        ),
+    )
     parser.add_argument("--demo-data-path", type=Path, default=DEMO_DATA_PATH_DEFAULT)
     parser.add_argument("--rawdata-path", type=Path, default=RAWDATA_PATH_DEFAULT)
     parser.add_argument("--skills", default="", help="comma-separated subset of skill names")
@@ -2617,6 +2672,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-total-jobs", type=int, default=0, help="0 means unlimited")
     parser.add_argument("--dry-run", action="store_true", help="pass dry_run=true to eval_segment.py")
     parser.add_argument("--write-video", action="store_true")
+    parser.add_argument(
+        "--partial-scene-load",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "whether to enable slim_only / task-relevant room loading; defaults to off. "
+            f"See {PERF_OPT_DOC_HINT} for when this is worth enabling"
+        ),
+    )
+    parser.add_argument("--render-viewer-camera", action="store_true")
+    parser.add_argument("--gui-viewport-only", action="store_true")
+    parser.add_argument(
+        "--skip-intermediate-obs-in-chunk",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "whether to enable slim_skipobs / chunk-internal obs skipping; defaults to on. "
+            f"See {PERF_OPT_DOC_HINT} for recommended launcher defaults"
+        ),
+    )
+    parser.add_argument("--env-wrapper-target", default="omnigibson.learning.wrappers.RGBWrapper")
     parser.add_argument("--segment-predicate-dump-trace", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--rebuild-manifest", action="store_true")

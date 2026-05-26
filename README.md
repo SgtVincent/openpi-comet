@@ -108,6 +108,23 @@ uv pip install -e bddl3
 uv pip install -e OmniGibson[eval]
 ```
 
+## Repo-local Guides
+
+Besides this README, the repository keeps a small set of operator-facing guides under [`openpi-comet/.trae/documents/`](.trae/documents/):
+
+| 你要做什么 | 直接看这里 |
+| --- | --- |
+| 先了解仓库结构、训练 / 数据 / eval 入口 | [`project_overview.md`](.trae/documents/project_overview.md) |
+| 找最常用的 BEHAVIOR eval 启动命令 | [`eval-quick-reference.md`](.trae/documents/eval-quick-reference.md) |
+| 理解 launcher、多机、persistent worker 的编排方式 | [`behavior_eval_orchestration_guide.md`](.trae/documents/behavior_eval_orchestration_guide.md) |
+| 理解 persistent skill eval 的实现与复用逻辑 | [`persistent_skill_eval_framework.md`](.trae/documents/persistent_skill_eval_framework.md) |
+
+如果你只是想先把基本功能跑起来，建议按这个顺序阅读：
+
+1. 先看本 README 的安装与训练 / rollout / evaluation 章节；
+2. 跑 BEHAVIOR eval 时，再看 [`eval-quick-reference.md`](.trae/documents/eval-quick-reference.md) 抄默认命令；
+3. 需要改 launcher 参数、排查 persistent worker、多机调度时，再看 [`behavior_eval_orchestration_guide.md`](.trae/documents/behavior_eval_orchestration_guide.md)。
+
 ## Model Zoo
 
 We provide a suite of base VLA model checkpoints trained on 1.5K hours robot trajectories, ideal for BEHAVIOR-1K fine-tuning.
@@ -196,7 +213,9 @@ python scripts/train_dist.py ${config_name} --exp_name=${exp_name} --overwrite
 
 To perform RFT, you need to first deploy the finetuned checkpoint, and then rollout the episodes in the BEHAVIOR-1K Simulator. We also observe that the `pose perturbator` helps improve the robustness of the RFT Algorithm. 
 
-1. Copy the files in `openpi-comet/src/behavior/learning` to `BEHAVIOR-1K/OmniGibson/omnigibson/learning`. Be careful to the latest commit of the BEHAVIOR-1K repo and replace the files in the CheckList:
+1. Use a recent `BEHAVIOR-1K` checkout whose `main` already includes the merged `skill_eval` eval pipeline. In that setup, the behavior-side files below are already part of `BEHAVIOR-1K` and can be used directly.
+
+   If you are on an older `BEHAVIOR-1K` revision that predates the merged eval pipeline, manually sync the files in `openpi-comet/src/behavior/learning` to `BEHAVIOR-1K/OmniGibson/omnigibson/learning` as a compatibility fallback:
 
 | Name | Description |
 |-------------------------------|-------------------------------------------------------------------------------------------------------|
@@ -249,7 +268,7 @@ After finetuning, you can run evaluation by following the steps below:
 
 2. Run the evaluation on BEHAVIOR:
 
-    Assume you have behavior env installed (check https://github.com/StanfordVL/BEHAVIOR-1K for more details), run the following command within the BEHAVIOR-1K directory:
+    Assume you have behavior env installed and are using a recent `BEHAVIOR-1K` `main` that already contains the stable eval pipeline (check https://github.com/StanfordVL/BEHAVIOR-1K for more details). Then run the following command within the `BEHAVIOR-1K` directory:
     
     ```bash
     conda activate behavior 
@@ -294,4 +313,3 @@ To update submodules to latest remote branch:
 ```bash
 git submodule update --remote --merge
 ```
-

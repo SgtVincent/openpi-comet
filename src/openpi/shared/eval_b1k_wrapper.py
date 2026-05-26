@@ -6,11 +6,11 @@ import logging
 from pathlib import Path
 import re
 
-import cv2
 import numpy as np
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
 import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger("policy")
 logger.setLevel(20)  # info
@@ -66,6 +66,8 @@ class B1KPolicyWrapper:
         self.temporal_ensemble_max = temporal_ensemble_max  # max number of sequences to ensemble
         self.step_counter = 0
         self.last_policy_inferred = False
+        self.cached_actions_remaining = 0
+        self.last_action_chunk = None
 
         self.fine_grained_level = fine_grained_level
         self.last_generated_subtask = None
@@ -130,6 +132,8 @@ class B1KPolicyWrapper:
         self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         self.step_counter = 0
         self.last_policy_inferred = False
+        self.cached_actions_remaining = 0
+        self.last_action_chunk = None
         self._maybe_set_active_session()
         self._maybe_reset_streaming_state()
         self.last_generated_subtask = None
@@ -152,6 +156,8 @@ class B1KPolicyWrapper:
         session.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         session.step_counter = 0
         session.last_policy_inferred = False
+        session.cached_actions_remaining = 0
+        session.last_action_chunk = None
         session.last_generated_subtask = None
         session.last_prompt_debug = None
 
@@ -201,8 +207,17 @@ class B1KPolicyWrapper:
         }
 
         if "robot_r1::robot_r1:zed_link:Camera:0::depth_linear" in obs:
-            depth_obs = obs["robot_r1::robot_r1:zed_link:Camera:0::depth_linear"]
-            depth_obs = cv2.resize(depth_obs, (DESPTH_RESIZE_SIZE, DESPTH_RESIZE_SIZE), interpolation=cv2.INTER_LINEAR)
+            depth_obs = torch.as_tensor(
+                obs["robot_r1::robot_r1:zed_link:Camera:0::depth_linear"],
+                dtype=torch.float32,
+            )
+            depth_obs = F.interpolate(
+                depth_obs.unsqueeze(0).unsqueeze(0),
+                size=(DESPTH_RESIZE_SIZE, DESPTH_RESIZE_SIZE),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+            depth_obs = depth_obs.cpu().numpy()
             processed_obs["observation/egocentric_depth"] = depth_obs[None]
 
         # if "robot_r1::robot_r1:left_realsense_link:Camera:0::depth_linear" in obs:
@@ -409,6 +424,8 @@ class B1KPolicyWrapper:
         """
         input_obs = self.process_obs(input_obs)
         self.last_policy_inferred = False
+        self.last_action_chunk = None
+        self.cached_actions_remaining = 0
         if self.control_mode == "receeding_temporal":
             return self.act_receeding_temporal(input_obs)
 
@@ -416,6 +433,7 @@ class B1KPolicyWrapper:
             if len(self.action_queue) > 0:
                 # pop the first action in the queue
                 final_action = self.action_queue.popleft()[None]
+                self.cached_actions_remaining = len(self.action_queue)
                 return torch.as_tensor(final_action, dtype=torch.float32)
 
         nbatch = copy.deepcopy(input_obs)
@@ -456,8 +474,10 @@ class B1KPolicyWrapper:
         # Need to broadcast joint_positions to match action sequence length
         target_joint_positions = action["actions"].copy()
         if self.control_mode == "receeding_horizon":
+            self.last_action_chunk = target_joint_positions[: self.max_len].copy()
             self.action_queue = deque([a for a in target_joint_positions[: self.max_len]])
             final_action = self.action_queue.popleft()[None]
+            self.cached_actions_remaining = len(self.action_queue)
 
         # # temporal emsemble start
         elif self.control_mode == "temporal_ensemble":
@@ -477,6 +497,7 @@ class B1KPolicyWrapper:
             final_action[-9] = target_joint_positions[0, -9]
             final_action[-1] = target_joint_positions[0, -1]
             final_action = final_action[None]
+            self.cached_actions_remaining = 0
         else:
             final_action = target_joint_positions
         return torch.as_tensor(final_action, dtype=torch.float32)

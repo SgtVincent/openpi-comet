@@ -38,6 +38,8 @@ die() { echo "[Error] $*" >&2; exit 1; }
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PERF_OPT_DOC_REL="../BEHAVIOR-1K/.trae/rules/performance_optimization.md"
+PERF_OPT_DOC="${PERF_OPT_DOC:-$REPO_ROOT/$PERF_OPT_DOC_REL}"
 PREFERRED_CONDA_BASE="${PREFERRED_CONDA_BASE:-/mnt/bn/behavior-data-hl/chenjunting/miniconda3}"
 PREFERRED_CONDA_SH="${PREFERRED_CONDA_SH:-$PREFERRED_CONDA_BASE/etc/profile.d/conda.sh}"
 
@@ -96,7 +98,10 @@ EVAL_EXTRA_OVERRIDES="${EVAL_EXTRA_OVERRIDES:-}"
 HEADLESS="${HEADLESS:-true}"
 WRITE_VIDEO="${WRITE_VIDEO:-false}"
 MAX_STEPS="${MAX_STEPS:-}"
-PARTIAL_SCENE_LOAD="${PARTIAL_SCENE_LOAD:-true}"
+# Performance tuning handbook: see $PERF_OPT_DOC
+# Default recommendation: use SSD datasets + PARTIAL_SCENE_LOAD=false + SKIP_INTERMEDIATE_OBS_IN_CHUNK=true
+PARTIAL_SCENE_LOAD="${PARTIAL_SCENE_LOAD:-false}"
+SKIP_INTERMEDIATE_OBS_IN_CHUNK="${SKIP_INTERMEDIATE_OBS_IN_CHUNK:-true}"
 MAX_STEPS_HUMAN_MULTIPLIER="${MAX_STEPS_HUMAN_MULTIPLIER:-1.2}"
 VIDEO_ON_REPLAN_ONLY="${VIDEO_ON_REPLAN_ONLY:-true}"
 STUCK_MOTION_WINDOW="${STUCK_MOTION_WINDOW:-2000}"
@@ -492,6 +497,9 @@ launch_eval() {
   if is_true_like "$PARTIAL_SCENE_LOAD"; then
     feature_args="partial_scene_load=true"
   fi
+  if is_true_like "$SKIP_INTERMEDIATE_OBS_IN_CHUNK"; then
+    feature_args="$feature_args skip_intermediate_obs_in_chunk=true"
+  fi
   feature_args="$feature_args render_viewer_camera=$RENDER_VIEWER_CAMERA gui_viewport_only=$GUI_VIEWPORT_ONLY viewer_width=$VIEWER_WIDTH viewer_height=$VIEWER_HEIGHT"
 
   if [[ "$EVAL_ENTRYPOINT" == "eval_custom.py" ]]; then
@@ -632,7 +640,8 @@ run_single_checkpoint_mode() {
   log "Writing outputs to: $OUT_DIR"
   log "Task=$TASK_NAME Checkpoint=$CKPT_DIR"
   log "Worker GPUs=[${WORKER_GPUS[*]}] Eval IDs=[${EVAL_IDS[*]}]"
-  log "Optimization knobs: partial_scene_load=$PARTIAL_SCENE_LOAD max_steps_human_multiplier=$MAX_STEPS_HUMAN_MULTIPLIER video_on_replan_only=$VIDEO_ON_REPLAN_ONLY stuck_motion_window=$STUCK_MOTION_WINDOW stuck_min_steps=$STUCK_MIN_STEPS stuck_motion_threshold=$STUCK_MOTION_THRESHOLD render_viewer_camera=$RENDER_VIEWER_CAMERA gui_viewport_only=$GUI_VIEWPORT_ONLY viewer_width=$VIEWER_WIDTH viewer_height=$VIEWER_HEIGHT cpu_affinity_mode=$CPU_AFFINITY_MODE cpu_affinity_cpus_per_worker=$CPU_AFFINITY_CPUS_PER_WORKER restore_cache_before_eval=$RESTORE_CACHE_BEFORE_EVAL warmup_cache_tar=${WARMUP_CACHE_TAR:-<none>}"
+  log "Performance guide: $PERF_OPT_DOC"
+  log "Optimization knobs: partial_scene_load=$PARTIAL_SCENE_LOAD skip_intermediate_obs_in_chunk=$SKIP_INTERMEDIATE_OBS_IN_CHUNK max_steps_human_multiplier=$MAX_STEPS_HUMAN_MULTIPLIER video_on_replan_only=$VIDEO_ON_REPLAN_ONLY stuck_motion_window=$STUCK_MOTION_WINDOW stuck_min_steps=$STUCK_MIN_STEPS stuck_motion_threshold=$STUCK_MOTION_THRESHOLD render_viewer_camera=$RENDER_VIEWER_CAMERA gui_viewport_only=$GUI_VIEWPORT_ONLY viewer_width=$VIEWER_WIDTH viewer_height=$VIEWER_HEIGHT cpu_affinity_mode=$CPU_AFFINITY_MODE cpu_affinity_cpus_per_worker=$CPU_AFFINITY_CPUS_PER_WORKER restore_cache_before_eval=$RESTORE_CACHE_BEFORE_EVAL warmup_cache_tar=${WARMUP_CACHE_TAR:-<none>}"
 
   local i
   for ((i=0; i<${#WORKER_TO_IDS[@]}; i++)); do

@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -1210,3 +1212,127 @@ def test_persistent_worker_restart_reason_detects_stale_heartbeat_and_timeouts()
 
 def test_persistent_worker_defaults_include_segment_timeout() -> None:
     assert persistent_worker_mod.DEFAULT_SEGMENT_TIMEOUT_S == 5400
+
+
+def test_persistent_worker_env_disables_sensor_reconfig_by_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("PERSISTENT_EVAL_DISABLE_SENSOR_RECONFIG", raising=False)
+    monkeypatch.delenv("PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS", raising=False)
+    monkeypatch.delenv("PERSISTENT_EVAL_SKIP_VISION_SENSOR_WARMUP", raising=False)
+    args = SimpleNamespace(
+        behavior_dir=tmp_path / "behavior",
+        out_dir=tmp_path / "run_out",
+        persistent_worker_heartbeat_s=60,
+        persistent_worker_task_reload_timeout=1800,
+        persistent_worker_segment_timeout=5400,
+    )
+
+    env = mod._persistent_worker_env(args, gpu_id=3, port=49003)
+
+    assert env["PERSISTENT_EVAL_DISABLE_SENSOR_RECONFIG"] == "1"
+    assert env["PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS"] == "1"
+    assert env["PERSISTENT_EVAL_SKIP_VISION_SENSOR_WARMUP"] == "1"
+
+
+def test_persistent_worker_env_respects_sensor_reconfig_override(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PERSISTENT_EVAL_DISABLE_SENSOR_RECONFIG", "0")
+    monkeypatch.setenv("PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS", "0")
+    monkeypatch.setenv("PERSISTENT_EVAL_SKIP_VISION_SENSOR_WARMUP", "0")
+    args = SimpleNamespace(
+        behavior_dir=tmp_path / "behavior",
+        out_dir=tmp_path / "run_out",
+        persistent_worker_heartbeat_s=60,
+        persistent_worker_task_reload_timeout=1800,
+        persistent_worker_segment_timeout=5400,
+    )
+
+    env = mod._persistent_worker_env(args, gpu_id=4, port=49004)
+
+    assert env["PERSISTENT_EVAL_DISABLE_SENSOR_RECONFIG"] == "0"
+    assert env["PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS"] == "0"
+    assert env["PERSISTENT_EVAL_SKIP_VISION_SENSOR_WARMUP"] == "0"
+
+
+def test_launcher_parse_args_defaults_to_skipobs_without_partial(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_skill_metric_multinode_sweep.py"])
+
+    args = mod.parse_args()
+
+    assert args.partial_scene_load is False
+    assert args.skip_intermediate_obs_in_chunk is True
+
+
+def test_launcher_parse_args_supports_explicit_opt_in_and_opt_out(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_skill_metric_multinode_sweep.py",
+            "--partial-scene-load",
+            "--no-skip-intermediate-obs-in-chunk",
+        ],
+    )
+
+    args = mod.parse_args()
+
+    assert args.partial_scene_load is True
+    assert args.skip_intermediate_obs_in_chunk is False
+
+
+def test_persistent_worker_parse_args_defaults_to_skipobs_without_partial(tmp_path) -> None:
+    args = persistent_worker_mod._parse_args(
+        [
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--worker-rank",
+            "0",
+            "--gpu-id",
+            "1",
+            "--port-base",
+            "49000",
+            "--ckpt-dir",
+            str(tmp_path / "ckpt"),
+        ]
+    )
+
+    assert args.partial_scene_load is False
+    assert args.skip_intermediate_obs_in_chunk is True
+
+
+def test_persistent_worker_parse_args_supports_explicit_opt_in_and_opt_out(tmp_path) -> None:
+    args = persistent_worker_mod._parse_args(
+        [
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--worker-rank",
+            "0",
+            "--gpu-id",
+            "1",
+            "--port-base",
+            "49000",
+            "--ckpt-dir",
+            str(tmp_path / "ckpt"),
+            "--partial-scene-load",
+            "--no-skip-intermediate-obs-in-chunk",
+        ]
+    )
+
+    assert args.partial_scene_load is True
+    assert args.skip_intermediate_obs_in_chunk is False
+
+
+def test_effective_persistent_viewer_flags_clamp_to_safe_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS", raising=False)
+
+    render_viewer_camera, gui_viewport_only = persistent_worker_mod._effective_persistent_viewer_flags(True, False)
+
+    assert render_viewer_camera is False
+    assert gui_viewport_only is True
+
+
+def test_effective_persistent_viewer_flags_respect_opt_out(monkeypatch) -> None:
+    monkeypatch.setenv("PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS", "0")
+
+    render_viewer_camera, gui_viewport_only = persistent_worker_mod._effective_persistent_viewer_flags(True, False)
+
+    assert render_viewer_camera is True
+    assert gui_viewport_only is False
