@@ -1,4 +1,5 @@
 from collections import deque
+import contextlib
 import copy
 import hashlib
 import json
@@ -47,6 +48,7 @@ class B1KPolicyWrapper:
         self.prompt_override = prompt_override
         # Session id is used to isolate runtime state (e.g., streaming memory) when the
         # same model instance is shared across multiple websocket connections.
+        self._session_generation: int = 0
         self._session_id: int = id(self)
 
         # load the task name from the metadata
@@ -141,6 +143,28 @@ class B1KPolicyWrapper:
         if self.reasoner:
             self.reasoner.reset()
 
+    def rotate_session(self, *, clear_old: bool = True) -> None:
+        """Start a fresh model runtime session without resetting task / plan state."""
+        old_session_id = self._session_id
+        model = getattr(self.policy, "_model", None)
+        if clear_old and model is not None:
+            clearer = getattr(model, "clear_session", None)
+            if callable(clearer):
+                with contextlib.suppress(Exception):
+                    clearer(old_session_id)
+
+        self._session_generation += 1
+        self._session_id = (id(self) << 32) + self._session_generation
+        self.action_queue = deque(maxlen=self.action_horizon)
+        self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
+        self.step_counter = 0
+        self.last_policy_inferred = False
+        self.last_generated_subtask = None
+        self.last_prompt_debug = None
+        self._maybe_set_active_session()
+        self._maybe_reset_streaming_state()
+        logger.info("Rotated policy session from %s to %s", old_session_id, self._session_id)
+
     def spawn_session(self) -> "B1KPolicyWrapper":
         """Create a per-connection session wrapper.
 
@@ -151,6 +175,7 @@ class B1KPolicyWrapper:
 
         # Shallow copy is enough to share large model weights while isolating mutable rollout state.
         session = copy.copy(self)
+        session._session_generation = 0
         session._session_id = id(session)
         session.action_queue = deque(maxlen=self.action_horizon)
         session.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}

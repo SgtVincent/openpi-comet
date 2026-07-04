@@ -87,6 +87,21 @@ def wait_for_port_free(port: int, *, timeout_s: float = 30.0) -> bool:
     return is_port_free(port)
 
 
+def wait_for_port_busy(port: int, *, timeout_s: float = 30.0) -> bool:
+    deadline = time.time() + float(timeout_s)
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex(("127.0.0.1", int(port))) == 0:
+                return True
+        time.sleep(0.2)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        if sock.connect_ex(("127.0.0.1", int(port))) == 0:
+            return True
+    return False
+
+
 def wait_for_server(port: int, timeout_s: int) -> None:
     start = time.time()
     last_log = start
@@ -99,6 +114,18 @@ def wait_for_server(port: int, timeout_s: int) -> None:
                 status = getattr(resp, "status", None) or resp.getcode()
                 if 200 <= int(status) < 300:
                     return
+        except urllib.error.HTTPError as exc:
+            if 200 <= int(exc.code) < 500:
+                return
+            now = time.time()
+            if now - last_log >= 30:
+                print(
+                    f"[worker] server healthz returned HTTP {exc.code} at {health_url}... "
+                    f"elapsed={int(now - start)}s",
+                    flush=True,
+                )
+                last_log = now
+            time.sleep(1.0)
         except (urllib.error.URLError, ConnectionError, OSError, socket.timeout, ValueError):
             now = time.time()
             if now - last_log >= 30:
@@ -131,6 +158,8 @@ def wait_for_server_proc(
                 f"log: {log_file}\n{tail}"
             )
         try:
+            if not wait_for_port_busy(port, timeout_s=5):
+                raise TimeoutError(f"server port {port} did not bind within 5s")
             wait_for_server(port, timeout_s=10)
             return
         except Exception as exc:
@@ -303,9 +332,8 @@ python OmniGibson/omnigibson/learning/eval_golden_rule.py \\
   max_steps={q(max_steps)} \\
   model.host=127.0.0.1 \\
   model.port={q(port)} \\
-  env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper \\
-  partial_scene_load=true \\
-  dry_run={q(str(dry_run).lower())}
+  env_wrapper._target_=omnigibson.learning.wrappers.RGBLowResWrapper \\
+  partial_scene_load=true
 """
     with episode_log.open("w") as f:
         proc = subprocess.run(["bash", "-lc", cmd], stdout=f, stderr=subprocess.STDOUT, text=True)
@@ -367,45 +395,42 @@ def run_worker(args: argparse.Namespace) -> int:
     print(f"[worker {args.worker_rank:03d}] {len(done_demos)} done, {len(pending)} pending", flush=True)
 
     ckpt_dir = resolve_checkpoint_dir(args.ckpt_dir)
-    server_proc: Optional[subprocess.Popen[str]] = None
-    server_log: Optional[Path] = None
-    task_port = args.port
 
-    try:
-        # Find free port
-        task_port = find_free_port(args.port, stride=args.gpus_per_node, max_tries=200)
+    for demo_id in pending:
+        server_proc: Optional[subprocess.Popen[str]] = None
+        server_log: Optional[Path] = None
+        task_port = -1
+        try:
+            task_port = find_free_port(args.port, stride=args.gpus_per_node, max_tries=200)
+            # Golden-rule server currently binds the GT plan at startup from a specific demo.
+            # Restart it per demo so the served prompt sequence always matches the evaluator's
+            # current episode instead of reusing the first demo's plan for all later episodes.
+            server_proc, server_log = start_golden_rule_server(
+                task_name=args.task,
+                port=task_port,
+                gpu_id=args.gpu_id,
+                ckpt_dir=ckpt_dir,
+                config_name=args.config_name,
+                policy_backend=args.policy_backend,
+                demo_data_path=args.demo_data_path,
+                demo_id=demo_id,
+                openpi_env=args.openpi_env,
+                behavior_dir=args.behavior_dir,
+                out_dir=args.out_dir / "server_logs",
+            )
+            print(
+                f"[worker {args.worker_rank:03d}] started golden-rule server for task={args.task} "
+                f"gpu={args.gpu_id} port={task_port} demo={demo_id}",
+                flush=True,
+            )
+            wait_for_server_proc(
+                proc=server_proc,
+                port=task_port,
+                timeout_s=args.server_ready_timeout,
+                log_file=server_log,
+            )
+            print(f"[worker {args.worker_rank:03d}] server ready on port {task_port}", flush=True)
 
-        # Start golden rule server for this worker
-        # For golden rule, we use the first demo's plan (server loads plan at startup)
-        # The evaluator will connect and the server autonomously advances skills
-        first_demo = pending[0] if pending else worker_demos[0]
-        server_proc, server_log = start_golden_rule_server(
-            task_name=args.task,
-            port=task_port,
-            gpu_id=args.gpu_id,
-            ckpt_dir=ckpt_dir,
-            config_name=args.config_name,
-            policy_backend=args.policy_backend,
-            demo_data_path=args.demo_data_path,
-            demo_id=first_demo,
-            openpi_env=args.openpi_env,
-            behavior_dir=args.behavior_dir,
-            out_dir=args.out_dir / "server_logs",
-        )
-        print(
-            f"[worker {args.worker_rank:03d}] started golden-rule server for task={args.task} "
-            f"gpu={args.gpu_id} port={task_port} demo={first_demo}",
-            flush=True,
-        )
-        wait_for_server_proc(
-            proc=server_proc,
-            port=task_port,
-            timeout_s=args.server_ready_timeout,
-            log_file=server_log,
-        )
-        print(f"[worker {args.worker_rank:03d}] server ready on port {task_port}", flush=True)
-
-        for demo_id in pending:
             print(f"[worker {args.worker_rank:03d}] evaluating demo={demo_id}", flush=True)
             row = run_episode_eval(
                 demo_id=demo_id,
@@ -437,9 +462,11 @@ def run_worker(args: argparse.Namespace) -> int:
                 f"sr={sr:.1%} et={et}",
                 flush=True,
             )
-    finally:
-        stop_process(server_proc)
-        wait_for_port_free(task_port)
+
+        finally:
+            stop_process(server_proc)
+            if task_port >= 0:
+                wait_for_port_free(task_port, timeout_s=60.0)
 
     return 0
 

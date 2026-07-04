@@ -545,6 +545,87 @@ def stop_process(proc: Optional[subprocess.Popen[str]]) -> None:
             pass
 
 
+def stop_stale_persistent_servers(out_dir: Path, worker_rank: int, *, timeout_s: float = 5.0) -> None:
+    """Best-effort cleanup for policy servers launched by a persistent worker.
+
+    ``start_server`` intentionally creates a new process group for the OpenPI
+    policy server. If the launcher watchdog kills a wedged worker process group,
+    the child server can survive as an orphan and keep its port / GPU memory.
+    Limit cleanup to this run and worker rank by matching the structured
+    ``--server-run-id`` prefix.
+    """
+
+    prefix = f"{out_dir.name}:worker{int(worker_rank):03d}:"
+    matches: List[int] = []
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001
+        return
+
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, args_text = stripped.partition(" ")
+        if "scripts/serve_b1k.py" not in args_text or "--server-run-id=" not in args_text:
+            continue
+        if f"--server-run-id={prefix}" not in args_text:
+            continue
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        matches.append(pid)
+
+    for pid in matches:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                continue
+
+    deadline = time.time() + max(0.0, timeout_s)
+    while matches and time.time() < deadline:
+        alive: List[int] = []
+        for pid in matches:
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                alive.append(pid)
+        if not alive:
+            return
+        matches = alive
+        time.sleep(0.2)
+
+    for pid in matches:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
 def json_dump(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
@@ -1121,7 +1202,7 @@ python OmniGibson/omnigibson/learning/eval_segment.py \
   model.expected_task_prompt_sha256={q(expected_task_prompt_sha256)} \
   model.expected_server_run_id={q(expected_server_run_id)} \
   model.expected_server_token={q(expected_server_token)} \
-  env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper \
+  env_wrapper._target_=omnigibson.learning.wrappers.RGBLowResWrapper \
   partial_scene_load={q(str(partial_scene_load).lower())} \
   skip_intermediate_obs_in_chunk={q(str(skip_intermediate_obs_in_chunk).lower())} \
   segment_predicate_window_mode=consecutive \
@@ -2181,17 +2262,16 @@ def _persistent_worker_env(args: argparse.Namespace, gpu_id: int, port: int) -> 
         "OMNIGIBSON_HEADLESS": "true",
         "OMNIGIBSON_DISABLE_EXTENSION_REGISTRY": "0",
         "OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK": "1",
-        # Persistent workers should avoid RGBWrapper's runtime sensor / render-product
-        # reconfiguration by default. That path is not required for the RLinf-style
-        # throughput knobs we care about (partial_scene_load / skip_intermediate_obs_in_chunk),
-        # but it is a known source of slow or unstable task loads in long-lived Isaac processes.
+        # Persistent workers should avoid RGB sensor render-product
+        # reconfiguration by default. That path is a known source of slow or
+        # unstable task loads in long-lived Isaac processes.
         "PERSISTENT_EVAL_DISABLE_SENSOR_RECONFIG": env.get("PERSISTENT_EVAL_DISABLE_SENSOR_RECONFIG", "1"),
         # Keep persistent workers on the safe headless viewer path by default.
         # Letting eval_segment re-enable the viewer camera / full UI has been a
         # recurring source of long task loads and GPU / property-window crashes.
         "PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS": env.get("PERSISTENT_EVAL_FORCE_SAFE_VIEWER_FLAGS", "1"),
         # Some tasks can still wedge inside VisionSensor warmup renders during
-        # env construction even after disabling RGBWrapper reconfiguration and
+        # env construction even after disabling RGB sensor reconfiguration and
         # clamping viewer flags. Skip those eager warmup renders by default for
         # persistent workers; the simulator can still render later during normal
         # rollout / observation paths after the env finishes loading.
@@ -2406,6 +2486,7 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                             flush=True,
                         )
                         stop_process(proc)
+                        stop_stale_persistent_servers(args.out_dir, rank)
                         proc, worker_log, jobs_path = _spawn_persistent_worker(
                             args,
                             worker_rank=rank,
@@ -2430,6 +2511,7 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
                             flush=True,
                         )
                         print(tail_text(Path(child["log_path"])))
+                        stop_stale_persistent_servers(args.out_dir, rank)
                         proc, worker_log, jobs_path = _spawn_persistent_worker(
                             args,
                             worker_rank=rank,
@@ -2471,8 +2553,9 @@ def launch_node_persistent(args: argparse.Namespace) -> int:
         return 1 if any_failed else 0
     finally:
         # SIGTERM/SIGKILL anyone still alive past the deadline.
-        for child in children.values():
+        for rank, child in children.items():
             stop_process(child.get("proc"))
+            stop_stale_persistent_servers(args.out_dir, rank)
 
 
 
@@ -2692,7 +2775,7 @@ def parse_args() -> argparse.Namespace:
             f"See {PERF_OPT_DOC_HINT} for recommended launcher defaults"
         ),
     )
-    parser.add_argument("--env-wrapper-target", default="omnigibson.learning.wrappers.RGBWrapper")
+    parser.add_argument("--env-wrapper-target", default="omnigibson.learning.wrappers.RGBLowResWrapper")
     parser.add_argument("--segment-predicate-dump-trace", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--rebuild-manifest", action="store_true")

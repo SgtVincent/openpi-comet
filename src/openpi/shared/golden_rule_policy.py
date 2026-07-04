@@ -1,5 +1,4 @@
-from collections import deque
-import copy
+import json
 import logging
 from typing import Any, Optional
 
@@ -32,6 +31,11 @@ class GoldenRulePolicyWrapper(B1KPolicyWrapper):
         skill_timeout_steps: int = 300,
         fine_grained_level: int = 2,
         temporal_ensemble_max: int = 3,
+        plan_start_skill_idx: int = 0,
+        prompt_override: str | None = None,
+        skill_prompt_template: str | None = None,
+        skill_prompt_override: str | None = None,
+        skill_prompt_detail_map_json: str | None = None,
     ) -> None:
         # We always force fine_grained_level to the value requested by the
         # caller; the base class only instantiates a reasoner when > 0.
@@ -43,11 +47,17 @@ class GoldenRulePolicyWrapper(B1KPolicyWrapper):
             action_horizon=action_horizon,
             temporal_ensemble_max=temporal_ensemble_max,
             fine_grained_level=fine_grained_level,
+            prompt_override=prompt_override,
         )
         self.plan_loader = plan_loader
         self.skill_timeout_steps = skill_timeout_steps
+        self.plan_start_skill_idx = int(plan_start_skill_idx)
+        self.skill_prompt_template = skill_prompt_template
+        self.skill_prompt_override = skill_prompt_override
+        self.skill_prompt_detail_map = self._parse_skill_prompt_detail_map(skill_prompt_detail_map_json)
         self._skill_step_counter: int = 0
         self._current_skill_desc: Optional[str] = None
+        self._last_logged_final_prompt: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     #  Lifecycle
@@ -57,8 +67,89 @@ class GoldenRulePolicyWrapper(B1KPolicyWrapper):
         super().reset()
         self._skill_step_counter = 0
         self._current_skill_desc = None
+        self._last_logged_final_prompt = None
         if self.plan_loader is not None:
             self.plan_loader.reset()
+            for _ in range(max(0, self.plan_start_skill_idx)):
+                self.plan_loader.advance()
+
+    @staticmethod
+    def _normalize_skill_key(text: str | None) -> str:
+        return " ".join(str(text or "").strip().lower().split())
+
+    @classmethod
+    def _parse_skill_prompt_detail_map(cls, raw: str | None) -> dict[str, str]:
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            logger.warning("Failed to parse skill_prompt_detail_map_json=%r: %s", raw, exc)
+            return {}
+        if not isinstance(parsed, dict):
+            logger.warning("Ignoring non-dict skill_prompt_detail_map_json=%r", raw)
+            return {}
+        return {cls._normalize_skill_key(k): str(v) for k, v in parsed.items() if v is not None}
+
+    @staticmethod
+    def _flatten_skill_field(value: Any) -> str:
+        """Return a readable string for annotation fields such as object_id."""
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            flattened = []
+            for item in value:
+                text = GoldenRulePolicyWrapper._flatten_skill_field(item)
+                if text:
+                    flattened.append(text)
+            return ", ".join(flattened)
+        return str(value)
+
+    @staticmethod
+    def _as_control_bool(value: Any) -> bool:
+        """Interpret small websocket control fields that may arrive as numpy scalars/arrays."""
+        if value is None:
+            return False
+        try:
+            if isinstance(value, np.ndarray):
+                return bool(value.item()) if value.shape == () else bool(np.any(value))
+        except Exception:
+            return False
+        return bool(value)
+
+    def _apply_skill_prompt_controls(self, *, skill: Any, skill_desc: str, skill_prompt: str) -> str:
+        """Apply runtime prompt override/template controls for prompt ablations."""
+        if self.skill_prompt_override:
+            return self.skill_prompt_override
+
+        skill_detail = self.skill_prompt_detail_map.get(self._normalize_skill_key(skill_desc))
+        if skill_detail is None:
+            skill_detail = self.skill_prompt_detail_map.get(self._normalize_skill_key(skill_prompt))
+        if skill_detail is None:
+            skill_detail = skill_prompt
+
+        if not self.skill_prompt_template:
+            return skill_detail
+
+        object_id = ""
+        manipulating_object_id = ""
+        if isinstance(skill, dict):
+            object_id = self._flatten_skill_field(skill.get("object_id"))
+            manipulating_object_id = self._flatten_skill_field(skill.get("manipulating_object_id"))
+
+        try:
+            return self.skill_prompt_template.format(
+                skill_prompt=skill_prompt,
+                skill_detail=skill_detail,
+                skill_description=skill_desc,
+                task_prompt=self.task_prompt,
+                task_name=self.task_name,
+                object_id=object_id,
+                manipulating_object_id=manipulating_object_id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to render skill_prompt_template=%r: %s", self.skill_prompt_template, exc)
+            return skill_prompt
 
     # ------------------------------------------------------------------ #
     #  Prompt resolution  (fine_grained_level == 2  →  plan_loader)
@@ -103,10 +194,18 @@ class GoldenRulePolicyWrapper(B1KPolicyWrapper):
         skill_desc = skill.get("skill_description", "") if isinstance(skill, dict) else str(skill)
         self._current_skill_desc = skill_desc
         skill_prompt = self.plan_loader.get_skill_prompt(skill_desc)
+        final_prompt = self._apply_skill_prompt_controls(skill=skill, skill_desc=skill_desc, skill_prompt=skill_prompt)
 
-        prompt_debug["final_prompt"] = skill_prompt
+        prompt_debug["final_prompt"] = final_prompt
         prompt_debug["skill_description"] = skill_desc
-        return skill_prompt, prompt_debug
+        prompt_debug["mapped_skill_prompt"] = skill_prompt
+        prompt_debug["skill_prompt_template"] = self.skill_prompt_template
+        prompt_debug["skill_prompt_override_used"] = self.skill_prompt_override is not None
+        prompt_debug["skill_detail"] = self.skill_prompt_detail_map.get(self._normalize_skill_key(skill_desc))
+        if final_prompt != self._last_logged_final_prompt:
+            logger.info("Golden rule final prompt: %r", final_prompt)
+            self._last_logged_final_prompt = final_prompt
+        return final_prompt, prompt_debug
 
     # ------------------------------------------------------------------ #
     #  Skill completion  (lazy import from BEHAVIOR-1K)
@@ -127,7 +226,7 @@ class GoldenRulePolicyWrapper(B1KPolicyWrapper):
 
         skill_desc = skill.get("skill_description", "") if isinstance(skill, dict) else str(skill)
 
-        # Lazy import – never at module top-level.
+        # Lazy import - never at module top-level.
         try:
             from omnigibson.learning.utils.skill_completion import check_skill_completed  # type: ignore[import-untyped]
         except Exception as exc:
@@ -142,7 +241,7 @@ class GoldenRulePolicyWrapper(B1KPolicyWrapper):
             logger.warning("Skill completion check failed for %r: %s", skill_desc, exc)
             completed = False
 
-        # Timeout guard – always treat timeout as completion so that the
+        # Timeout guard - always treat timeout as completion so that the
         # evaluator does not hang on a single skill.
         if not completed and self._skill_step_counter >= self.skill_timeout_steps:
             logger.info(
@@ -170,6 +269,10 @@ class GoldenRulePolicyWrapper(B1KPolicyWrapper):
         # separately and pass the result through ``input_obs`` when available.
         # For convenience we also perform the check here if the obs carries
         # the required ``env`` / ``info`` keys.
+        if self._as_control_bool(input_obs.pop("golden_rule_advance_plan", False)):
+            logger.info("Received remote golden-rule advance signal")
+            self._advance_plan()
+
         env = input_obs.get("env")
         info = input_obs.get("info", {})
         if env is not None and self.check_skill_completion(env, info):
@@ -185,12 +288,12 @@ class GoldenRulePolicyWrapper(B1KPolicyWrapper):
 
         advanced = self.plan_loader.advance()
         self._skill_step_counter = 0
-        # Force replan: clear the action queue so the next call to act()
-        # will run the policy with the new prompt instead of dequeuing stale
-        # actions.
-        self.action_queue.clear()
+        # Force a fresh per-skill runtime session so the next call to act()
+        # runs like an isolated primitive diagnostic instead of inheriting any
+        # streaming memory / rollout state from the previous skill.
+        self.rotate_session(clear_old=True)
         logger.info(
-            "Advanced plan (advanced=%s); action queue cleared. New skill: %s",
+            "Advanced plan (advanced=%s); policy session rotated. New skill: %s",
             advanced,
             self.current_skill_desc,
         )

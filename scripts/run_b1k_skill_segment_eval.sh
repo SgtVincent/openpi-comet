@@ -80,7 +80,7 @@ SEGMENT_LIMIT_PER_DEMO="${SEGMENT_LIMIT_PER_DEMO:-}"
 SEGMENT_INDICES="${SEGMENT_INDICES:-}"
 INSTANCE_IDS="${INSTANCE_IDS:-}"
 SEGMENT_EXTRA_OVERRIDES="${SEGMENT_EXTRA_OVERRIDES:-}"
-ENV_WRAPPER_TARGET="${ENV_WRAPPER_TARGET:-omnigibson.learning.wrappers.RGBWrapper}"
+ENV_WRAPPER_TARGET="${ENV_WRAPPER_TARGET:-omnigibson.learning.wrappers.RGBLowResWrapper}"
 
 DEMO_DATA_PATH="${DEMO_DATA_PATH:-/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos}"
 RAWDATA_PATH="${RAWDATA_PATH:-/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-rawdata}"

@@ -304,6 +304,16 @@ class PersistentWorker:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to append status event %s: %s", event, exc)
 
+    def _emit_phase(self, phase: str, stage: str, started_at: Optional[float] = None, **fields: Any) -> None:
+        payload = {
+            "phase": phase,
+            "stage": stage,
+            **fields,
+        }
+        if started_at is not None:
+            payload["elapsed_s"] = time.time() - started_at
+        self._emit_status("task_load_phase", **payload)
+
     def _set_state(self, state: str, **fields: Any) -> None:
         now = time.time()
         with self._state_lock:
@@ -395,6 +405,7 @@ class PersistentWorker:
     # ------------------------------------------------------- policy server mgmt
 
     def _start_server(self, task_name: str) -> None:
+        phase_t0 = time.time()
         port = launcher.find_free_port(
             int(self.args.port_base),
             stride=int(self.args.gpus_per_node),
@@ -405,6 +416,13 @@ class PersistentWorker:
             worker_rank=self.rank,
             task_name=task_name,
             port=port,
+        )
+        self._emit_phase(
+            "server_start",
+            "begin",
+            task_name=task_name,
+            port=port,
+            server_run_id=identity["server_run_id"],
         )
         proc, log_file = launcher.start_server(
             task_name=task_name,
@@ -430,6 +448,15 @@ class PersistentWorker:
             server_run_id=identity["server_run_id"],
             log=str(log_file),
         )
+        self._emit_phase(
+            "server_wait_ready",
+            "begin",
+            task_name=task_name,
+            port=port,
+            server_run_id=identity["server_run_id"],
+            server_pid=proc.pid,
+            server_ready_timeout_s=int(self.args.server_ready_timeout),
+        )
         launcher.wait_for_server_proc(
             proc=proc,
             port=port,
@@ -438,6 +465,7 @@ class PersistentWorker:
             expected_identity=identity,
         )
         self._emit_status("server_ready", task_name=task_name, port=port)
+        self._emit_phase("server_start", "done", phase_t0, task_name=task_name, port=port)
 
     def _stop_server(self) -> None:
         if self._server_proc is None:
@@ -461,6 +489,7 @@ class PersistentWorker:
 
     def _build_eval_cfg(self, task_name: str, sample: Dict[str, Any]) -> Any:
         """Compose the Hydra config the evaluator constructor expects."""
+        phase_t0 = time.time()
         from inspect import getsourcefile
 
         import hydra
@@ -514,10 +543,23 @@ class PersistentWorker:
             "segment_predicate_min_consecutive=3",
             f"segment_predicate_dump_trace={'true' if self.args.segment_predicate_dump_trace else 'false'}",
         ]
+        self._emit_phase(
+            "eval_cfg_compose",
+            "begin",
+            task_name=task_name,
+            config_dir=config_dir,
+            demo_id=sample.get("demo_id"),
+            skill_idx=sample.get("skill_idx"),
+            segment_max_steps=int(sample["dynamic_max_steps"]),
+            model_port=int(self._server_port),
+            env_wrapper_target=self.args.env_wrapper_target,
+            partial_scene_load=bool(self.args.partial_scene_load),
+        )
         with hydra.initialize_config_dir(config_dir, version_base="1.1"):
             cfg = hydra.compose("eval_segment_config.yaml", overrides=overrides)
         OmegaConf.resolve(cfg)
         OmegaConf.set_struct(cfg, False)
+        self._emit_phase("eval_cfg_compose", "done", phase_t0, task_name=task_name)
         return cfg
 
     def _unload_evaluator(self) -> None:
@@ -569,15 +611,39 @@ class PersistentWorker:
             # env_wrapper=None. Some Hydra / OmegaConf paths still try to
             # instantiate a null wrapper and return None, which makes
             # Evaluator.self.env None during task load. The base
-            # EnvironmentWrapper avoids RGBWrapper's render-product mutation
+            # EnvironmentWrapper avoids RGB sensor render-product mutation
             # while preserving the expected wrapper interface.
             cfg.env_wrapper._target_ = "omnigibson.envs.env_wrapper.EnvironmentWrapper"
 
         # Import lazily so gm flags above are applied first.
+        self._emit_phase("import_subtask_evaluator", "begin", task_name=task_name)
         from omnigibson.learning.eval_subtask_reset import SubTaskEvaluator
+        self._emit_phase("import_subtask_evaluator", "done", task_name=task_name)
 
+        os.environ["PERSISTENT_EVAL_STATUS_PATH"] = str(self.status_path)
+        os.environ["PERSISTENT_EVAL_WORKER_RANK"] = str(self.rank)
+        os.environ["PERSISTENT_EVAL_GPU_ID"] = str(self.gpu_id)
+        os.environ["PERSISTENT_EVAL_JOB_KEY"] = str(sample.get("job_key") or "")
+        os.environ["PERSISTENT_EVAL_DEMO_ID"] = str(sample.get("demo_id") or "")
+        os.environ["PERSISTENT_EVAL_SKILL_IDX"] = str(sample.get("skill_idx") or "")
+        os.environ["PERSISTENT_EVAL_TASK_NAME"] = str(task_name)
+        ctor_t0 = time.time()
+        self._emit_phase(
+            "subtask_evaluator_ctor",
+            "begin",
+            task_name=task_name,
+            job_key=sample.get("job_key"),
+            demo_id=sample.get("demo_id"),
+            skill_idx=sample.get("skill_idx"),
+            env_wrapper_target=self.args.env_wrapper_target,
+            partial_scene_load=bool(self.args.partial_scene_load),
+        )
         evaluator_ctx = SubTaskEvaluator(cfg)
+        self._emit_phase("subtask_evaluator_ctor", "done", ctor_t0, task_name=task_name)
+        enter_t0 = time.time()
+        self._emit_phase("subtask_evaluator_enter", "begin", task_name=task_name)
         evaluator = evaluator_ctx.__enter__()
+        self._emit_phase("subtask_evaluator_enter", "done", enter_t0, task_name=task_name)
         self._evaluator_ctx = evaluator_ctx
         self._evaluator = evaluator
         self._loaded_task_name = task_name
@@ -872,7 +938,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--launcher-pid", default=0, type=int)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--write-video", action="store_true")
-    parser.add_argument("--env-wrapper-target", default="omnigibson.learning.wrappers.RGBWrapper")
+    parser.add_argument("--env-wrapper-target", default="omnigibson.learning.wrappers.RGBLowResWrapper")
     parser.add_argument(
         "--partial-scene-load",
         action=argparse.BooleanOptionalAction,
@@ -903,6 +969,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
     worker = PersistentWorker(args)
+
+    def _handle_termination(signum: int, _frame: Any) -> None:
+        worker._emit_status("terminated", signal=signum)
+        try:
+            worker._stop_server()
+        finally:
+            worker._stop_heartbeat_thread()
+        raise SystemExit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, _handle_termination)
+    signal.signal(signal.SIGINT, _handle_termination)
     try:
         return worker.run()
     except KeyboardInterrupt:

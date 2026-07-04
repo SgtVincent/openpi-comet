@@ -87,6 +87,9 @@ class Args:
 
     # Golden rule specific
     skill_timeout_steps: int = 300
+    skill_prompt_template: str | None = None
+    skill_prompt_override: str | None = None
+    skill_prompt_detail_map_json: str | None = None
 
     # If provided, the server will load a GT plan from demo annotations and
     # inject it into the policy wrapper.  When None, the wrapper starts with
@@ -94,12 +97,14 @@ class Args:
     # the websocket protocol (not yet implemented).
     demo_data_path: str | None = None
     demo_id: str | None = None
+    plan_start_skill_idx: int = 0
 
 
 def _try_load_plan_loader(
     demo_data_path: str | None,
     task_name: str | None,
     demo_id: str | None,
+    plan_start_skill_idx: int = 0,
 ) -> Any:
     """Attempt to create a GTPlanLoader from the BEHAVIOR-1K repo.
 
@@ -127,11 +132,15 @@ def _try_load_plan_loader(
         )
         plan = loader.load_plan()
         if plan:
+            for _ in range(max(0, int(plan_start_skill_idx))):
+                loader.advance()
             logger.info(
-                "Loaded GT plan with %d skills for task=%s demo=%s",
+                "Loaded GT plan with %d skills for task=%s demo=%s (start_skill_idx=%d, current=%s)",
                 len(plan),
                 task_name,
                 demo_id,
+                plan_start_skill_idx,
+                loader.get_current_skill(),
             )
             return loader
         else:
@@ -170,6 +179,7 @@ def main(args: Args) -> None:
         args.demo_data_path,
         args.task_name,
         args.demo_id,
+        args.plan_start_skill_idx,
     )
 
     policy = GoldenRulePolicyWrapper(
@@ -182,6 +192,11 @@ def main(args: Args) -> None:
         skill_timeout_steps=args.skill_timeout_steps,
         fine_grained_level=args.fine_grained_level,
         temporal_ensemble_max=args.temporal_ensemble_max,
+        plan_start_skill_idx=args.plan_start_skill_idx,
+        prompt_override=args.prompt_override,
+        skill_prompt_template=args.skill_prompt_template,
+        skill_prompt_override=args.skill_prompt_override,
+        skill_prompt_detail_map_json=args.skill_prompt_detail_map_json,
     )
     policy_metadata = {
         **base_policy_metadata,
@@ -190,6 +205,9 @@ def main(args: Args) -> None:
         "server_token": args.server_token,
         "golden_rule": True,
         "n_plan_skills": len(plan_loader) if plan_loader is not None else 0,
+        "skill_prompt_template": args.skill_prompt_template,
+        "skill_prompt_override": args.skill_prompt_override,
+        "skill_prompt_detail_map_json": args.skill_prompt_detail_map_json,
     }
     policy_metadata = {k: v for k, v in policy_metadata.items() if v is not None}
 

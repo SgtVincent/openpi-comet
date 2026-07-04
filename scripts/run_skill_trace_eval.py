@@ -277,7 +277,7 @@ python OmniGibson/omnigibson/learning/eval_segment.py \\
   segment_max_steps={q(dynamic_max_steps)} \\
   model.host=127.0.0.1 \\
   model.port={q(port)} \\
-  env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper \\
+  env_wrapper._target_=omnigibson.learning.wrappers.RGBLowResWrapper \\
   partial_scene_load=true \\
   segment_predicate_window_mode=consecutive \\
   segment_predicate_min_consecutive=3 \\
