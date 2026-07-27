@@ -343,6 +343,14 @@ class BaseModelConfig(abc.ABC):
                 alpha=getattr(train_config.model, "alpha", 10.0),
                 action_expert_name="subtask",
             )
+        elif pytorch_model_name == "pi05_ki_joint_query":
+            from openpi.models_pytorch import pi05_ki_joint_query as _pi05_ki_joint_query
+
+            model = _pi05_ki_joint_query.PI05KIJointQueryPytorch(
+                config=train_config.model,
+                alpha=getattr(train_config.model, "alpha", 10.0),
+                action_expert_name="subtask",
+            )
         elif pytorch_model_name == "pi0_memoryvla":
             from openpi.models_pytorch import pi0_memoryvla as _pi0_memoryvla
 

@@ -24,7 +24,9 @@ import datetime
 import faulthandler
 import functools
 import gc
+import hashlib
 import importlib
+import json
 import importlib.metadata as importlib_metadata
 import logging
 import os
@@ -955,8 +957,205 @@ def _collect_grad_debug_stats(parameters, accelerator: Accelerator) -> dict[str,
     }
 
 
+def _compute_param_group_grad_norm(
+    parameters: list[torch.nn.Parameter],
+    accelerator: Accelerator,
+) -> tuple[float, bool]:
+    """Compute the total L2 gradient norm for a list of parameters.
+
+    Returns a tuple ``(norm, available)`` where ``available`` is False when
+    no usable gradient data was found across all ranks (e.g. all param grads
+    are None or empty shards under ZeRO-2 before ``deepspeed.engine.step()``
+    has consolidated them).  When unavailable, ``norm`` is ``float('nan')``
+    instead of a misleading 0.0.
+
+    Under DeepSpeed ZeRO-2, gradients are partitioned per-rank so we use
+    ``deepspeed.utils.safe_get_local_grad`` to obtain each param's local
+    gradient shard, then all-reduce sum-of-squares across ranks to recover
+    the global norm.
+    """
+    device = accelerator.device
+    total_sq = torch.zeros(1, device=device, dtype=torch.float64)
+    any_grad_seen = False
+
+    # Use DeepSpeed's safe_get_local_grad when available; otherwise fall back
+    # to param.grad directly (DDP / single-GPU / etc.).
+    is_deepspeed = accelerator.distributed_type == DistributedType.DEEPSPEED
+    if is_deepspeed:
+        try:
+            from deepspeed.utils import safe_get_local_grad
+        except ImportError:
+            safe_get_local_grad = None
+    else:
+        safe_get_local_grad = None
+
+    for param in parameters:
+        if is_deepspeed and safe_get_local_grad is not None:
+            try:
+                # safe_get_local_grad is ZeRO-3 only (asserts param has ds_id).
+                # Under ZeRO-2, params don't have ds_id — fall back to param.grad.
+                if not hasattr(param, "ds_id"):
+                    grad = getattr(param, "grad", None)
+                else:
+                    grad = safe_get_local_grad(param)
+            except (AssertionError, RuntimeError, AttributeError):
+                # Any DeepSpeed-specific failure → fall back to direct grad access.
+                grad = getattr(param, "grad", None)
+        else:
+            grad = getattr(param, "grad", None)
+        if grad is None:
+            continue
+        grad_data = grad.detach()
+        if grad_data.numel() == 0:
+            continue
+        any_grad_seen = True
+        finite_mask = torch.isfinite(grad_data)
+        if finite_mask.any():
+            total_sq += grad_data[finite_mask].float().pow(2).sum(dtype=torch.float64)
+
+    # Reduce across ranks (sum of squares) to get global norm when possible.
+    # NOTE: Under ZeRO-2 each rank holds a different shard of each param's
+    # grad tensor, so summing the per-rank norms squared yields the squared
+    # global norm.  Under DDP every rank has the full grad, so we take the
+    # mean (which equals any single rank's value).
+    if is_deepspeed:
+        total_sq = cast(torch.Tensor, accelerator.reduce(total_sq, reduction="sum"))
+    else:
+        total_sq = cast(torch.Tensor, accelerator.reduce(total_sq, reduction="mean"))
+
+    norm_value = float(torch.sqrt(total_sq).item())
+    # If no rank had any gradient data, mark as unavailable (NaN instead of 0.0).
+    if not any_grad_seen and norm_value == 0.0:
+        return float("nan"), False
+    return norm_value, True
+
+
 def _trainable_parameters(module: torch.nn.Module) -> list[torch.nn.Parameter]:
     return [p for p in module.parameters() if p.requires_grad]
+
+
+def _get_git_info() -> dict[str, str]:
+    """Return git commit hash and branch name, best-effort.
+
+    Returns empty strings if git is unavailable or not in a repo.
+    """
+    info: dict[str, str] = {"commit": "", "branch": ""}
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        if result.returncode == 0:
+            info["commit"] = result.stdout.strip()
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        if result.returncode == 0:
+            info["branch"] = result.stdout.strip()
+    except Exception:
+        pass
+    return info
+
+
+def _build_data_fingerprint(config, data_config) -> dict:
+    """Build a data fingerprint dict from TrainConfig + DataConfig.
+
+    Includes a stable SHA256 of canonical serialized data selection params
+    for exact reproducibility of the training data subset.
+    """
+    try:
+        repo_id = getattr(data_config, "repo_id", None) or ""
+        episodes_index = getattr(data_config, "episodes_index", None)
+        tasks = getattr(data_config, "tasks", None)
+        fine_grained_level = getattr(data_config, "fine_grained_level", 0)
+        modalities = getattr(data_config, "modalities", None)
+        subtask_source = getattr(data_config, "subtask_source", None)
+        prompt_from_task = getattr(data_config, "prompt_from_task", False)
+
+        fingerprint = {
+            "repo_id": str(repo_id) if repo_id else "",
+            "seed": getattr(config, "seed", 42),
+            "batch_size": getattr(config, "batch_size", 0),
+            "num_train_steps": getattr(config, "num_train_steps", 0),
+            "fine_grained_level": fine_grained_level,
+        }
+        if episodes_index is not None:
+            fingerprint["num_episodes"] = len(episodes_index)
+            fingerprint["episodes_index_first_last"] = [
+                int(episodes_index[0]),
+                int(episodes_index[-1]),
+            ] if len(episodes_index) > 0 else []
+        if tasks is not None:
+            fingerprint["tasks"] = list(tasks)
+        if modalities is not None:
+            fingerprint["modalities"] = list(modalities)
+        if subtask_source is not None:
+            fingerprint["subtask_source"] = subtask_source
+        fingerprint["prompt_from_task"] = prompt_from_task
+
+        # Build SHA256 of canonical sorted data selection
+        canonical = {
+            "repo_id": str(repo_id) if repo_id else "",
+            "seed": getattr(config, "seed", 42),
+            "fine_grained_level": fine_grained_level,
+            "subtask_source": subtask_source if subtask_source is not None else "",
+            "prompt_from_task": prompt_from_task,
+            "modalities": sorted(modalities) if modalities is not None else [],
+            "tasks": sorted(tasks) if tasks is not None else [],
+            "episodes_index": [int(i) for i in episodes_index] if episodes_index is not None else [],
+        }
+        canonical_json = json.dumps(canonical, sort_keys=True)
+        fingerprint["sha256"] = hashlib.sha256(canonical_json.encode()).hexdigest()
+        fingerprint["sha256_canonical_preview"] = canonical_json[:200] + "..."
+
+        return fingerprint
+    except Exception:
+        return {"error": "failed_to_build_fingerprint"}
+
+
+def _build_checkpoint_manifest(
+    *,
+    config,
+    data_config,
+    global_step: int,
+    accelerator: Accelerator,
+    precision: str,
+) -> dict:
+    """Build the checkpoint manifest.json dict with metadata."""
+    git_info = _get_git_info()
+
+    try:
+        gpu_type = ""
+        if torch.cuda.is_available():
+            gpu_type = torch.cuda.get_device_name(0)
+    except Exception:
+        gpu_type = ""
+
+    manifest = {
+        "git": {
+            "commit": git_info["commit"],
+            "branch": git_info["branch"],
+        },
+        "config": dataclasses.asdict(config) if dataclasses.is_dataclass(config) else str(config),
+        "data_fingerprint": _build_data_fingerprint(config, data_config),
+        "run_metadata": {
+            "global_step": global_step,
+            "timestamp": time.time(),
+            "timestamp_iso": datetime.datetime.now().isoformat(),
+            "hostname": platform.node(),
+        },
+        "hardware": {
+            "num_gpus": accelerator.num_processes,
+            "gpu_type": gpu_type,
+            "precision": precision,
+            "strategy": str(accelerator.distributed_type),
+        },
+    }
+    return manifest
 
 
 def _atomic_write_checkpoint_dir(tmp_dir: Path, final_dir: Path) -> None:
@@ -1045,6 +1244,21 @@ def save_checkpoint(
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
+        # Save manifest.json (human-readable checkpoint metadata fingerprint).
+        try:
+            manifest = _build_checkpoint_manifest(
+                config=config,
+                data_config=data_config,
+                global_step=global_step,
+                accelerator=accelerator,
+                precision=config.pytorch_training_precision,
+            )
+            manifest_path = tmp_ckpt_dir / "manifest.json"
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=2, default=str)
+        except Exception:
+            logging.warning("Failed to write manifest.json", exc_info=True)
+
         # Save norm stats.
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
@@ -1110,6 +1324,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     add_file_logging(str(config.log_dir / f"rank{accelerator.process_index}.log"), formatter)
     install_excepthook()
+
+    # Rank-0 metrics.jsonl writer: one JSON line per optimizer step.
+    # Opened in append mode for resume safety; flushed after every write.
+    _metrics_file = None
+    if is_main:
+        _metrics_path = config.log_dir / "metrics.jsonl"
+        _metrics_file = open(_metrics_path, "a", buffering=1)  # line-buffered
+        logging.info("Writing per-step metrics to %s", _metrics_path)
 
     configure_hf_cache(config, accelerator=accelerator)
     os.environ["OPENPI_FORCE_LOAD_CACHE"] = "1" if config.force_load_cache else "0"
@@ -1249,6 +1471,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     use_vlm2 = config.pytorch_model_name in ("vlm2", "vlm2_subtask")
+    is_pi05_ki_joint = config.pytorch_model_name == "pi05_ki_joint_query"
     if config.pytorch_model_name in ("vlm2", "vlm2_subtask"):
         import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
 
@@ -1303,6 +1526,18 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             alpha=alpha,
             action_expert_name="subtask",
         )
+    elif config.pytorch_model_name == "pi05_ki_joint_query":
+        import openpi.models_pytorch.pi05_ki_joint_query as _pi05_ki_joint_query
+
+        model = _pi05_ki_joint_query.PI05KIJointQueryPytorch(model_cfg)
+        if is_main:
+            ki = bool(getattr(model, "knowledge_insulation", False))
+            logging.info(
+                "π0.5-KI joint query query-MSE variant model loaded (knowledge_insulation=%s, beta_text=%.3f, beta_query=%.3f)",
+                ki,
+                getattr(model, "beta_text", 1.0),
+                getattr(model, "beta_query", 1.0),
+            )
     else:
         import openpi.models_pytorch.pi0_pytorch as _pi0_pytorch
 
@@ -1340,6 +1575,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 "subtask",
                 "pi0_hamlet",
                 "pi0_memoryvla",
+                "pi05_ki_joint_query",
             )
             safetensors.torch.load_model(model, model_path, strict=load_strict)
             if is_main:
@@ -1367,8 +1603,93 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     if len(optim_params) == 0:
         raise RuntimeError("No trainable parameters found (all parameters are frozen).")
 
+    # Per-group peak/end LRs for pi05_ki_joint_query joint model (backbone + expert).
+    # Read from config if available, otherwise fall back to global schedule values.
+    bb_peak_lr = float(getattr(config, "backbone_lr", peak_lr))
+    ex_peak_lr = float(getattr(config, "expert_lr", peak_lr))
+    bb_end_lr = float(getattr(config, "backbone_end_lr", end_lr))
+    ex_end_lr = float(getattr(config, "expert_end_lr", end_lr))
+
+    # LR schedule factory — builds an independent cosine schedule for each param group.
+    def _make_lr_schedule(peak: float, end_val: float):
+        def _schedule(step: int) -> float:
+            if step < warmup_steps:
+                init_lr = peak / (warmup_steps + 1)
+                return init_lr + (peak - init_lr) * step / max(1, warmup_steps)
+            progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
+            cos = 0.5 * (1 + np.cos(np.pi * progress))
+            return end_val + (peak - end_val) * cos
+        return _schedule
+
+    lr_schedule_bb = _make_lr_schedule(bb_peak_lr, bb_end_lr)
+    lr_schedule_ex = _make_lr_schedule(ex_peak_lr, ex_end_lr)
+
     use_8bit_optim = os.environ.get("USE_8BIT_OPTIM", "0") == "1"
-    if use_8bit_optim:
+    if is_pi05_ki_joint:
+        # π0.5-KI joint query: single AdamW with two param groups (backbone + expert).
+        # DeepSpeed ZeRO-2 shards one optimizer state across ranks → memory efficient.
+        bb_params = list(model.get_backbone_params())
+        ex_params = list(model.get_expert_params())
+
+        # Verify coverage (non-zero, no overlap with trainable).
+        bb_ids = {id(p) for p in bb_params}
+        ex_ids = {id(p) for p in ex_params}
+        if bb_ids & ex_ids:
+            raise ValueError("Backbone and expert param groups overlap!")
+        all_ids = bb_ids | ex_ids
+        trainable_ids = {id(p) for p in optim_params}
+        missing = trainable_ids - all_ids
+        if missing:
+            raise ValueError(f"{len(missing)} trainable params not in backbone or expert groups.")
+
+        if use_8bit_optim:
+            try:
+                import bitsandbytes as bnb
+
+                optimizer = bnb.optim.AdamW8bit(
+                    [
+                        {"params": bb_params, "lr": bb_peak_lr, "name": "backbone"},
+                        {"params": ex_params, "lr": ex_peak_lr, "name": "expert"},
+                    ],
+                    betas=(config.optimizer.b1, config.optimizer.b2),
+                    eps=config.optimizer.eps,
+                    weight_decay=config.optimizer.weight_decay,
+                )
+                if is_main:
+                    logging.info("Using 8-bit AdamW with 2 param groups (backbone/expert)")
+            except ImportError:
+                if is_main:
+                    logging.warning("bitsandbytes not found, falling back to standard AdamW")
+                optimizer = torch.optim.AdamW(
+                    [
+                        {"params": bb_params, "lr": bb_peak_lr, "name": "backbone"},
+                        {"params": ex_params, "lr": ex_peak_lr, "name": "expert"},
+                    ],
+                    betas=(config.optimizer.b1, config.optimizer.b2),
+                    eps=config.optimizer.eps,
+                    weight_decay=config.optimizer.weight_decay,
+                )
+        else:
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": bb_params, "lr": bb_peak_lr, "name": "backbone"},
+                    {"params": ex_params, "lr": ex_peak_lr, "name": "expert"},
+                ],
+                betas=(config.optimizer.b1, config.optimizer.b2),
+                eps=config.optimizer.eps,
+                weight_decay=config.optimizer.weight_decay,
+            )
+
+        if is_main:
+            bb_count = sum(p.numel() for p in bb_params)
+            ex_count = sum(p.numel() for p in ex_params)
+            logging.info(
+                "π0.5-KI joint query param-group optimizer: backbone=%d params (%.2fM, lr=%.2e), "
+                "expert=%d params (%.2fM, lr=%.2e)",
+                len(bb_params), bb_count / 1e6, bb_peak_lr,
+                len(ex_params), ex_count / 1e6, ex_peak_lr,
+            )
+    elif use_8bit_optim:
         try:
             import bitsandbytes as bnb
 
@@ -1551,8 +1872,20 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 # Update LR per optimizer step (only when syncing grads).
                 if accelerator.sync_gradients:
                     lr = lr_schedule(global_step)
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = lr
+                    if is_pi05_ki_joint:
+                        # Independent cosine schedules per param group.
+                        lr_bb = lr_schedule_bb(global_step)
+                        lr_ex = lr_schedule_ex(global_step)
+                        for pg in optimizer.param_groups:
+                            if pg.get("name") == "backbone":
+                                pg["lr"] = lr_bb
+                            elif pg.get("name") == "expert":
+                                pg["lr"] = lr_ex
+                            else:
+                                pg["lr"] = lr
+                    else:
+                        for pg in optimizer.param_groups:
+                            pg["lr"] = lr
 
                 extra_metrics: dict[str, float] = {}
                 ds_plugin = accelerator.state.deepspeed_plugin if accelerator.distributed_type == DistributedType.DEEPSPEED else None
@@ -1571,125 +1904,361 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 autocast_dtype = (
                     torch.bfloat16 if config.pytorch_training_precision == "bfloat16" else torch.float16
                 )
-                with torch.autocast(
-                    device_type=accelerator.device.type,
-                    dtype=autocast_dtype,
-                    enabled=use_autocast,
-                ):
+                if is_pi05_ki_joint:
+                    # ================================================================
+                    # π0.5-KI joint query: two-phase forward/backward (one graph at a time)
+                    # Phase 1: backbone (CE + query MSE) → backward → free graph
+                    # Phase 2: expert (flow matching) → backward → free graph
+                    # Single optimizer with 2 param groups; one step at the end.
+                    # Memory: at most one 3.6B graph in memory at once.
+                    # KI: structural (detached KV in expert forward); when KI=ON,
+                    #   phase-2 backward produces zero backbone grads.
+                    # ================================================================
                     if profile_memory:
                         _reset_peak_memory_stats(accelerator)
-                    if use_vlm2:
-                        if config.pytorch_model_name == "vlm2_subtask":
-                            (
-                                video_frames,
-                                point_maps,
-                                language_tokens,
-                                language_masks,
-                                subtask_tokens,
-                                subtask_mask,
-                                subtask_ar_mask,
-                                subtask_loss_mask,
-                            ) = _prepare_vlm2_inputs(observation, config, accelerator.device, include_subtask=True)
-                            losses = model(
-                                video_frames=video_frames,
-                                point_maps=point_maps,
-                                language_tokens=language_tokens,
-                                language_masks=language_masks,
-                                actions=actions,
-                                subtask_tokens=subtask_tokens,
-                                subtask_mask=subtask_mask,
-                                subtask_ar_mask=subtask_ar_mask,
-                                subtask_loss_mask=subtask_loss_mask,
-                            )
-                        else:
-                            video_frames, point_maps, language_tokens, language_masks = _prepare_vlm2_inputs(
-                                observation, config, accelerator.device
-                            )
-                            losses = model(
-                                video_frames=video_frames,
-                                point_maps=point_maps,
-                                language_tokens=language_tokens,
-                                language_masks=language_masks,
-                                actions=actions,
-                            )
-                    else:
-                        losses = model(observation, actions)
 
-                    if isinstance(losses, dict):
-                        extra_metrics = {
-                            k: v.item()
-                            for k, v in losses.items()
-                            if k != "loss" and isinstance(v, torch.Tensor) and v.numel() == 1
-                        }
-                        loss = losses["loss"]
-                    elif isinstance(losses, (list, tuple)):
-                        loss = torch.stack(list(losses)).mean()
-                    elif not isinstance(losses, torch.Tensor):
-                        loss = torch.tensor(losses, device=accelerator.device, dtype=torch.float32)
-                    else:
-                        loss = losses.mean()
+                    # ---- Phase 1: backbone forward + loss check + backward ----
+                    with torch.autocast(
+                        device_type=accelerator.device.type,
+                        dtype=autocast_dtype,
+                        enabled=use_autocast,
+                    ):
+                        bb_losses = model.compute_backbone_losses(observation, actions)
+                        bb_loss = bb_losses["backbone_loss"]
 
-                if _debug_overflow_enabled(config):
-                    extra_metrics.update(_loss_tensor_debug_metrics(losses, actions))
-
-                loss_rank_stats = _gather_scalar_stats(accelerator, loss)
-                any_rank_has_nonfinite_loss = not bool(loss_rank_stats["all_finite"])
-                if any_rank_has_nonfinite_loss and is_main:
-                    logging.error(
-                        "Non-finite loss detected on at least one rank at step=%s: "
-                        "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s std=%s",
-                        global_step,
-                        int(loss_rank_stats["finite_count"]),
-                        int(loss_rank_stats["total_count"]),
-                        int(loss_rank_stats["bad_rank"]),
-                        loss_rank_stats["min"],
-                        loss_rank_stats["max"],
-                        loss_rank_stats["mean"],
-                        loss_rank_stats["std"],
-                    )
-
-                if not torch.isfinite(loss.detach()):
-                    _log_nonfinite_batch_state(loss=loss, actions=actions, observation=observation)
-                    _save_nonfinite_debug_dump(
-                        output_dir=config.log_dir,
-                        global_step=global_step,
-                        accelerator=accelerator,
-                        loss=loss,
-                        actions=actions,
-                        observation=observation,
-                    )
-                if any_rank_has_nonfinite_loss:
-                    consecutive_nonfinite_losses += 1
-                    total_nonfinite_loss_batches += 1
-                    optimizer.zero_grad(set_to_none=True)
-                    accelerator.wait_for_everyone()
-                    if consecutive_nonfinite_losses >= max_consecutive_nonfinite_losses:
-                        raise FloatingPointError(
-                            "Too many consecutive non-finite losses before backward. "
-                            f"Reached {consecutive_nonfinite_losses} skipped batches."
-                        )
-                    if is_main:
-                        logging.warning(
-                            "Skipping non-finite-loss batch at global_step=%s; "
-                            "consecutive_nonfinite_losses=%s/%s",
+                    # Cross-rank finiteness check for backbone loss
+                    bb_loss_stats = _gather_scalar_stats(accelerator, bb_loss)
+                    bb_nonfinite = not bool(bb_loss_stats["all_finite"])
+                    if bb_nonfinite and is_main:
+                        logging.error(
+                            "Non-finite backbone loss at step=%s: "
+                            "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s",
                             global_step,
-                            consecutive_nonfinite_losses,
-                            max_consecutive_nonfinite_losses,
+                            int(bb_loss_stats["finite_count"]),
+                            int(bb_loss_stats["total_count"]),
+                            int(bb_loss_stats["bad_rank"]),
+                            bb_loss_stats["min"],
+                            bb_loss_stats["max"],
+                            bb_loss_stats["mean"],
                         )
-                    continue
+                    if bb_nonfinite:
+                        if not torch.isfinite(bb_loss.detach()):
+                            _log_nonfinite_batch_state(loss=bb_loss, actions=actions, observation=observation)
+                            _save_nonfinite_debug_dump(
+                                output_dir=config.log_dir,
+                                global_step=global_step,
+                                accelerator=accelerator,
+                                loss=bb_loss,
+                                actions=actions,
+                                observation=observation,
+                            )
+                        consecutive_nonfinite_losses += 1
+                        total_nonfinite_loss_batches += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        accelerator.wait_for_everyone()
+                        if consecutive_nonfinite_losses >= max_consecutive_nonfinite_losses:
+                            raise FloatingPointError(
+                                "Too many consecutive non-finite backbone losses. "
+                                f"Reached {consecutive_nonfinite_losses} skipped batches."
+                            )
+                        if is_main:
+                            logging.warning(
+                                "Skipping non-finite backbone loss at step=%s; "
+                                "consecutive_nonfinite_losses=%s/%s",
+                                global_step,
+                                consecutive_nonfinite_losses,
+                                max_consecutive_nonfinite_losses,
+                            )
+                        continue
 
-                consecutive_nonfinite_losses = 0
+                    # Backbone backward (accumulates grads on backbone params only)
+                    accelerator.backward(bb_loss)
 
-                if profile_memory:
-                    log_memory_usage(accelerator, global_step, "after_forward")
+                    # Capture scalar metrics, free backbone graph
+                    bb_loss_val = float(bb_loss.detach().float().item())
+                    # Collect raw component losses with their original keys
+                    extra_metrics = {
+                        k: v.item()
+                        for k, v in bb_losses.items()
+                        if k != "backbone_loss" and isinstance(v, torch.Tensor) and v.numel() == 1
+                    }
+                    # Structured loss component keys for π0.5-KI joint query training
+                    # loss_backbone = total backbone loss (CE + query MSE, weighted)
+                    # loss_ce = raw CE loss (detached)
+                    # loss_query_mse = raw query MSE loss (detached)
+                    extra_metrics["loss_backbone"] = bb_loss_val
+                    extra_metrics["loss_ce"] = extra_metrics.get("ce_loss", float("nan"))
+                    extra_metrics["loss_query_mse"] = extra_metrics.get("query_mse_loss", float("nan"))
+                    del bb_losses, bb_loss
 
-                if profile_memory:
-                    _reset_peak_memory_stats(accelerator)
-                accelerator.backward(loss)
-                if profile_memory:
-                    log_memory_usage(accelerator, global_step, "after_backward")
+                    if profile_memory:
+                        log_memory_usage(accelerator, global_step, "after_backbone_backward")
+                        _reset_peak_memory_stats(accelerator)
 
-                loss_for_log = float(loss.detach().float().item())
+                    # ---- Phase 2: expert forward + loss check + backward ----
+                    with torch.autocast(
+                        device_type=accelerator.device.type,
+                        dtype=autocast_dtype,
+                        enabled=use_autocast,
+                    ):
+                        ex_losses = model.compute_expert_loss(observation, actions)
+                        ex_loss = ex_losses["expert_loss"]
+
+                    # Cross-rank finiteness check for expert loss
+                    ex_loss_stats = _gather_scalar_stats(accelerator, ex_loss)
+                    ex_nonfinite = not bool(ex_loss_stats["all_finite"])
+                    if ex_nonfinite and is_main:
+                        logging.error(
+                            "Non-finite expert loss at step=%s: "
+                            "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s",
+                            global_step,
+                            int(ex_loss_stats["finite_count"]),
+                            int(ex_loss_stats["total_count"]),
+                            int(ex_loss_stats["bad_rank"]),
+                            ex_loss_stats["min"],
+                            ex_loss_stats["max"],
+                            ex_loss_stats["mean"],
+                        )
+                    if ex_nonfinite:
+                        if not torch.isfinite(ex_loss.detach()):
+                            _log_nonfinite_batch_state(loss=ex_loss, actions=actions, observation=observation)
+                            _save_nonfinite_debug_dump(
+                                output_dir=config.log_dir,
+                                global_step=global_step,
+                                accelerator=accelerator,
+                                loss=ex_loss,
+                                actions=actions,
+                                observation=observation,
+                            )
+                        consecutive_nonfinite_losses += 1
+                        total_nonfinite_loss_batches += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        accelerator.wait_for_everyone()
+                        if consecutive_nonfinite_losses >= max_consecutive_nonfinite_losses:
+                            raise FloatingPointError(
+                                "Too many consecutive non-finite expert losses. "
+                                f"Reached {consecutive_nonfinite_losses} skipped batches."
+                            )
+                        if is_main:
+                            logging.warning(
+                                "Skipping non-finite expert loss at step=%s; "
+                                "consecutive_nonfinite_losses=%s/%s",
+                                global_step,
+                                consecutive_nonfinite_losses,
+                                max_consecutive_nonfinite_losses,
+                            )
+                        continue
+
+                    # Expert backward (accumulates grads on expert params only with KI=ON;
+                    # adds flow→backbone grads with KI=OFF)
+                    accelerator.backward(ex_loss)
+
+                    # Capture scalar metrics, free expert graph
+                    ex_loss_val = float(ex_loss.detach().float().item())
+                    for k, v in ex_losses.items():
+                        if k != "expert_loss" and isinstance(v, torch.Tensor) and v.numel() == 1:
+                            extra_metrics[k] = v.item()
+                    # Structured loss component keys for π0.5-KI joint query training
+                    # loss_expert = weighted expert loss (alpha * flow_loss)
+                    # loss_flow_raw = raw flow matching loss (pre-alpha weighting)
+                    extra_metrics["loss_expert"] = ex_loss_val
+                    extra_metrics["loss_flow_raw"] = extra_metrics.get("flow_loss", float("nan"))
+                    del ex_losses, ex_loss
+
+                    # ---- Per-param-group gradient norms (before clipping) ----
+                    # NOTE: Under DeepSpeed ZeRO-2, grads are partitioned per-rank.
+                    # We use safe_get_local_grad + all-reduce sum-of-squares to
+                    # recover the global norm per group.  If gradient data is not
+                    # yet available (e.g. before engine.step()), the value is NaN
+                    # and the ``_available`` flag is False.
+                    # The total grad_norm from accelerator.clip_grad_norm_ is always
+                    # the authoritative total.
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    bb_params_group = list(unwrapped_model.get_backbone_params())
+                    ex_params_group = list(unwrapped_model.get_expert_params())
+
+                    # ---- Loss-based expert fraction (always available) ----
+                    # This is a pure loss-magnitude diagnostic: what fraction of
+                    # the total loss comes from the expert phase.  Always computable
+                    # from loss values regardless of gradient visibility.
+                    total_loss_for_fraction = bb_loss_val + ex_loss_val
+                    if total_loss_for_fraction > 0:
+                        extra_metrics["expert_loss_fraction"] = ex_loss_val / total_loss_for_fraction
+                    else:
+                        extra_metrics["expert_loss_fraction"] = 0.0
+
+                    # Only compute per-group grad norms on sync steps
+                    if accelerator.sync_gradients:
+                        gn_backbone, bb_gn_available = _compute_param_group_grad_norm(bb_params_group, accelerator)
+                        gn_expert, ex_gn_available = _compute_param_group_grad_norm(ex_params_group, accelerator)
+                        extra_metrics["grad_norm_backbone"] = gn_backbone
+                        extra_metrics["grad_norm_expert"] = gn_expert
+                        extra_metrics["grad_norm_backbone_available"] = bb_gn_available
+                        extra_metrics["grad_norm_expert_available"] = ex_gn_available
+
+                        # ---- KI heuristic diagnostic (loss-based, always available when losses > 0) ----
+                        # This is a *heuristic*, not a proof of KI correctness.
+                        #
+                        # Idea: the ratio of expert loss magnitude vs total loss
+                        # serves as a proxy for how much gradient contribution
+                        # the expert phase could potentially make to backbone params.
+                        # When KI=ON, flow gradients should not leak to backbone,
+                        # so the actual expert→backbone contribution should be near zero
+                        # even when this loss ratio is high.
+                        #
+                        # This is a loss-magnitude proxy for KI, not a direct measurement.
+                        # A proper KI verification requires unit tests with
+                        # controlled single-phase backwards (see test_ki_integration_*.py).
+                        total_loss_for_ratio = bb_loss_val + ex_loss_val
+                        if total_loss_for_ratio > 0:
+                            # Heuristic: expert_loss / (backbone_loss + expert_loss)
+                            # When KI=ON, this ratio estimates the maximum possible leak;
+                            # actual leak should be near 0.
+                            extra_metrics["ki_heuristic_loss_ratio"] = ex_loss_val / total_loss_for_ratio
+                        else:
+                            extra_metrics["ki_heuristic_loss_ratio"] = 0.0
+                    else:
+                        # Non-sync steps: no meaningful grad norm across ranks
+                        extra_metrics["grad_norm_backbone"] = float("nan")
+                        extra_metrics["grad_norm_expert"] = float("nan")
+                        extra_metrics["grad_norm_backbone_available"] = False
+                        extra_metrics["grad_norm_expert_available"] = False
+                        extra_metrics["ki_heuristic_loss_ratio"] = float("nan")
+
+                    # Both phases passed — reset counter
+                    consecutive_nonfinite_losses = 0
+
+                    if profile_memory:
+                        log_memory_usage(accelerator, global_step, "after_expert_backward")
+
+                    # Combined loss for logging (backbone + expert)
+                    loss_for_log = bb_loss_val + ex_loss_val
+                    # loss_total alias for consistency with structured keys
+                    extra_metrics["loss_total"] = loss_for_log
+                    # Use expert loss stats as the primary loss_rank_stats for downstream code
+                    loss_rank_stats = ex_loss_stats
+
+                else:
+                    # ---- Standard single-forward path (PI0, PI05, VLM2, etc.) ----
+                    with torch.autocast(
+                        device_type=accelerator.device.type,
+                        dtype=autocast_dtype,
+                        enabled=use_autocast,
+                    ):
+                        if profile_memory:
+                            _reset_peak_memory_stats(accelerator)
+                        if use_vlm2:
+                            if config.pytorch_model_name == "vlm2_subtask":
+                                (
+                                    video_frames,
+                                    point_maps,
+                                    language_tokens,
+                                    language_masks,
+                                    subtask_tokens,
+                                    subtask_mask,
+                                    subtask_ar_mask,
+                                    subtask_loss_mask,
+                                ) = _prepare_vlm2_inputs(observation, config, accelerator.device, include_subtask=True)
+                                losses = model(
+                                    video_frames=video_frames,
+                                    point_maps=point_maps,
+                                    language_tokens=language_tokens,
+                                    language_masks=language_masks,
+                                    actions=actions,
+                                    subtask_tokens=subtask_tokens,
+                                    subtask_mask=subtask_mask,
+                                    subtask_ar_mask=subtask_ar_mask,
+                                    subtask_loss_mask=subtask_loss_mask,
+                                )
+                            else:
+                                video_frames, point_maps, language_tokens, language_masks = _prepare_vlm2_inputs(
+                                    observation, config, accelerator.device
+                                )
+                                losses = model(
+                                    video_frames=video_frames,
+                                    point_maps=point_maps,
+                                    language_tokens=language_tokens,
+                                    language_masks=language_masks,
+                                    actions=actions,
+                                )
+                        else:
+                            losses = model(observation, actions)
+
+                        if isinstance(losses, dict):
+                            extra_metrics = {
+                                k: v.item()
+                                for k, v in losses.items()
+                                if k != "loss" and isinstance(v, torch.Tensor) and v.numel() == 1
+                            }
+                            loss = losses["loss"]
+                        elif isinstance(losses, (list, tuple)):
+                            loss = torch.stack(list(losses)).mean()
+                        elif not isinstance(losses, torch.Tensor):
+                            loss = torch.tensor(losses, device=accelerator.device, dtype=torch.float32)
+                        else:
+                            loss = losses.mean()
+
+                    if _debug_overflow_enabled(config):
+                        extra_metrics.update(_loss_tensor_debug_metrics(losses, actions))
+
+                    loss_rank_stats = _gather_scalar_stats(accelerator, loss)
+                    any_rank_has_nonfinite_loss = not bool(loss_rank_stats["all_finite"])
+                    if any_rank_has_nonfinite_loss and is_main:
+                        logging.error(
+                            "Non-finite loss detected on at least one rank at step=%s: "
+                            "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s std=%s",
+                            global_step,
+                            int(loss_rank_stats["finite_count"]),
+                            int(loss_rank_stats["total_count"]),
+                            int(loss_rank_stats["bad_rank"]),
+                            loss_rank_stats["min"],
+                            loss_rank_stats["max"],
+                            loss_rank_stats["mean"],
+                            loss_rank_stats["std"],
+                        )
+
+                    if not torch.isfinite(loss.detach()):
+                        _log_nonfinite_batch_state(loss=loss, actions=actions, observation=observation)
+                        _save_nonfinite_debug_dump(
+                            output_dir=config.log_dir,
+                            global_step=global_step,
+                            accelerator=accelerator,
+                            loss=loss,
+                            actions=actions,
+                            observation=observation,
+                        )
+                    if any_rank_has_nonfinite_loss:
+                        consecutive_nonfinite_losses += 1
+                        total_nonfinite_loss_batches += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        accelerator.wait_for_everyone()
+                        if consecutive_nonfinite_losses >= max_consecutive_nonfinite_losses:
+                            raise FloatingPointError(
+                                "Too many consecutive non-finite losses before backward. "
+                                f"Reached {consecutive_nonfinite_losses} skipped batches."
+                            )
+                        if is_main:
+                            logging.warning(
+                                "Skipping non-finite-loss batch at global_step=%s; "
+                                "consecutive_nonfinite_losses=%s/%s",
+                                global_step,
+                                consecutive_nonfinite_losses,
+                                max_consecutive_nonfinite_losses,
+                            )
+                        continue
+
+                    consecutive_nonfinite_losses = 0
+
+                    if profile_memory:
+                        log_memory_usage(accelerator, global_step, "after_forward")
+
+                    if profile_memory:
+                        _reset_peak_memory_stats(accelerator)
+                    accelerator.backward(loss)
+                    if profile_memory:
+                        log_memory_usage(accelerator, global_step, "after_backward")
+
+                    loss_for_log = float(loss.detach().float().item())
                 loss_scale = _get_deepspeed_loss_scale(accelerator)
                 if accelerator.sync_gradients:
                     if global_step < 5 and is_main and torch.cuda.is_available() and not profile_memory:
@@ -1833,14 +2402,20 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     # stats/logging use optimizer-step granularity
                     if is_main:
-                        infos.append(
-                            {
-                                "loss": loss_for_log,
-                                "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                                "grad_norm": grad_norm_value,
-                                **extra_metrics,
-                            }
-                        )
+                        info_dict = {
+                            "loss": loss_for_log,
+                            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                            "grad_norm": grad_norm_value,
+                            "grad_norm_total": grad_norm_value,
+                            **extra_metrics,
+                        }
+                        # Per-param-group LRs for π0.5-KI joint query model.
+                        if is_pi05_ki_joint:
+                            for pg in optimizer.param_groups:
+                                name = pg.get("name")
+                                if name:
+                                    info_dict[f"lr_{name}"] = float(pg["lr"])
+                        infos.append(info_dict)
                         if loss_scale is not None:
                             infos[-1]["loss_scale"] = loss_scale
                             # Always warn on dangerously low loss scale (regardless of debug mode)
@@ -1849,6 +2424,18 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                     "loss_scale=%.2e at step=%s — training may be numerically unstable",
                                     loss_scale, global_step,
                                 )
+
+                        # Write per-step metrics to metrics.jsonl (rank 0 only).
+                        # Flattened info_dict + step + epoch for offline analysis.
+                        if _metrics_file is not None:
+                            _epoch = (global_step // steps_per_epoch) + 1
+                            _record = {
+                                "step": int(global_step),
+                                "epoch": int(_epoch),
+                                **info_dict,
+                            }
+                            _metrics_file.write(json.dumps(_record, default=str) + "\n")
+                            _metrics_file.flush()
 
                     if is_main and (global_step % int(config.log_interval) == 0):
                         elapsed = time.time() - start_time
@@ -1869,26 +2456,67 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         loss_scale_values = [info["loss_scale"] for info in infos if "loss_scale" in info]
                         if loss_scale_values:
                             avg_loss_scale = sum(loss_scale_values) / len(loss_scale_values)
-                        logging.info(
-                            "step=%s epoch=%s epoch_step=%s/%s loss=%.4f lr=%.2e grad_norm=%.2f loss_scale=%s time=%.1fs",
-                            global_step,
-                            epoch,
-                            epoch_step,
-                            steps_per_epoch,
-                            avg_loss,
-                            avg_lr,
-                            avg_grad_norm,
-                            f"{avg_loss_scale:.1f}" if avg_loss_scale is not None else "n/a",
-                            elapsed,
-                        )
+
+                        # π0.5-KI joint query: per-component loss averages for log line
+                        avg_bb_loss = None
+                        avg_ex_loss = None
+                        avg_ce_loss = None
+                        avg_flow_raw = None
+                        if is_pi05_ki_joint:
+                            bb_vals = [info["loss_backbone"] for info in infos if "loss_backbone" in info]
+                            ex_vals = [info["loss_expert"] for info in infos if "loss_expert" in info]
+                            ce_vals = [info["loss_ce"] for info in infos if "loss_ce" in info]
+                            flow_vals = [info["loss_flow_raw"] for info in infos if "loss_flow_raw" in info]
+                            if bb_vals:
+                                avg_bb_loss = sum(bb_vals) / len(bb_vals)
+                            if ex_vals:
+                                avg_ex_loss = sum(ex_vals) / len(ex_vals)
+                            if ce_vals:
+                                avg_ce_loss = sum(ce_vals) / len(ce_vals)
+                            if flow_vals:
+                                avg_flow_raw = sum(flow_vals) / len(flow_vals)
+
+                        if is_pi05_ki_joint and avg_bb_loss is not None and avg_ex_loss is not None:
+                            logging.info(
+                                "step=%s epoch=%s epoch_step=%s/%s loss=%.4f (bb=%.4f ex=%.4f ce=%.4f flow=%.4f) "
+                                "lr=%.2e grad_norm=%.2f loss_scale=%s time=%.1fs",
+                                global_step,
+                                epoch,
+                                epoch_step,
+                                steps_per_epoch,
+                                avg_loss,
+                                avg_bb_loss,
+                                avg_ex_loss,
+                                avg_ce_loss if avg_ce_loss is not None else float("nan"),
+                                avg_flow_raw if avg_flow_raw is not None else float("nan"),
+                                avg_lr,
+                                avg_grad_norm,
+                                f"{avg_loss_scale:.1f}" if avg_loss_scale is not None else "n/a",
+                                elapsed,
+                            )
+                        else:
+                            logging.info(
+                                "step=%s epoch=%s epoch_step=%s/%s loss=%.4f lr=%.2e grad_norm=%.2f loss_scale=%s time=%.1fs",
+                                global_step,
+                                epoch,
+                                epoch_step,
+                                steps_per_epoch,
+                                avg_loss,
+                                avg_lr,
+                                avg_grad_norm,
+                                f"{avg_loss_scale:.1f}" if avg_loss_scale is not None else "n/a",
+                                elapsed,
+                            )
 
                         if is_main and config.wandb_enabled and len(infos) > 0:
                             try:
                                 wandb = _get_wandb()
                                 log_payload: dict[str, float] = {
                                     "loss": avg_loss,
+                                    "loss/total": avg_loss,
                                     "learning_rate": avg_lr,
                                     "grad_norm": avg_grad_norm,
+                                    "grad_norm/total": avg_grad_norm,
                                     "step": float(global_step),
                                     "epoch": float(epoch),
                                     "epoch_step": float(epoch_step),
@@ -1897,10 +2525,48 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 }
                                 if avg_loss_scale is not None:
                                     log_payload["loss_scale"] = avg_loss_scale
+
+                                # --- π0.5-KI joint query structured metrics ---
+                                if is_pi05_ki_joint:
+                                    # Loss components
+                                    for metric_key, wandb_key in [
+                                        ("loss_backbone", "loss/backbone"),
+                                        ("loss_ce", "loss/ce"),
+                                        ("loss_query_mse", "loss/query_mse"),
+                                        ("loss_expert", "loss/expert"),
+                                        ("loss_flow_raw", "loss/flow_raw"),
+                                        ("expert_loss_fraction", "loss/expert_fraction"),
+                                    ]:
+                                        vals = [info[metric_key] for info in infos if metric_key in info and np.isfinite(info[metric_key])]
+                                        if vals:
+                                            log_payload[wandb_key] = sum(vals) / len(vals)
+
+                                    # Per-param-group LRs
+                                    for pg_name in ("backbone", "expert"):
+                                        lr_key = f"lr_{pg_name}"
+                                        vals = [info[lr_key] for info in infos if lr_key in info]
+                                        if vals:
+                                            log_payload[f"lr/{pg_name}"] = sum(vals) / len(vals)
+
+                                    # Per-param-group gradient norms
+                                    for pg_name in ("backbone", "expert"):
+                                        gn_key = f"grad_norm_{pg_name}"
+                                        vals = [info[gn_key] for info in infos if gn_key in info and np.isfinite(info[gn_key])]
+                                        if vals:
+                                            log_payload[f"grad_norm/{pg_name}"] = sum(vals) / len(vals)
+
+                                    # KI heuristic diagnostic (clearly labeled as heuristic)
+                                    ki_key = "ki_heuristic_loss_ratio"
+                                    ki_vals = [info[ki_key] for info in infos if ki_key in info and np.isfinite(info[ki_key])]
+                                    if ki_vals:
+                                        log_payload["ki/heuristic_loss_ratio"] = sum(ki_vals) / len(ki_vals)
+
+                                # Backward-compat: legacy subtask/ prefix
                                 for metric_key in ("flow_loss", "ce_loss"):
                                     vals = [info[metric_key] for info in infos if metric_key in info]
                                     if vals:
                                         log_payload[f"subtask/{metric_key}"] = sum(vals) / len(vals)
+
                                 wandb.log(log_payload, step=global_step)
                             except Exception:
                                 logging.warning("wandb log failed; continuing without wandb", exc_info=True)
@@ -1938,6 +2604,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     if pbar is not None:
         pbar.close()
+    # Close metrics.jsonl file (rank 0 only).
+    if _metrics_file is not None:
+        _metrics_file.close()
+        logging.info("metrics.jsonl closed")
     if is_main and config.wandb_enabled:
         try:
             wandb = _get_wandb()

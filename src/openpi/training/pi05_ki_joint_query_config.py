@@ -1,0 +1,338 @@
+"""π0.5-KI joint query Training experimental configs.
+
+Experimental TrainConfig entries for π0.5-KI joint query query-MSE variant joint training with
+Knowledge Insulation (KI) ON/OFF smoke tests.
+
+These are **experimental / smoke-test** configs — not production training configs.
+They use real B1K data and real pi05_base checkpoint but with tiny batch sizes
+and few steps for quick validation.
+
+Precision variants:
+- ``*_smoke``: fp16 (intended production config, unstable on V100)
+- ``*_smoke_fp32``: float32 (V100 smoke test, numerically stable but slower)
+"""
+
+from pathlib import Path
+
+import openpi.models.pi05_ki_joint_query_config as pi05_ki_joint_query_config
+import openpi.training.optimizer as _optimizer
+from openpi.training.data_config import AssetsConfig, DataConfig, LeRobotB1KDataConfig
+from openpi.training.train_config import TrainConfig
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_B1K_DATA_ROOT = "/mnt/bn/saiwenresearch/mlx/users/chenjunting/data/2025-challenge-demos/"
+_B1K_SUBTASK_TEMPLATES = str(
+    _REPO_ROOT / "src/behavior/learning/datas/b1k_subtask_phrase_templates.json"
+)
+_B1K_OBJECT_MAPPING = str(
+    _REPO_ROOT / "src/behavior/learning/datas/b1k_object_id_name_mapping.json"
+)
+_PI05_BASE_CKPT = "checkpoints/pi05_base_pytorch"
+
+
+def _make_b1k_subtask_data_config(episodes_index: list[int] | None = None) -> LeRobotB1KDataConfig:
+    """Shared B1K data config with subtask annotations.
+
+    Args:
+        episodes_index: which episodes to use; None = first 2 (smoke-test scale)
+
+    Returns:
+        LeRobotB1KDataConfig with subtask_source="annotations_skill"
+    """
+    if episodes_index is None:
+        episodes_index = list(range(2))  # smoke-test scale: 2 episodes only
+
+    return LeRobotB1KDataConfig(
+        repo_id="behavior-1k/2025-challenge-demos",
+        assets=AssetsConfig(
+            assets_dir=f"{_PI05_BASE_CKPT}/assets",
+            asset_id="behavior-1k/2025-challenge-demos",
+        ),
+        base_config=DataConfig(
+            prompt_from_task=True,
+            episodes_index=episodes_index,
+            behavior_dataset_root=_B1K_DATA_ROOT,
+            fine_grained_level=0,
+            subtask_source="annotations_skill",
+            subtask_template_path=_B1K_SUBTASK_TEMPLATES,
+            subtask_object_name_mapping_path=_B1K_OBJECT_MAPPING,
+            subtask_joiner=" then ",
+        ),
+    )
+
+
+# Canonical 5-task subset for π0.5-KI joint query long baseline experiments.
+# First 5 tasks from B1K challenge (indices 0-4 in TASK_NAMES_TO_INDICES).
+# Selected as the standard multi-task baseline spanning diverse manipulation
+# skills: articulation (radio), pick-and-place (trash), organizing (decorations),
+# cleaning (plates), and food prep (canning).
+_B1K_MULTITASK_TASKS: tuple[str, ...] = (
+    "turning_on_radio",
+    "picking_up_trash",
+    "putting_away_Halloween_decorations",
+    "cleaning_up_plates_and_food",
+    "can_meat",
+)
+
+
+def _make_b1k_multitask_data_config(num_tasks: int = 5, episodes_per_task: int = 20) -> LeRobotB1KDataConfig:
+    """Multi-task B1K data config with balanced episodes across tasks.
+
+    Selects ``episodes_per_task`` episodes from each of the first ``num_tasks``
+    tasks in ``_B1K_MULTITASK_TASKS`` for a balanced multi-task training subset.
+
+    NOTE: ``episodes_index`` is applied **per selected task**, not globally.
+    With tasks=[t1, t2, ..., tN] and episodes_index=[0..M-1], the total
+    number of episodes is N × M, not M.
+
+    Args:
+        num_tasks: number of tasks to include (first N from _B1K_MULTITASK_TASKS)
+        episodes_per_task: number of episodes per task
+
+    Returns:
+        LeRobotB1KDataConfig with subtask_source="annotations_skill"
+    """
+    if num_tasks > len(_B1K_MULTITASK_TASKS):
+        raise ValueError(
+            f"num_tasks={num_tasks} exceeds available tasks ({len(_B1K_MULTITASK_TASKS)}): "
+            f"{_B1K_MULTITASK_TASKS}"
+        )
+    tasks = list(_B1K_MULTITASK_TASKS[:num_tasks])
+    episodes_index = list(range(episodes_per_task))
+
+    return LeRobotB1KDataConfig(
+        repo_id="behavior-1k/2025-challenge-demos",
+        assets=AssetsConfig(
+            assets_dir=f"{_PI05_BASE_CKPT}/assets",
+            asset_id="behavior-1k/2025-challenge-demos",
+        ),
+        base_config=DataConfig(
+            prompt_from_task=True,
+            tasks=tasks,
+            episodes_index=episodes_index,
+            behavior_dataset_root=_B1K_DATA_ROOT,
+            fine_grained_level=0,
+            subtask_source="annotations_skill",
+            subtask_template_path=_B1K_SUBTASK_TEMPLATES,
+            subtask_object_name_mapping_path=_B1K_OBJECT_MAPPING,
+            subtask_joiner=" then ",
+        ),
+    )
+
+
+def _make_pi05_ki_joint_query_config(
+    *,
+    name: str,
+    knowledge_insulation: bool,
+    num_train_steps: int = 5,
+    batch_size_per_gpu: int = 1,
+    peak_lr: float = 1e-5,
+    precision: str = "float16",
+) -> TrainConfig:
+    """Factory for π0.5-KI joint query query-MSE variant TrainConfig (smoke-test scale).
+
+    Args:
+        name: config name (used for get_config lookup)
+        knowledge_insulation: whether to enable Knowledge Insulation
+        num_train_steps: total training steps
+        batch_size_per_gpu: per-GPU batch size
+        peak_lr: peak learning rate
+        precision: "float16" or "float32" (fp16 = intended production,
+            fp32 = V100 smoke test stability workaround)
+
+    Returns:
+        TrainConfig for PI05KIJointQueryPytorch (query-MSE variant)
+    """
+    if precision == "float16":
+        pytorch_precision = "float16"
+        accel_mp = "fp16"
+    elif precision == "float32":
+        pytorch_precision = "float32"
+        accel_mp = "no"
+    else:
+        raise ValueError(f"Unsupported precision: {precision}")
+
+    # Each config gets its own output dir so KI ON/OFF and fp16/fp32
+    # runs never overwrite each other's checkpoints or logs.
+    output_root = f"./outputs/{name}"
+
+    return TrainConfig(
+        name=name,
+        exp_name=name,  # unique per config
+        project_name="pi05_ki",
+        pytorch_model_name="pi05_ki_joint_query",
+        model=pi05_ki_joint_query_config.Pi05KIJointQueryConfig(
+            alpha=10.0,
+            subtask_max_len=128,
+            action_horizon=32,
+            num_query_tokens=32,
+            knowledge_insulation=knowledge_insulation,
+            truncate_expert_kv=True,
+            beta_text=1.0,
+            beta_query=1.0,
+            flow_loss_weight=10.0,
+        ),
+        data=_make_b1k_subtask_data_config(),
+        pytorch_weight_path=_PI05_BASE_CKPT,
+        num_train_steps=num_train_steps,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=peak_lr,
+            decay_steps=num_train_steps,
+        ),
+        pytorch_training_precision=pytorch_precision,
+        accelerate_mixed_precision=accel_mp,
+        ema_decay=None,
+        wandb_enabled=False,
+        assets_base_dir=f"{output_root}/assets",
+        checkpoint_base_dir=f"{output_root}/checkpoints",
+        log_base_dir=f"{output_root}/logs",
+        num_workers=2,
+        batch_size_per_gpu=batch_size_per_gpu,
+        gradient_accumulation_steps=1,
+        save_interval=2,
+        log_interval=1,
+    )
+
+
+def _make_pi05_ki_joint_query_long_baseline_config(
+    *,
+    name: str,
+    knowledge_insulation: bool,
+    num_train_steps: int,
+    shared_warmup_steps: int = 50,
+    shared_decay_steps: int = 500,
+    shared_peak_lr: float = 1e-5,
+    num_tasks: int = 5,
+    episodes_per_task: int = 20,
+    save_interval: int = 50,
+    precision: str = "float32",
+) -> TrainConfig:
+    """Factory for π0.5-KI joint query query-MSE variant long-baseline TrainConfig.
+
+    Both KI=ON and KI=OFF baselines share the same LR schedule
+    (warmup + cosine decay) so that step-by-step LR values are
+    identical for the first 200 steps.  KI=OFF simply stops earlier.
+
+    Uses a balanced multi-task subset (num_tasks × episodes_per_task).
+
+    Args:
+        name: config name (used for get_config lookup)
+        knowledge_insulation: whether to enable Knowledge Insulation
+        num_train_steps: total training steps
+        shared_warmup_steps: warmup steps (same for both baselines)
+        shared_decay_steps: total decay steps (same for both baselines)
+        shared_peak_lr: peak learning rate (same for both baselines)
+        num_tasks: number of tasks for multi-task subset
+        episodes_per_task: episodes per task
+        save_interval: checkpoint save interval in steps
+        precision: "float16" or "float32"
+
+    Returns:
+        TrainConfig for PI05KIJointQueryPytorch (query-MSE variant) long baseline
+    """
+    if precision == "float16":
+        pytorch_precision = "float16"
+        accel_mp = "fp16"
+    elif precision == "float32":
+        pytorch_precision = "float32"
+        accel_mp = "no"
+    else:
+        raise ValueError(f"Unsupported precision: {precision}")
+
+    output_root = f"./outputs/{name}"
+
+    return TrainConfig(
+        name=name,
+        exp_name=name,  # unique per config
+        project_name="pi05_ki",
+        pytorch_model_name="pi05_ki_joint_query",
+        model=pi05_ki_joint_query_config.Pi05KIJointQueryConfig(
+            alpha=10.0,
+            subtask_max_len=128,
+            action_horizon=32,
+            num_query_tokens=32,
+            knowledge_insulation=knowledge_insulation,
+            truncate_expert_kv=True,
+            beta_text=1.0,
+            beta_query=1.0,
+            flow_loss_weight=10.0,
+        ),
+        data=_make_b1k_multitask_data_config(
+            num_tasks=num_tasks,
+            episodes_per_task=episodes_per_task,
+        ),
+        pytorch_weight_path=_PI05_BASE_CKPT,
+        num_train_steps=num_train_steps,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=shared_warmup_steps,
+            peak_lr=shared_peak_lr,
+            decay_steps=shared_decay_steps,
+            decay_lr=0.0,
+        ),
+        pytorch_training_precision=pytorch_precision,
+        accelerate_mixed_precision=accel_mp,
+        ema_decay=None,
+        wandb_enabled=False,
+        assets_base_dir=f"{output_root}/assets",
+        checkpoint_base_dir=f"{output_root}/checkpoints",
+        log_base_dir=f"{output_root}/logs",
+        num_workers=2,
+        batch_size_per_gpu=1,
+        gradient_accumulation_steps=1,
+        save_interval=save_interval,
+        log_interval=1,
+    )
+
+
+_PI05_KI_JOINT_QUERY_CONFIGS = [
+    # --- fp16 base configs (intended production; may be unstable on V100) ---
+    _make_pi05_ki_joint_query_config(
+        name="pi05_ki_joint_query_b1k-ki_on_smoke",
+        knowledge_insulation=True,
+        precision="float16",
+    ),
+    _make_pi05_ki_joint_query_config(
+        name="pi05_ki_joint_query_b1k-ki_off_smoke",
+        knowledge_insulation=False,
+        precision="float16",
+    ),
+    # --- fp32 V100 smoke variants (numerically stable, for validation only) ---
+    _make_pi05_ki_joint_query_config(
+        name="pi05_ki_joint_query_b1k-ki_on_smoke_fp32",
+        knowledge_insulation=True,
+        precision="float32",
+    ),
+    _make_pi05_ki_joint_query_config(
+        name="pi05_ki_joint_query_b1k-ki_off_smoke_fp32",
+        knowledge_insulation=False,
+        precision="float32",
+    ),
+    # --- Long baselines: multi-task, shared LR schedule, fp32 ---
+    # Both share identical LR schedule (warmup=50, decay=500, peak=1e-5)
+    # KI=OFF stops at 200 steps on the same schedule curve
+    _make_pi05_ki_joint_query_long_baseline_config(
+        name="pi05_ki_joint_query_b1k-multitask-ki_on_500step_fp32",
+        knowledge_insulation=True,
+        num_train_steps=500,
+        shared_warmup_steps=50,
+        shared_decay_steps=500,
+        shared_peak_lr=1e-5,
+        num_tasks=5,
+        episodes_per_task=20,
+        save_interval=50,
+        precision="float32",
+    ),
+    _make_pi05_ki_joint_query_long_baseline_config(
+        name="pi05_ki_joint_query_b1k-multitask-ki_off_200step_fp32",
+        knowledge_insulation=False,
+        num_train_steps=200,
+        shared_warmup_steps=50,
+        shared_decay_steps=500,
+        shared_peak_lr=1e-5,
+        num_tasks=5,
+        episodes_per_task=20,
+        save_interval=50,
+        precision="float32",
+    ),
+]

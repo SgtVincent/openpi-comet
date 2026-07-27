@@ -38,7 +38,7 @@ class TrainConfig:
     # Gemma/PaliGemma fine-tuning than bf16.
     pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "bfloat16"
 
-    pytorch_model_name: Literal["pi0", "pi0_hamlet", "pi0_memoryvla", "vlm2", "vlm2_subtask", "subtask"] = "pi0"
+    pytorch_model_name: Literal["pi0", "pi0_hamlet", "pi0_memoryvla", "vlm2", "vlm2_subtask", "subtask", "pi05_ki_joint_query"] = "pi0"
 
     # Accelerate controls (used by scripts/train_accelerate.py). Defaults preserve existing behavior.
     gradient_accumulation_steps: int = 1
@@ -154,12 +154,13 @@ def eps_index_fn(*indexs):
     return eps_index
 
 
+from openpi.training.pi05_ki_joint_query_config import _PI05_KI_JOINT_QUERY_CONFIGS
 from openpi.training.pretrain_config import _PRETRAIN_CONFIGS
 from openpi.training.rft_config import _RFT_CONFIGS
 from openpi.training.sft_config import _SFT_CONFIGS
 from openpi.training.test_config import _TEST_CONFIGS
 
-_CONFIGS = [*_PRETRAIN_CONFIGS, *_SFT_CONFIGS, *_RFT_CONFIGS, *_TEST_CONFIGS]
+_CONFIGS = [*_PRETRAIN_CONFIGS, *_SFT_CONFIGS, *_RFT_CONFIGS, *_TEST_CONFIGS, *_PI05_KI_JOINT_QUERY_CONFIGS]
 
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
