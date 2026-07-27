@@ -1,3 +1,4 @@
+import math
 from typing import Literal
 
 import pytest
@@ -7,6 +8,128 @@ from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
+from transformers.models.siglip import modeling_siglip
+
+
+def _sharded_lecun_normal_(tensor: torch.Tensor, fan_in: int) -> None:
+    if tensor.numel() == 0:
+        return
+    variance = 1.0 / max(1, fan_in)
+    std = math.sqrt(variance) / 0.87962566103423978
+    modeling_siglip.trunc_normal_tf_(tensor, std=std)
+
+
+def _sharded_default_flax_embed_init_(tensor: torch.Tensor, fan_in: int) -> None:
+    if tensor.numel() == 0:
+        return
+    std = math.sqrt(1.0 / max(1, fan_in))
+    with torch.no_grad():
+        tensor.normal_(std=std)
+
+
+def _sharded_xavier_uniform_(tensor: torch.Tensor, fan_in: int, fan_out: int) -> None:
+    if tensor.numel() == 0:
+        return
+    bound = math.sqrt(6.0 / max(1, fan_in + fan_out))
+    with torch.no_grad():
+        tensor.uniform_(-bound, bound)
+
+
+def _fan_in_from_module(module: nn.Module) -> int:
+    if isinstance(module, nn.Embedding):
+        return int(module.embedding_dim)
+    if isinstance(module, nn.Linear):
+        return int(module.in_features)
+    if isinstance(module, nn.Conv2d):
+        kernel_h, kernel_w = module.kernel_size
+        return int((module.in_channels // module.groups) * kernel_h * kernel_w)
+    raise TypeError(f"Unsupported module type for sharded init: {type(module)}")
+
+
+def _patch_siglip_init_for_zero3() -> None:
+    current = modeling_siglip.SiglipPreTrainedModel._init_weights
+    if getattr(current, "_openpi_zero3_safe", False):
+        return
+
+    original_init_weights = current
+
+    def _patched_init_weights(self, module):
+        if isinstance(module, nn.Embedding) and module.weight.ndim < 2:
+            _sharded_default_flax_embed_init_(module.weight, _fan_in_from_module(module))
+            return
+        if isinstance(module, modeling_siglip.SiglipAttention) and module.q_proj.weight.ndim < 2:
+            embed_dim = int(module.q_proj.in_features)
+            proj_dim = int(module.q_proj.out_features)
+            for proj in (module.q_proj, module.k_proj, module.v_proj, module.out_proj):
+                _sharded_xavier_uniform_(proj.weight, embed_dim, proj_dim)
+                if proj.bias is not None:
+                    nn.init.zeros_(proj.bias)
+            return
+        if isinstance(module, modeling_siglip.SiglipMLP) and module.fc1.weight.ndim < 2:
+            _sharded_xavier_uniform_(module.fc1.weight, module.fc1.in_features, module.fc1.out_features)
+            _sharded_xavier_uniform_(module.fc2.weight, module.fc2.in_features, module.fc2.out_features)
+            if module.fc1.bias is not None:
+                nn.init.normal_(module.fc1.bias, std=1e-6)
+            if module.fc2.bias is not None:
+                nn.init.normal_(module.fc2.bias, std=1e-6)
+            return
+        if isinstance(module, (nn.Linear, nn.Conv2d)) and module.weight.ndim < 2:
+            _sharded_lecun_normal_(module.weight, _fan_in_from_module(module))
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+            return
+        return original_init_weights(self, module)
+
+    _patched_init_weights._openpi_zero3_safe = True  # type: ignore[attr-defined]
+    modeling_siglip.SiglipPreTrainedModel._init_weights = _patched_init_weights
+
+
+def _patch_gemma_init_for_zero3() -> None:
+    current = modeling_gemma.GemmaPreTrainedModel._init_weights
+    if getattr(current, "_openpi_zero3_safe", False):
+        return
+
+    original_init_weights = current
+
+    def _patched_init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear) and module.weight.ndim < 2:
+            if module.weight.numel() > 0:
+                with torch.no_grad():
+                    module.weight.normal_(mean=0.0, std=std)
+            if module.bias is not None and module.bias.numel() > 0:
+                module.bias.data.zero_()
+            return
+        if isinstance(module, nn.Embedding) and module.weight.ndim < 2:
+            if module.weight.numel() > 0:
+                with torch.no_grad():
+                    module.weight.normal_(mean=0.0, std=std)
+                if module.padding_idx is not None and 0 <= module.padding_idx < module.weight.shape[0]:
+                    module.weight.data[module.padding_idx].zero_()
+            return
+        return original_init_weights(self, module)
+
+    _patched_init_weights._openpi_zero3_safe = True  # type: ignore[attr-defined]
+    modeling_gemma.GemmaPreTrainedModel._init_weights = _patched_init_weights
+
+
+def _patch_gemma_rmsnorm_repr_for_zero3() -> None:
+    current = modeling_gemma.GemmaRMSNorm.extra_repr
+    if getattr(current, "_openpi_zero3_safe", False):
+        return
+
+    def _patched_extra_repr(self):
+        weight = getattr(self, "weight", None)
+        shape_repr = tuple(weight.shape) if weight is not None else ("partitioned",)
+        return f"{shape_repr}, eps={self.eps}"
+
+    _patched_extra_repr._openpi_zero3_safe = True  # type: ignore[attr-defined]
+    modeling_gemma.GemmaRMSNorm.extra_repr = _patched_extra_repr
+
+
+_patch_siglip_init_for_zero3()
+_patch_gemma_init_for_zero3()
+_patch_gemma_rmsnorm_repr_for_zero3()
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -15,7 +138,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config,
         action_expert_config,
         use_adarms=None,
-        precision: Literal["bfloat16", "float32"] = "bfloat16",
+        precision: Literal["bfloat16", "float16", "float32"] = "bfloat16",
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -60,9 +183,11 @@ class PaliGemmaWithExpertModel(nn.Module):
 
         self.to_bfloat16_for_selected_params(precision)
 
-    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
+    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
+        elif precision == "float16":
+            self.to(dtype=torch.float16)
         elif precision == "float32":
             self.to(dtype=torch.float32)
             return
@@ -225,9 +350,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
                     after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
-                    # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                        out_emb = out_emb.to(dtype=torch.bfloat16)
+                    # Match the downstream MLP compute dtype to avoid extra implicit casts.
+                    target_dtype = layer.mlp.up_proj.weight.dtype
+                    if out_emb.dtype != target_dtype:
+                        out_emb = out_emb.to(dtype=target_dtype)
 
                     out_emb = layer.mlp(out_emb)
                     # second residual

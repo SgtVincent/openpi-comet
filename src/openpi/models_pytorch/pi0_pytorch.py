@@ -13,12 +13,14 @@ from openpi.models_pytorch.action_experts import create_action_expert
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
+logger = logging.getLogger(__name__)
+
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "cpu":
-        # CPU doesn't support bfloat16, use float32 instead
-        if target_dtype == torch.bfloat16:
+        # CPU doesn't support bfloat16/float16 well, use float32 instead
+        if target_dtype in (torch.bfloat16, torch.float16):
             return torch.float32
         if target_dtype == torch.float64:
             return torch.float64
@@ -124,14 +126,18 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
+        msg = (
+            "transformers_replace compatibility check failed. "
+            "openpi-comet now patches SigLIP init at runtime, so manual `cp` into site-packages should not be required. "
+            "If model creation still fails, check local `src/openpi/models_pytorch/gemma_pytorch.py` and transformers version compatibility."
+        )
         try:
             from transformers.models.siglip import check
 
             if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
+                logger.warning(msg)
         except ImportError:
-            raise ValueError(msg) from None
+            logger.warning(msg)
 
         self.action_expert = create_action_expert(
             action_expert_name,
@@ -174,7 +180,31 @@ class PI0Pytorch(nn.Module):
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+        if os.environ.get("OPENPI_DEBUG_ATTENTION_MASK", "0") in {"1", "true", "TRUE", "True"}:
+            valid_keys_per_query = att_2d_masks_4d.any(dim=-1)
+            if not bool(valid_keys_per_query.all().item()):
+                invalid_rows = int((~valid_keys_per_query).sum().item())
+                total_rows = valid_keys_per_query.numel()
+                if not getattr(self, "_logged_all_masked_attention_rows", False):
+                    logger.warning(
+                        "Attention mask contains %d/%d query rows with no valid keys. This can produce NaNs "
+                        "in some attention kernels; using finite fp16-safe mask sentinel still avoids -inf overflow.",
+                        invalid_rows,
+                        total_rows,
+                    )
+                    self._logged_all_masked_attention_rows = True
+                if os.environ.get("OPENPI_STRICT_ATTENTION_MASK", "0") in {"1", "true", "TRUE", "True"}:
+                    raise ValueError(f"Attention mask contains {invalid_rows}/{total_rows} all-masked rows.")
+        # Keep the additive mask finite under fp16 autocast.  The previous
+        # sentinel (-2.3819763e38) overflows to -inf when an attention backend
+        # casts the mask to float16, which can amplify NaN risk in long V100
+        # fp16 runs.  -1e4 is representable in fp16 and still effectively
+        # suppresses masked logits in softmax.
+        return torch.where(
+            att_2d_masks_4d,
+            torch.zeros((), dtype=torch.float32, device=att_2d_masks.device),
+            torch.full((), -1.0e4, dtype=torch.float32, device=att_2d_masks.device),
+        )
 
     def make_att_2d_masks(self, pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch.Tensor:
         return make_att_2d_masks(pad_masks, att_masks)
@@ -288,6 +318,11 @@ class PI0Pytorch(nn.Module):
         time_emb = time_emb.type(dtype=timestep.dtype)
 
         # Fuse timestep + action information using an MLP
+        # Align noisy_actions to the projection layer compute dtype to avoid fp16/bf16 mismatch
+        # under DeepSpeed/Accelerate mixed precision.
+        if isinstance(noisy_actions, torch.Tensor) and noisy_actions.dtype != self.action_in_proj.weight.dtype:
+            noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
+
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
@@ -358,7 +393,8 @@ class PI0Pytorch(nn.Module):
             time=time,
         )
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        # Keep flow-loss math in fp32 to reduce fp16 overflow risk on V100.
+        return F.mse_loss(u_t.float(), v_t.float(), reduction="none")
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

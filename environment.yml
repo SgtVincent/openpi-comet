@@ -167,6 +167,8 @@ dependencies:
   - zlib-ng=2.3.3
   - zstd=1.5.7
   - pip:
+      - accelerate==1.13.0
+      - deepspeed==0.18.8
       - absl-py==2.3.0
       - addict==2.4.0
       - aenum==3.1.16

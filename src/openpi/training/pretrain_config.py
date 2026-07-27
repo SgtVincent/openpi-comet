@@ -49,7 +49,7 @@ _PRETRAIN_CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                 tasks=["turning_on_radio"],
                 fine_grained_level=0,
             ),
@@ -110,6 +110,53 @@ _PRETRAIN_CONFIGS = [
         batch_size=8 * 32,
     ),
     TrainConfig(
+        name="pi05_memoryvla_b1k-pt12_cs32_bs64_lr1e-4_step50k",
+        exp_name="openpi",
+        project_name="B1K",
+        pytorch_model_name="pi0_memoryvla",
+        model=memoryvla_config.MemoryVLAConfig(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="checkpoints/openpi_comet/pi05-b1kpt12-cs32/assets",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
+                tasks=[
+                    "turning_on_radio",
+                    "picking_up_trash",
+                    "hiding_Easter_eggs",
+                    "wash_a_baseball_cap",
+                    "hanging_pictures",
+                    "attach_a_camera_to_a_tripod",
+                    "make_microwave_popcorn",
+                    "bringing_water",
+                    "tidying_bedroom",
+                    "putting_shoes_on_rack",
+                    "setting_the_fire",
+                    "cook_hot_dogs",
+                ],
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pi05_base_pytorch",
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=5e-5,
+            decay_steps=50_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
         name="pi05_b1k-pt50_cs32_bs64_lr2.5e-5_step50k",
         exp_name="openpi",
         project_name="B1K",
@@ -163,7 +210,7 @@ _PRETRAIN_CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                 fine_grained_level=0,
             ),
         ),
@@ -198,7 +245,7 @@ _PRETRAIN_CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                 fine_grained_level=0,
             ),
         ),
@@ -346,7 +393,7 @@ _PRETRAIN_CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                 fine_grained_level=0,
             ),
         ),
@@ -426,7 +473,7 @@ _PRETRAIN_CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/",
                 tasks=[
                     "turning_on_radio",
                     "picking_up_trash",

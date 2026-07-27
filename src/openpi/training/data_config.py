@@ -4,6 +4,7 @@ import dataclasses
 from enum import Enum
 from enum import auto
 import logging
+import os
 import pathlib
 from typing import Protocol, TypeAlias
 
@@ -272,13 +273,19 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
-        return dataclasses.replace(
+        config = dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
+        # Allow overriding the BEHAVIOR dataset root at runtime (common across clusters).
+        override_root = os.environ.get("OPENPI_BEHAVIOR_DATASET_ROOT")
+        if override_root:
+            config = dataclasses.replace(config, behavior_dataset_root=override_root)
+            logging.info("Overriding behavior_dataset_root via OPENPI_BEHAVIOR_DATASET_ROOT=%s", override_root)
+        return config
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:

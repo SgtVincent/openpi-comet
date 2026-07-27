@@ -24,6 +24,7 @@ from typing import Callable, Optional, Union
 import torch
 from torch import nn
 
+from openpi.models_pytorch.dtype_utils import align_tensors_to_reference_dtype
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -502,9 +503,13 @@ class GemmaModel(GemmaPreTrainedModel):
 
         # embed positions
         hidden_states = inputs_embeds
-        # Convert to bfloat16 if the first layer uses bfloat16
-        if len(self.layers) > 0 and self.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(torch.bfloat16)
+        # Align activations to the first layer compute dtype, but only for standard floating dtypes.
+        if len(self.layers) > 0:
+            (hidden_states,) = align_tensors_to_reference_dtype(
+                self.layers[0].self_attn.q_proj.weight,
+                hidden_states,
+                context="decoder",
+            )
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

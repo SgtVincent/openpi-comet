@@ -1,0 +1,2007 @@
+"""
+Accelerate training entrypoint for PI0/PI05/VLM2 (PyTorch).
+
+This script is a sibling of `scripts/train_pytorch.py`:
+- Keeps the same config/data/model pipeline
+- Replaces manual DDP orchestration with HuggingFace Accelerate
+- Optionally supports DeepSpeed ZeRO via `accelerate launch --config_file ...`
+
+Usage
+Single process (CPU/GPU):
+  python scripts/train_accelerate.py <config_name> --exp_name <run_name>
+
+Multi-GPU:
+  accelerate launch --multi_gpu --num_processes=<n> scripts/train_accelerate.py <config_name> --exp_name <run_name>
+
+DeepSpeed ZeRO:
+  accelerate launch --config_file configs/accelerate_ds_zero2.yaml scripts/train_accelerate.py <config_name> --exp_name <run_name>
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime
+import faulthandler
+import functools
+import gc
+import importlib
+import importlib.metadata as importlib_metadata
+import logging
+import os
+import platform
+import signal
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING
+from typing import cast
+
+faulthandler.enable()
+faulthandler.register(signal.SIGUSR1, all_threads=True)
+
+_FAULT_TIMEOUT_S = int(os.environ.get("OPENPI_FAULT_TIMEOUT_S", "0"))
+_FAULT_REPEAT = os.environ.get("OPENPI_FAULT_REPEAT", "0") == "1"
+if _FAULT_TIMEOUT_S > 0:
+    faulthandler.dump_traceback_later(_FAULT_TIMEOUT_S, repeat=_FAULT_REPEAT)
+
+
+def _patch_byted_wandb_metadata() -> None:
+    """Let libraries that probe `wandb` metadata work with `byted-wandb`.
+
+    The internal Tracking SDK is installed as `byted-wandb` while exposing the
+    import name `wandb`. Some libraries, including HuggingFace Accelerate paths,
+    probe package metadata by distribution name (`wandb`). When only
+    `byted-wandb` is installed this can fail even though `import wandb` works.
+    The byted-wandb guide recommends remapping that metadata lookup early.
+    """
+
+    if os.environ.get("OPENPI_DISABLE_BYTED_WANDB_METADATA_PATCH", "0") in {"1", "true", "TRUE", "True"}:
+        return
+
+    old_metadata = importlib_metadata.metadata
+
+    def metadata(name: str):
+        if name == "wandb":
+            try:
+                return old_metadata("byted-wandb")
+            except importlib_metadata.PackageNotFoundError:
+                pass
+        return old_metadata(name)
+
+    importlib_metadata.metadata = metadata
+
+
+_patch_byted_wandb_metadata()
+
+import numpy as np
+import safetensors.torch
+import torch
+import tqdm
+import tree
+from accelerate import Accelerator
+from accelerate.utils import DistributedType
+
+
+def _strip_wandb_vendor_from_sys_path() -> None:
+    """Prevent wandb vendored deps from shadowing real packages.
+
+    Some internal wandb distributions may prepend `.../wandb/vendor` to sys.path,
+    which can cause unrelated imports (e.g., IPython -> pygments) to pick up
+    vendored, incompatible modules.
+    """
+
+    def _norm(p: str) -> str:
+        return p.replace("\\", "/")
+
+    sys.path[:] = [p for p in sys.path if p and "/wandb/vendor" not in _norm(p)]
+
+    # If pygments was already imported from wandb's vendor tree, drop it so the
+    # next import resolves to the real `pygments` package.
+    for name, mod in list(sys.modules.items()):
+        if not name.startswith("pygments"):
+            continue
+        mod_file = getattr(mod, "__file__", "")
+        if mod_file and "/wandb/vendor/pygments" in _norm(mod_file):
+            sys.modules.pop(name, None)
+
+
+_strip_wandb_vendor_from_sys_path()
+
+# Lazily imported OpenPI modules.
+_model = None  # type: ignore[assignment]
+_normalize = None  # type: ignore[assignment]
+_config = None  # type: ignore[assignment]
+_data_loader = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    import openpi.models.model as _model
+    import openpi.shared.normalize as _normalize
+    import openpi.training.config as _config
+    import openpi.training.data_loader as _data_loader
+
+
+_WANDB = None
+
+
+def _get_wandb():
+    global _WANDB
+    if _WANDB is None:
+        import wandb
+
+        _WANDB = wandb
+    return _WANDB
+
+
+def init_logging():
+    level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
+
+    class CustomFormatter(logging.Formatter):
+        def format(self, record):
+            record.levelname = level_mapping.get(record.levelname, record.levelname)
+            return super().format(record)
+
+    formatter: logging.Formatter = CustomFormatter(
+        fmt="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)-80s (%(process)d:%(filename)s:%(lineno)s)",
+        datefmt="%H:%M:%S",
+    )
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+    else:
+        logger.handlers[0].setFormatter(formatter)
+
+    return formatter
+
+
+def add_file_logging(log_file: str, formatter: logging.Formatter) -> None:
+    logger = logging.getLogger()
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == os.path.abspath(log_file):
+            return
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+
+def _wait_for_path(path: Path, *, what: str) -> None:
+    timeout_s = float(os.environ.get("OPENPI_FS_SYNC_TIMEOUT_S", "600"))
+    poll_s = float(os.environ.get("OPENPI_FS_SYNC_POLL_S", "1"))
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if path.exists():
+            return
+        time.sleep(poll_s)
+    raise TimeoutError(f"Timed out waiting for {what}: {path}")
+
+
+def install_excepthook() -> None:
+    default_hook = sys.excepthook
+
+    def _hook(exc_type, exc, tb):
+        try:
+            logging.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+        finally:
+            default_hook(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
+def configure_hf_cache(config: _config.TrainConfig, *, accelerator: Accelerator) -> None:
+    offline = os.environ.get("OPENPI_OFFLINE", "1") == "1"
+    if offline:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    if os.environ.get("OPENPI_TORCH_COMPILE_SAMPLE_ACTIONS", "0") != "1":
+        os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+    checkpoints_root = Path(config.checkpoint_base_dir).expanduser().resolve()
+    hf_home = Path(os.environ.get("HF_HOME", str(checkpoints_root / "hf_home"))).expanduser()
+    hub_cache = Path(os.environ.get("HUGGINGFACE_HUB_CACHE", str(hf_home / "hub"))).expanduser()
+    transformers_cache = Path(os.environ.get("TRANSFORMERS_CACHE", str(hf_home / "transformers"))).expanduser()
+    datasets_cache = Path(
+        os.environ.get("HF_DATASETS_CACHE", str(checkpoints_root / "hf_datasets_cache"))
+    ).expanduser()
+
+    os.environ["HF_HOME"] = str(hf_home)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hub_cache)
+    os.environ["TRANSFORMERS_CACHE"] = str(transformers_cache)
+    os.environ["HF_DATASETS_CACHE"] = str(datasets_cache)
+
+    # Keep the existing per-node caching behavior to reduce filelock races in multi-process runs.
+    if accelerator.num_processes > 1:
+        os.environ.setdefault("OPENPI_HF_DATASETS_CACHE_PER_RANK", "1")
+        os.environ.setdefault("OPENPI_LOAD_DATASET_NUM_PROC_CAP", "32")
+        os.environ.setdefault("OPENPI_HF_LOAD_DATASET_RETRIES", "5")
+        os.environ.setdefault("OPENPI_HF_LOAD_DATASET_RETRY_SLEEP_S", "2")
+
+    if accelerator.is_main_process:
+        hf_home.mkdir(parents=True, exist_ok=True)
+        hub_cache.mkdir(parents=True, exist_ok=True)
+        transformers_cache.mkdir(parents=True, exist_ok=True)
+        datasets_cache.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        logging.info("HF_HOME=%s", os.environ.get("HF_HOME"))
+        logging.info("HF_DATASETS_CACHE=%s", os.environ.get("HF_DATASETS_CACHE"))
+        logging.info("HUGGINGFACE_HUB_CACHE=%s", os.environ.get("HUGGINGFACE_HUB_CACHE"))
+        logging.info("TRANSFORMERS_CACHE=%s", os.environ.get("TRANSFORMERS_CACHE"))
+        logging.info("HF_HUB_OFFLINE=%s", os.environ.get("HF_HUB_OFFLINE"))
+        logging.info("HF_DATASETS_OFFLINE=%s", os.environ.get("HF_DATASETS_OFFLINE"))
+        logging.info("TRANSFORMERS_OFFLINE=%s", os.environ.get("TRANSFORMERS_OFFLINE"))
+        logging.info("TORCHDYNAMO_DISABLE=%s", os.environ.get("TORCHDYNAMO_DISABLE"))
+        logging.info(
+            "OPENPI_HF_DATASETS_CACHE_PER_RANK=%s", os.environ.get("OPENPI_HF_DATASETS_CACHE_PER_RANK")
+        )
+        logging.info("OPENPI_LOAD_DATASET_NUM_PROC_CAP=%s", os.environ.get("OPENPI_LOAD_DATASET_NUM_PROC_CAP"))
+
+
+def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
+    if not enabled:
+        logging.info("wandb logging disabled")
+        return
+
+    try:
+        wandb = _get_wandb()
+
+        ckpt_dir = config.checkpoint_dir
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+
+        settings = wandb.Settings(init_timeout=120)
+        if resuming:
+            run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+            wandb.init(id=run_id, resume="must", project=config.project_name, settings=settings)
+        else:
+            wandb.init(
+                name=config.exp_name,
+                config=dataclasses.asdict(config),
+                project=config.project_name,
+                settings=settings,
+            )
+            (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+    except Exception as exc:
+        # W&B is optional for training; avoid killing a multi-node job due to logging deps.
+        debug = os.environ.get("OPENPI_WANDB_DEBUG", "0") in {"1", "true", "TRUE", "True"}
+        if debug:
+            logging.warning("wandb init failed; continuing without wandb", exc_info=True)
+        else:
+            logging.warning("wandb init failed (%s); continuing without wandb", type(exc).__name__)
+        try:
+            object.__setattr__(config, "wandb_enabled", False)
+        except Exception:
+            pass
+        return
+
+
+def _latest_step_dir(checkpoint_dir: Path) -> tuple[int, Path] | None:
+    steps = [
+        int(d.name)
+        for d in checkpoint_dir.iterdir()
+        if d.is_dir() and d.name.isdigit() and not d.name.startswith("tmp_")
+    ]
+    if not steps:
+        return None
+    step = max(steps)
+    return step, checkpoint_dir / f"{step}"
+
+
+def build_datasets(config: _config.TrainConfig):
+    retries = max(1, int(os.environ.get("OPENPI_BUILD_DATASET_RETRIES", "3")))
+    rank = int(os.environ.get("RANK", "0"))
+    skip_norm_stats = os.environ.get("OPENPI_SKIP_NORM_STATS", "0") == "1"
+    for attempt in range(1, retries + 1):
+        try:
+            data_loader = _data_loader.create_data_loader(
+                config,
+                framework="pytorch",
+                shuffle=True,
+                skip_norm_stats=skip_norm_stats,
+            )
+            return data_loader, data_loader.data_config()
+        except FileNotFoundError as exc:
+            transient_lock_race = exc.filename is None and int(os.environ.get("WORLD_SIZE", "1")) > 1
+            if (not transient_lock_race) or attempt >= retries:
+                raise
+            delay_s = float(os.environ.get("OPENPI_BUILD_DATASET_RETRY_SLEEP_S", "2")) * attempt
+            logging.warning(
+                "Rank %s hit transient ENOENT during dataset init (attempt %s/%s). Retrying in %.1fs",
+                rank,
+                attempt,
+                retries,
+                delay_s,
+            )
+            time.sleep(delay_s)
+
+
+def log_memory_usage(accelerator: Accelerator, step: int, phase: str = "unknown") -> None:
+    if not (torch.cuda.is_available() and accelerator.device.type == "cuda"):
+        return
+    device = accelerator.device
+    memory_allocated = torch.cuda.memory_allocated(device) / 1e9
+    memory_reserved = torch.cuda.memory_reserved(device) / 1e9
+    memory_reserved_unallocated = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1e9
+    device_free = 0.0
+    device_total = 0.0
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        device_free = free_bytes / 1e9
+        device_total = total_bytes / 1e9
+    except Exception:
+        pass
+    memory_stats = torch.cuda.memory_stats(device)
+    max_memory_allocated = memory_stats.get("allocated_bytes.all.peak", 0) / 1e9
+    max_memory_reserved = memory_stats.get("reserved_bytes.all.peak", 0) / 1e9
+    logging.info(
+        "Step %s (%s): GPU memory - allocated: %.2fGB, reserved: %.2fGB, reserved_unallocated: %.2fGB, device_free: %.2fGB, device_total: %.2fGB, peak_allocated: %.2fGB, peak_reserved: %.2fGB | rank=%s/%s",
+        step,
+        phase,
+        memory_allocated,
+        memory_reserved,
+        memory_reserved_unallocated,
+        device_free,
+        device_total,
+        max_memory_allocated,
+        max_memory_reserved,
+        accelerator.process_index,
+        accelerator.num_processes,
+    )
+
+
+def _memory_phase_logging_enabled() -> bool:
+    return os.environ.get("OPENPI_PHASE_MEMORY_LOG", "0") == "1"
+
+
+def _memory_phase_steps() -> set[int]:
+    raw = os.environ.get("OPENPI_PHASE_MEMORY_LOG_STEPS", "0")
+    steps: set[int] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            steps.add(int(token))
+        except ValueError:
+            logging.warning("Ignoring invalid OPENPI_PHASE_MEMORY_LOG_STEPS token: %s", token)
+    return steps
+
+
+def _should_profile_memory_step(step: int) -> bool:
+    if not _memory_phase_logging_enabled():
+        return False
+    return step in _memory_phase_steps()
+
+
+def _reset_peak_memory_stats(accelerator: Accelerator) -> None:
+    if not (torch.cuda.is_available() and accelerator.device.type == "cuda"):
+        return
+    torch.cuda.reset_peak_memory_stats(accelerator.device)
+
+
+def _prepare_vlm2_inputs(
+    observation,
+    config: _config.TrainConfig,
+    device: torch.device,
+    *,
+    include_subtask: bool = False,
+):
+    image_keys = _model.IMAGE_KEYS
+    frames = [observation.images[k] for k in image_keys if k in observation.images]
+    if not frames:
+        raise ValueError("No images found in observation for VLM2 inputs.")
+
+    video_frames = torch.stack(frames, dim=1)  # (b, f, c, h, w)
+    target_frames = config.vlm2_num_frames
+    if video_frames.shape[1] < target_frames:
+        pad_count = target_frames - video_frames.shape[1]
+        pad_frame = video_frames[:, -1:].repeat(1, pad_count, 1, 1, 1)
+        video_frames = torch.cat([video_frames, pad_frame], dim=1)
+    elif video_frames.shape[1] > target_frames:
+        video_frames = video_frames[:, :target_frames]
+
+    if getattr(observation, "pcd_xyz", None) is not None:
+        point_map = observation.pcd_xyz.to(torch.float32)
+        if point_map.dim() != 4:
+            raise ValueError(f"Expected pcd_xyz shape (b, s, n, 3), got {point_map.shape}")
+        point_maps = point_map[:, None].repeat(1, target_frames, 1, 1, 1)
+    else:
+        batch_size, _, _, height, width = video_frames.shape
+        point_maps = torch.zeros(
+            batch_size,
+            target_frames,
+            height,
+            width,
+            3,
+            device=device,
+            dtype=torch.float32,
+        )
+
+    language_tokens = observation.tokenized_prompt
+    language_masks = observation.tokenized_prompt_mask
+    if language_tokens is None or language_masks is None:
+        raise ValueError("tokenized_prompt and tokenized_prompt_mask are required for VLM2 training.")
+
+    if not include_subtask:
+        return video_frames, point_maps, language_tokens, language_masks
+
+    subtask_tokens = getattr(observation, "subtask_tokens", None)
+    subtask_mask = getattr(observation, "subtask_mask", None)
+    subtask_ar_mask = getattr(observation, "subtask_ar_mask", None)
+    subtask_loss_mask = getattr(observation, "subtask_loss_mask", None)
+    return (
+        video_frames,
+        point_maps,
+        language_tokens,
+        language_masks,
+        subtask_tokens,
+        subtask_mask,
+        subtask_ar_mask,
+        subtask_loss_mask,
+    )
+
+
+def _infer_accelerate_mixed_precision(config: _config.TrainConfig) -> str:
+    mp = getattr(config, "accelerate_mixed_precision", None)
+    if mp is not None:
+        return str(mp)
+    if config.pytorch_training_precision == "bfloat16":
+        return "bf16"
+    if config.pytorch_training_precision == "float16":
+        return "fp16"
+    return "no"
+
+
+def _safe_set_nested(config: dict, key_path: str, value) -> None:
+    keys = key_path.split(".")
+    node = config
+    for key in keys[:-1]:
+        child = node.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            node[key] = child
+        node = child
+    node[keys[-1]] = value
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value in {"1", "true", "TRUE", "True", "yes", "YES", "y", "Y"}
+
+
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _env_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _env_bool_for_json(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    return value in {"1", "true", "TRUE", "True", "yes", "YES", "y", "Y"}
+
+
+def _fp16_stability_profile_enabled() -> bool:
+    return _env_flag("OPENPI_FP16_STABILITY_PROFILE", False)
+
+
+def _patch_deepspeed_config(
+    ds_config: dict,
+    *,
+    effective_batch_size: int,
+    grad_accum_steps: int,
+    world_size: int,
+    precision: str,
+    clip_grad_norm: float,
+) -> None:
+    ds_config["train_micro_batch_size_per_gpu"] = int(effective_batch_size)
+    ds_config["gradient_accumulation_steps"] = int(grad_accum_steps)
+    ds_config["train_batch_size"] = int(effective_batch_size * grad_accum_steps * world_size)
+    fp16_stability_profile = _fp16_stability_profile_enabled() and precision == "float16"
+    ds_grad_clip = _env_float("OPENPI_DS_GRADIENT_CLIPPING")
+    default_grad_clip = 0.5 if fp16_stability_profile else clip_grad_norm
+    ds_config["gradient_clipping"] = float(default_grad_clip if ds_grad_clip is None else ds_grad_clip)
+
+    if precision == "bfloat16":
+        _safe_set_nested(ds_config, "bf16.enabled", True)
+        _safe_set_nested(ds_config, "fp16.enabled", False)
+    elif precision == "float16":
+        _safe_set_nested(ds_config, "bf16.enabled", False)
+        _safe_set_nested(ds_config, "fp16.enabled", True)
+        _safe_set_nested(ds_config, "fp16.auto_cast", False)
+        fp16_profile_defaults = {
+            "OPENPI_FP16_INITIAL_SCALE_POWER": 10,
+            "OPENPI_FP16_LOSS_SCALE_WINDOW": 1000,
+            "OPENPI_FP16_HYSTERESIS": 2,
+            "OPENPI_FP16_MIN_LOSS_SCALE": 1,
+        }
+        for env_name, key_path in (
+            ("OPENPI_FP16_INITIAL_SCALE_POWER", "fp16.initial_scale_power"),
+            ("OPENPI_FP16_LOSS_SCALE_WINDOW", "fp16.loss_scale_window"),
+            ("OPENPI_FP16_HYSTERESIS", "fp16.hysteresis"),
+            ("OPENPI_FP16_MIN_LOSS_SCALE", "fp16.min_loss_scale"),
+        ):
+            override = _env_int(env_name)
+            if override is None and fp16_stability_profile:
+                override = fp16_profile_defaults[env_name]
+            if override is not None:
+                _safe_set_nested(ds_config, key_path, override)
+    else:
+        _safe_set_nested(ds_config, "bf16.enabled", False)
+        _safe_set_nested(ds_config, "fp16.enabled", False)
+
+    reduce_bucket_size = _env_int("OPENPI_DS_REDUCE_BUCKET_SIZE")
+    if reduce_bucket_size is None and fp16_stability_profile:
+        reduce_bucket_size = 50_000_000
+    if reduce_bucket_size is not None:
+        _safe_set_nested(ds_config, "zero_optimization.reduce_bucket_size", reduce_bucket_size)
+    allgather_bucket_size = _env_int("OPENPI_DS_ALLGATHER_BUCKET_SIZE")
+    if allgather_bucket_size is None and fp16_stability_profile:
+        allgather_bucket_size = 50_000_000
+    if allgather_bucket_size is not None:
+        _safe_set_nested(ds_config, "zero_optimization.allgather_bucket_size", allgather_bucket_size)
+    overlap_comm = _env_bool_for_json("OPENPI_DS_OVERLAP_COMM")
+    if overlap_comm is not None:
+        _safe_set_nested(ds_config, "zero_optimization.overlap_comm", overlap_comm)
+    pin_memory = _env_bool_for_json("OPENPI_DS_OFFLOAD_PIN_MEMORY")
+    if pin_memory is None and fp16_stability_profile:
+        pin_memory = False
+    if pin_memory is not None:
+        _safe_set_nested(ds_config, "zero_optimization.offload_optimizer.pin_memory", pin_memory)
+
+    # Do not combine DeepSpeed precision engines with torch_autocast.
+    _safe_set_nested(ds_config, "torch_autocast.enabled", False)
+
+
+def _validate_deepspeed_precision_config(accelerator: Accelerator, ds_config: dict, *, precision: str) -> None:
+    ds_fp16 = bool(ds_config.get("fp16", {}).get("enabled", False))
+    ds_bf16 = bool(ds_config.get("bf16", {}).get("enabled", False))
+    ds_torch_autocast = bool(ds_config.get("torch_autocast", {}).get("enabled", False))
+
+    if ds_torch_autocast:
+        raise ValueError("DeepSpeed torch_autocast.enabled must be false when using the Accelerate trainer.")
+    if precision == "float16" and not ds_fp16:
+        raise ValueError("Requested float16 training but DeepSpeed fp16.enabled=false.")
+    if precision == "bfloat16" and not ds_bf16:
+        raise ValueError("Requested bfloat16 training but DeepSpeed bf16.enabled=false.")
+    if precision == "float32" and (ds_fp16 or ds_bf16):
+        raise ValueError("Requested float32 training but DeepSpeed fp16/bf16 is still enabled.")
+
+    accel_mp = accelerator.mixed_precision
+    if precision == "float16" and accel_mp not in ("fp16", "no"):
+        raise ValueError(f"Requested float16 training but accelerator.mixed_precision={accel_mp}.")
+    if precision == "bfloat16" and accel_mp not in ("bf16", "no"):
+        raise ValueError(f"Requested bfloat16 training but accelerator.mixed_precision={accel_mp}.")
+    if precision == "float32" and accel_mp != "no":
+        raise ValueError(f"Requested float32 training but accelerator.mixed_precision={accel_mp}.")
+
+
+def _patch_deepspeed_autocast(accelerator: Accelerator) -> None:
+    """Patch DeepSpeed engine to be transparent to external torch.autocast contexts.
+
+    In DeepSpeed >= 0.17.2, ``autocast_if_enabled()`` wraps the engine forward.
+    When ``torch_autocast.enabled=false`` in the DS config (which we force to
+    avoid double mixed-precision with ``fp16.enabled=true``), the engine detects
+    an outer ``torch.autocast`` and **explicitly disables** it via
+    ``torch.autocast(enabled=False)``.  This strips autocast from the entire
+    forward pass, causing float32-activation-vs-float16-weight mismatches.
+
+    The patch makes ``torch_autocast_enabled`` / ``torch_autocast_dtype`` on the
+    engine fall through to the active ``torch.autocast`` state so that the
+    engine re-enables (rather than disables) autocast during forward.
+    """
+    if getattr(accelerator.state, "deepspeed_plugin", None) is None:
+        return
+
+    try:
+        from deepspeed.runtime.engine import DeepSpeedEngine
+    except ImportError:
+        return
+
+    if getattr(DeepSpeedEngine, "_openpi_autocast_patched", False):
+        return
+
+    _orig_enabled = DeepSpeedEngine.torch_autocast_enabled
+    _orig_dtype = DeepSpeedEngine.torch_autocast_dtype
+
+    def _patched_enabled(self):
+        return _orig_enabled(self) or torch.is_autocast_enabled()
+
+    def _patched_dtype(self):
+        if not _orig_enabled(self) and torch.is_autocast_enabled():
+            return torch.get_autocast_dtype("cuda")
+        return _orig_dtype(self)
+
+    DeepSpeedEngine.torch_autocast_enabled = _patched_enabled
+    DeepSpeedEngine.torch_autocast_dtype = _patched_dtype
+    DeepSpeedEngine._openpi_autocast_patched = True
+    logging.info(
+        "Patched DeepSpeedEngine autocast: engine now falls through to external torch.autocast context."
+    )
+
+
+def _patch_deepspeed_loss_scaler() -> None:
+    """Keep training when dynamic loss scale reaches the configured minimum.
+
+    Some DeepSpeed versions type `fp16.min_loss_scale` as an integer config field,
+    which prevents using fractional minima such as `1e-8`. In long V100 FP16 runs,
+    occasional overflow events can still drive the scaler down to the minimum.
+    Instead of hard-failing the whole job at that point, keep DeepSpeed's normal
+    overflow behavior (skip step + hold/reduce scale) and disable the fatal exit.
+    """
+    try:
+        from deepspeed.runtime.fp16.loss_scaler import DynamicLossScaler
+    except ImportError:
+        return
+
+    if getattr(DynamicLossScaler, "_openpi_min_scale_patched", False):
+        return
+
+    _orig_init = DynamicLossScaler.__init__
+
+    @functools.wraps(_orig_init)
+    def _patched_init(
+        self,
+        init_scale,
+        scale_window,
+        min_scale,
+        delayed_shift,
+        consecutive_hysteresis,
+        raise_error_at_min_scale=True,
+        dtype=torch.half,
+    ):
+        return _orig_init(
+            self,
+            init_scale,
+            scale_window,
+            min_scale,
+            delayed_shift,
+            consecutive_hysteresis,
+            raise_error_at_min_scale=False,
+            dtype=dtype,
+        )
+
+    DynamicLossScaler.__init__ = _patched_init
+    DynamicLossScaler._openpi_min_scale_patched = True
+    logging.info(
+        "Patched DeepSpeed DynamicLossScaler: reaching min_loss_scale will skip steps instead of exiting."
+    )
+
+
+def _get_deepspeed_loss_scale(accelerator: Accelerator) -> float | None:
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
+        return None
+    # Accelerate wraps the engine; try multiple known attribute paths.
+    engine_wrapper = getattr(accelerator, "deepspeed_engine_wrapped", None)
+    engine = getattr(engine_wrapper, "engine", engine_wrapper)  # unwrap if needed
+    if engine is None:
+        return None
+
+    # Candidate objects that may hold the loss scale value:
+    # 1. engine.optimizer.loss_scaler (FP16_DeepSpeedZeroOptimizer)
+    # 2. engine.optimizer  (sometimes exposes cur_scale directly)
+    # 3. engine itself     (DeepSpeedEngine.loss_scale property)
+    optimizer = getattr(engine, "optimizer", None)
+    loss_scaler = getattr(optimizer, "loss_scaler", None) if optimizer is not None else None
+    candidates = [obj for obj in (loss_scaler, optimizer, engine) if obj is not None]
+
+    for obj in candidates:
+        for attr in ("cur_scale", "loss_scale"):
+            value = getattr(obj, attr, None)
+            if value is None:
+                continue
+            try:
+                return float(value.item() if hasattr(value, "item") else value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _debug_overflow_enabled(config: _config.TrainConfig) -> bool:
+    return bool(getattr(config, "debug_overflow", False))
+
+
+def _summarize_tensor_for_debug(name: str, value: torch.Tensor) -> str:
+    tensor = value.detach()
+    finite_mask = torch.isfinite(tensor)
+    finite_count = int(finite_mask.sum().item())
+    total_count = tensor.numel()
+    if finite_count > 0:
+        finite_tensor = tensor[finite_mask].float()
+        min_value = float(finite_tensor.min().item())
+        max_value = float(finite_tensor.max().item())
+        mean_abs = float(finite_tensor.abs().mean().item())
+    else:
+        min_value = float("nan")
+        max_value = float("nan")
+        mean_abs = float("nan")
+    return (
+        f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"finite={finite_count}/{total_count} min={min_value:.6g} "
+        f"max={max_value:.6g} mean_abs={mean_abs:.6g}"
+    )
+
+
+def _tensor_debug_payload(value: torch.Tensor, *, max_values: int = 16) -> dict[str, object]:
+    tensor = value.detach()
+    finite_mask = torch.isfinite(tensor)
+    finite_count = int(finite_mask.sum().item())
+    total_count = tensor.numel()
+    if finite_count > 0:
+        finite_tensor = tensor[finite_mask].float()
+        min_value = float(finite_tensor.min().item())
+        max_value = float(finite_tensor.max().item())
+        mean_abs = float(finite_tensor.abs().mean().item())
+    else:
+        min_value = float("nan")
+        max_value = float("nan")
+        mean_abs = float("nan")
+
+    flat = tensor.flatten()
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "finite_count": finite_count,
+        "total_count": total_count,
+        "min": min_value,
+        "max": max_value,
+        "mean_abs": mean_abs,
+        "sample": flat[:max_values].float().cpu(),
+    }
+
+
+def _observation_debug_payload(observation) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for attr_name in (
+        "state",
+        "images",
+        "image_masks",
+        "tokenized_prompt",
+        "tokenized_prompt_mask",
+        "token_ar_mask",
+        "token_loss_mask",
+    ):
+        value = getattr(observation, attr_name, None)
+        if isinstance(value, torch.Tensor):
+            payload[attr_name] = _tensor_debug_payload(value)
+        elif isinstance(value, dict):
+            payload[attr_name] = {
+                str(k): _tensor_debug_payload(v) for k, v in value.items() if isinstance(v, torch.Tensor)
+            }
+    return payload
+
+
+def _log_nonfinite_batch_state(*, loss: torch.Tensor, actions: torch.Tensor, observation) -> None:
+    logging.error(
+        "Encountered non-finite loss before backward: value=%s dtype=%s",
+        loss.detach().float().item(),
+        loss.dtype,
+    )
+    logging.error(_summarize_tensor_for_debug("actions", actions))
+
+    for attr_name in ("state", "images", "image_masks", "tokenized_prompt", "tokenized_prompt_mask"):
+        value = getattr(observation, attr_name, None)
+        if isinstance(value, torch.Tensor):
+            logging.error(_summarize_tensor_for_debug(f"observation.{attr_name}", value))
+        elif isinstance(value, dict):
+            for key, tensor in value.items():
+                if isinstance(tensor, torch.Tensor):
+                    logging.error(_summarize_tensor_for_debug(f"observation.{attr_name}.{key}", tensor))
+
+
+def _save_nonfinite_debug_dump(
+    *,
+    output_dir: Path,
+    global_step: int,
+    accelerator: Accelerator,
+    loss: torch.Tensor,
+    actions: torch.Tensor,
+    observation,
+) -> None:
+    try:
+        debug_dir = output_dir / "nonfinite_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        rank = int(accelerator.process_index)
+        local_rank = int(accelerator.local_process_index)
+        dump_path = debug_dir / f"nonfinite_rank{rank}_local{local_rank}_step{global_step}.pt"
+        torch.save(
+            {
+                "global_step": global_step,
+                "rank": rank,
+                "local_rank": local_rank,
+                "num_processes": int(accelerator.num_processes),
+                "loss": _tensor_debug_payload(loss),
+                "actions": _tensor_debug_payload(actions),
+                "observation": _observation_debug_payload(observation),
+            },
+            dump_path,
+        )
+        logging.error("Saved non-finite debug dump to %s", dump_path)
+    except Exception:
+        logging.exception("Failed to save non-finite debug dump")
+
+
+def _safe_float(value: torch.Tensor | float | int | None) -> float:
+    if value is None:
+        return float("nan")
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return float("nan")
+        return float(value.detach().float().reshape(-1)[0].item())
+    return float(value)
+
+
+def _loss_tensor_debug_metrics(losses: object, actions: torch.Tensor) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    loss_tensor: torch.Tensor | None = None
+    if isinstance(losses, torch.Tensor):
+        loss_tensor = losses.detach().float()
+    elif isinstance(losses, dict):
+        for key in ("flow_loss_per_sample", "per_sample_loss", "loss_per_sample"):
+            value = losses.get(key)
+            if isinstance(value, torch.Tensor):
+                metrics[f"{key}_max"] = _safe_float(value.detach().float().amax())
+                metrics[f"{key}_mean"] = _safe_float(value.detach().float().mean())
+                break
+
+    if loss_tensor is not None:
+        finite_mask = torch.isfinite(loss_tensor)
+        metrics["loss_tensor_finite_ratio"] = float(finite_mask.float().mean().item()) if loss_tensor.numel() else 1.0
+        if finite_mask.any():
+            finite_loss = loss_tensor[finite_mask]
+            metrics["loss_tensor_max"] = _safe_float(finite_loss.amax())
+            metrics["loss_tensor_mean"] = _safe_float(finite_loss.mean())
+            metrics["loss_tensor_std"] = _safe_float(finite_loss.std(unbiased=False))
+            if loss_tensor.ndim >= 2:
+                per_sample = loss_tensor.flatten(1).mean(dim=1)
+                metrics["per_sample_loss_max"] = _safe_float(per_sample.amax())
+                metrics["per_sample_loss_mean"] = _safe_float(per_sample.mean())
+                metrics["per_sample_loss_std"] = _safe_float(per_sample.std(unbiased=False))
+                metrics["per_sample_loss_argmax"] = _safe_float(torch.argmax(per_sample))
+
+    actions_f = actions.detach().float()
+    metrics["target_action_abs_max"] = _safe_float(actions_f.abs().amax())
+    metrics["target_action_mean_abs"] = _safe_float(actions_f.abs().mean())
+    return metrics
+
+
+def _gather_scalar_stats(accelerator: Accelerator, scalar: torch.Tensor) -> dict[str, float]:
+    value = scalar.detach().float().reshape(1).to(accelerator.device)
+    gathered = accelerator.gather(value)
+    finite = torch.isfinite(gathered)
+    stats = {
+        "finite_count": float(finite.sum().item()),
+        "total_count": float(gathered.numel()),
+        "all_finite": float(bool(finite.all().item())),
+        "bad_rank": -1.0,
+        "min": float("nan"),
+        "max": float("nan"),
+        "mean": float("nan"),
+        "std": float("nan"),
+    }
+    if finite.any():
+        finite_values = gathered[finite]
+        stats.update(
+            {
+                "min": _safe_float(finite_values.amin()),
+                "max": _safe_float(finite_values.amax()),
+                "mean": _safe_float(finite_values.mean()),
+                "std": _safe_float(finite_values.std(unbiased=False)),
+            }
+        )
+    if not finite.all():
+        stats["bad_rank"] = _safe_float(torch.nonzero(~finite, as_tuple=False).reshape(-1)[0])
+    return stats
+
+
+def _collect_grad_debug_stats(parameters, accelerator: Accelerator) -> dict[str, float]:
+    device = accelerator.device
+    global_norm_sq = torch.zeros(1, device=device, dtype=torch.float64)
+    max_abs_grad = torch.zeros(1, device=device, dtype=torch.float32)
+    nonfinite_count = torch.zeros(1, device=device, dtype=torch.float32)
+    total_grad_elements = torch.zeros(1, device=device, dtype=torch.float32)
+    grad_tensors = torch.zeros(1, device=device, dtype=torch.float32)
+
+    for param in parameters:
+        grad = getattr(param, "grad", None)
+        if grad is None:
+            continue
+        grad_tensors += 1
+        grad_data = grad.detach()
+        total_grad_elements += float(grad_data.numel())
+        finite_mask = torch.isfinite(grad_data)
+        nonfinite_count += (~finite_mask).sum().to(torch.float32)
+        if finite_mask.any():
+            finite_grad = grad_data[finite_mask].float()
+            global_norm_sq += finite_grad.pow(2).sum(dtype=torch.float64)
+            max_abs_grad = torch.maximum(max_abs_grad, finite_grad.abs().max().to(torch.float32))
+
+    global_norm_sq = cast(torch.Tensor, accelerator.reduce(global_norm_sq, reduction="sum"))
+    max_abs_grad = cast(torch.Tensor, accelerator.reduce(max_abs_grad, reduction="max"))
+    nonfinite_count = cast(torch.Tensor, accelerator.reduce(nonfinite_count, reduction="sum"))
+    total_grad_elements = cast(torch.Tensor, accelerator.reduce(total_grad_elements, reduction="sum"))
+    grad_tensors = cast(torch.Tensor, accelerator.reduce(grad_tensors, reduction="sum"))
+
+    total_grad_elements_value = float(total_grad_elements.item())
+    nonfinite_count_value = float(nonfinite_count.item())
+    finite_ratio = 1.0
+    if total_grad_elements_value > 0:
+        finite_ratio = max(0.0, 1.0 - nonfinite_count_value / total_grad_elements_value)
+
+    return {
+        "global_norm": float(torch.sqrt(global_norm_sq).item()),
+        "max_abs_grad": float(max_abs_grad.item()),
+        "nonfinite_count": nonfinite_count_value,
+        "total_grad_elements": total_grad_elements_value,
+        "finite_ratio": finite_ratio,
+        "grad_tensors": float(grad_tensors.item()),
+    }
+
+
+def _trainable_parameters(module: torch.nn.Module) -> list[torch.nn.Parameter]:
+    return [p for p in module.parameters() if p.requires_grad]
+
+
+def _atomic_write_checkpoint_dir(tmp_dir: Path, final_dir: Path) -> None:
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    tmp_dir.rename(final_dir)
+
+
+def save_checkpoint(
+    *,
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    global_step: int,
+    config: _config.TrainConfig,
+    data_config: _config.DataConfig,
+) -> None:
+    if os.environ.get("OPENPI_DISABLE_CHECKPOINT", "0") in {"1", "true", "TRUE", "True"}:
+        return
+    # `global_step` is 1-based here: pass the post-update optimizer step so checkpoint directories
+    # line up with the visible training step count.
+    should_save = (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps
+    if not should_save:
+        return
+
+    final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+    tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+
+    # Rank 0 owns directory cleanup/creation to avoid races on shared filesystems.
+    if accelerator.is_main_process:
+        if tmp_ckpt_dir.exists():
+            shutil.rmtree(tmp_ckpt_dir)
+        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+    if not accelerator.is_main_process:
+        _wait_for_path(tmp_ckpt_dir, what="tmp_ckpt_dir")
+
+    # Save accelerate/deepspeed state for resume.
+    # IMPORTANT: This must run on *all* ranks (DeepSpeed save is collective). Running it on rank0 only can hang.
+    save_acc_state = os.environ.get("OPENPI_SAVE_ACCELERATE_STATE", "1") != "0"
+    if save_acc_state:
+        acc_state_dir = tmp_ckpt_dir / "accelerate_state"
+        t0 = time.time()
+        if accelerator.is_main_process and _should_profile_memory_step(global_step):
+            _reset_peak_memory_stats(accelerator)
+        try:
+            accelerator.save_state(str(acc_state_dir))
+        except Exception as exc:
+            logging.warning(
+                "accelerator.save_state failed (resume may not work for sharded optimizers): %s", exc
+            )
+        else:
+            if accelerator.is_main_process:
+                logging.info("accelerator.save_state finished in %.1fs", time.time() - t0)
+                if _should_profile_memory_step(global_step):
+                    log_memory_usage(accelerator, global_step, "after_save_state")
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        # Save model weights (portable artifact).
+        model_to_save = accelerator.unwrap_model(model)
+        model_path = tmp_ckpt_dir / "model.safetensors"
+        try:
+            # DeepSpeed ZeRO-3 may keep params partitioned; use Accelerator to materialize a full state_dict.
+            state_dict = accelerator.get_state_dict(model)
+            safetensors.torch.save_file(state_dict, str(model_path))
+        except Exception:
+            # Fallback for non-partitioned models (handles tied/shared tensors).
+            safetensors.torch.save_model(model_to_save, model_path)
+
+        # Save optimizer state (non-DeepSpeed / non-sharded). With DeepSpeed, prefer accelerator.save_state.
+        if optimizer is not None:
+            try:
+                torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+            except Exception as exc:
+                logging.warning("Failed to save optimizer.pt (will rely on accelerate_state if present): %s", exc)
+
+        metadata = {
+            "global_step": global_step,
+            "config": dataclasses.asdict(config),
+            "timestamp": time.time(),
+            "accelerate": {
+                "distributed_type": str(accelerator.distributed_type),
+                "num_processes": accelerator.num_processes,
+            },
+        }
+        torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+
+        # Save norm stats.
+        norm_stats = data_config.norm_stats
+        if norm_stats is not None and data_config.asset_id is not None:
+            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+
+        _atomic_write_checkpoint_dir(tmp_ckpt_dir, final_ckpt_dir)
+        logging.info("Saved checkpoint at step %s -> %s", global_step, final_ckpt_dir)
+
+        if accelerator.is_main_process and config.wandb_enabled:
+            try:
+                wandb = _get_wandb()
+                wandb.log({"checkpoint_step": global_step}, step=global_step)
+            except Exception:
+                logging.warning("wandb log failed; continuing without wandb", exc_info=True)
+                try:
+                    object.__setattr__(config, "wandb_enabled", False)
+                except Exception:
+                    pass
+
+    accelerator.wait_for_everyone()
+
+
+def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> None:
+    accelerator = Accelerator(
+        mixed_precision=_infer_accelerate_mixed_precision(config),
+        gradient_accumulation_steps=int(getattr(config, "gradient_accumulation_steps", 1)),
+    )
+
+    is_main = accelerator.is_main_process
+    local_rank = accelerator.local_process_index
+
+    # Seed: keep per-rank determinism.
+    seed = int(config.seed) + int(local_rank)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # DDP-safe overwrite/resume handling.
+    resuming = False
+    if config.resume:
+        if config.checkpoint_dir.exists():
+            latest = _latest_step_dir(config.checkpoint_dir)
+            if latest is None:
+                raise FileNotFoundError(f"No valid checkpoints found in {config.checkpoint_dir} for resume")
+            resuming = True
+            if is_main:
+                logging.info("Resuming from %s at step %s", latest[1], latest[0])
+        else:
+            raise FileNotFoundError(f"Experiment checkpoint directory {config.checkpoint_dir} does not exist for resume")
+    elif config.overwrite:
+        if is_main and config.checkpoint_dir.exists():
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info("Overwriting checkpoint directory: %s", config.checkpoint_dir)
+        accelerator.wait_for_everyone()
+
+    if is_main:
+        config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        config.log_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+    if not is_main:
+        _wait_for_path(config.log_dir, what="log_dir")
+
+    add_file_logging(str(config.log_dir / f"rank{accelerator.process_index}.log"), formatter)
+    install_excepthook()
+
+    configure_hf_cache(config, accelerator=accelerator)
+    os.environ["OPENPI_FORCE_LOAD_CACHE"] = "1" if config.force_load_cache else "0"
+    if is_main:
+        logging.info("prepare_hf_cache_only=%s", config.prepare_hf_cache_only)
+        logging.info("force_load_cache=%s", config.force_load_cache)
+
+    if is_main and not config.prepare_hf_cache_only:
+        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+
+    # Batch size semantics: keep compatibility with train_pytorch.py.
+    world_size = accelerator.num_processes
+    if config.batch_size_per_gpu is not None:
+        per_gpu = int(config.batch_size_per_gpu)
+        if per_gpu <= 0:
+            raise ValueError("--batch_size_per_gpu must be a positive integer when provided.")
+        object.__setattr__(config, "batch_size", per_gpu * world_size)
+        effective_batch_size = per_gpu
+    else:
+        effective_batch_size = config.batch_size // world_size
+
+    if is_main:
+        logging.info(
+            "Using batch size per GPU: %s (total batch size across %s procs: %s) grad_accum=%s effective_total=%s",
+            effective_batch_size,
+            world_size,
+            config.batch_size,
+            accelerator.gradient_accumulation_steps,
+            config.batch_size * accelerator.gradient_accumulation_steps,
+        )
+
+    # Accelerate cannot infer micro-batch size from the custom OpenPI dataloader wrapper.
+    # Populate the DeepSpeed plugin config explicitly before `prepare()`.
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
+        precision = str(config.pytorch_training_precision)
+        _patch_deepspeed_config(
+            ds_config,
+            effective_batch_size=int(effective_batch_size),
+            grad_accum_steps=int(accelerator.gradient_accumulation_steps),
+            world_size=int(world_size),
+            precision=precision,
+            clip_grad_norm=float(config.optimizer.clip_gradient_norm),
+        )
+        _validate_deepspeed_precision_config(accelerator, ds_config, precision=precision)
+        if is_main:
+            fp16_config = ds_config.get("fp16", {}) if isinstance(ds_config.get("fp16", {}), dict) else {}
+            zero_config = (
+                ds_config.get("zero_optimization", {})
+                if isinstance(ds_config.get("zero_optimization", {}), dict)
+                else {}
+            )
+            offload_config = (
+                zero_config.get("offload_optimizer", {})
+                if isinstance(zero_config.get("offload_optimizer", {}), dict)
+                else {}
+            )
+            logging.info(
+                "Patched DeepSpeed config: micro_bs=%s grad_accum=%s train_bs=%s bf16=%s fp16=%s "
+                "grad_clip=%s fp16_initial_scale_power=%s fp16_loss_scale_window=%s fp16_hysteresis=%s "
+                "fp16_min_loss_scale=%s zero_stage=%s reduce_bucket=%s allgather_bucket=%s "
+                "overlap_comm=%s offload_optimizer_device=%s offload_optimizer_pin_memory=%s",
+                ds_config.get("train_micro_batch_size_per_gpu"),
+                ds_config.get("gradient_accumulation_steps"),
+                ds_config.get("train_batch_size"),
+                ds_config.get("bf16", {}).get("enabled", False),
+                fp16_config.get("enabled", False),
+                ds_config.get("gradient_clipping"),
+                fp16_config.get("initial_scale_power"),
+                fp16_config.get("loss_scale_window"),
+                fp16_config.get("hysteresis"),
+                fp16_config.get("min_loss_scale"),
+                zero_config.get("stage"),
+                zero_config.get("reduce_bucket_size"),
+                zero_config.get("allgather_bucket_size"),
+                zero_config.get("overlap_comm"),
+                offload_config.get("device"),
+                offload_config.get("pin_memory"),
+            )
+
+    loader, data_config = build_datasets(config)
+    if config.prepare_hf_cache_only:
+        if is_main:
+            logging.info("Offline HF cache preparation completed; exiting as requested.")
+        return
+
+    # Epoch accounting: len(loader) is per-rank micro-batch count.
+    steps_per_epoch_micro = len(loader)
+    steps_per_epoch = max(1, steps_per_epoch_micro // accelerator.gradient_accumulation_steps)
+    if steps_per_epoch <= 0:
+        raise RuntimeError(f"Computed steps_per_epoch={steps_per_epoch}, expected a positive value.")
+
+    if config.num_train_epochs is not None:
+        if config.num_train_epochs <= 0:
+            raise ValueError("--num_train_epochs must be a positive integer when provided.")
+        computed_steps = int(config.num_train_epochs) * steps_per_epoch
+        provided_steps = int(config.num_train_steps)
+        target_steps = computed_steps if provided_steps <= 0 else min(provided_steps, computed_steps)
+        object.__setattr__(config, "num_train_steps", target_steps)
+        if is_main:
+            logging.info(
+                "Computed num_train_steps=%s from num_train_epochs=%s and steps_per_epoch=%s (micro=%s, grad_accum=%s)",
+                target_steps,
+                config.num_train_epochs,
+                steps_per_epoch,
+                steps_per_epoch_micro,
+                accelerator.gradient_accumulation_steps,
+            )
+        if config.save_at_epoch_end_only:
+            object.__setattr__(config, "save_interval", target_steps)
+            if is_main:
+                logging.info("save_at_epoch_end_only enabled: save_interval=%s", target_steps)
+
+    # Build model (same logic as train_pytorch.py).
+    import openpi.models.pi0_config as _pi0_config
+    import openpi.models.pi05_subtask_config as _pi05_subtask_config
+    import openpi.models.vlm2_vla_config as _vlm2_vla_config
+
+    if isinstance(config.model, _vlm2_vla_config.VLM2VLAConfig):
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+    elif isinstance(config.model, _pi05_subtask_config.Pi05SubtaskConfig):
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+    elif not isinstance(config.model, _pi0_config.Pi0Config):
+        model_cfg = _pi0_config.Pi0Config(
+            dtype=config.pytorch_training_precision,
+            action_dim=config.model.action_dim,
+            action_horizon=config.model.action_horizon,
+            max_token_len=config.model.max_token_len,
+            paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
+            action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
+            pi05=getattr(config.model, "pi05", False),
+        )
+    else:
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+
+    use_vlm2 = config.pytorch_model_name in ("vlm2", "vlm2_subtask")
+    if config.pytorch_model_name in ("vlm2", "vlm2_subtask"):
+        import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
+
+        vlm2_config = _vlm2_model.VLM2Config(
+            visual_dim=2048,
+            geometry_dim=config.vlm2_geometry_dim,
+            view_dim=config.vlm2_view_dim,
+            working_memory_size=config.vlm2_working_memory_size,
+            episodic_memory_capacity=config.vlm2_episodic_memory_capacity,
+            episodic_similarity_threshold=config.vlm2_episodic_similarity_threshold,
+            episodic_fusion_alpha=config.vlm2_episodic_fusion_alpha,
+            sem_geo_fusion_tanh_gate_enable=config.vlm2_sem_geo_fusion_tanh_gate_enable,
+            sem_geo_fusion_tanh_gate_init_alpha=config.vlm2_sem_geo_fusion_tanh_gate_init_alpha,
+            num_heads=8,
+            hidden_dim=1024,
+            dropout=0.0,
+            pi05=True,
+            action_dim=model_cfg.action_dim,
+            action_horizon=model_cfg.action_horizon,
+            dtype=config.pytorch_training_precision,
+            paligemma_variant=model_cfg.paligemma_variant,
+            action_expert_variant=model_cfg.action_expert_variant,
+            num_frames=config.vlm2_num_frames,
+            frame_height=224,
+            frame_width=224,
+            patch_size=16,
+            vggt_pretrained=getattr(model_cfg, "vggt_pretrained", None),
+            vggt_load_strict=getattr(model_cfg, "vggt_load_strict", False),
+            vggt_enable_track=getattr(model_cfg, "vggt_enable_track", False),
+            freeze_vggt_backbone=getattr(model_cfg, "freeze_vggt_backbone", False),
+            freeze_image_encoder=getattr(model_cfg, "freeze_image_encoder", False),
+        )
+        if config.pytorch_model_name == "vlm2_subtask":
+            alpha = getattr(model_cfg, "alpha", 10.0)
+            model = _vlm2_model.VLM2SubtaskWithPi05(vlm2_config, alpha=alpha)
+        else:
+            model = _vlm2_model.VLM2WithPi05(vlm2_config)
+    elif config.pytorch_model_name == "pi0_hamlet":
+        import openpi.models_pytorch.pi0_hamlet as _pi0_hamlet
+
+        model = _pi0_hamlet.Pi05WithHamlet(model_cfg)
+    elif config.pytorch_model_name == "pi0_memoryvla":
+        import openpi.models_pytorch.pi0_memoryvla as _pi0_memoryvla
+
+        model = _pi0_memoryvla.Pi05WithMemoryVLA(model_cfg)
+    elif config.pytorch_model_name == "subtask":
+        import openpi.models_pytorch.pi05_subtask as _pi05_subtask
+
+        alpha = getattr(model_cfg, "alpha", 10.0)
+        model = _pi05_subtask.PI05SubtaskPytorch(
+            model_cfg,
+            alpha=alpha,
+            action_expert_name="subtask",
+        )
+    else:
+        import openpi.models_pytorch.pi0_pytorch as _pi0_pytorch
+
+        model = _pi0_pytorch.PI0Pytorch(model_cfg)
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if is_main:
+            logging.info("Enabled gradient checkpointing for memory optimization")
+    else:
+        if is_main:
+            logging.info("Gradient checkpointing is not supported for this model")
+
+    # Memory/perf knobs (keep same behavior as train_pytorch.py).
+    if world_size >= 8:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+        if is_main:
+            logging.info("Enabled memory optimizations for 8+ GPU training")
+
+    # Weight loading for fine-tuning.
+    if config.pytorch_weight_path is not None:
+        if is_main:
+            logging.info("Loading weights from: %s", config.pytorch_weight_path)
+        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        if not os.path.exists(model_path):
+            if is_main:
+                logging.warning("Model checkpoint not found at %s. Skipping weight loading.", model_path)
+        else:
+            load_strict = config.pytorch_model_name not in (
+                "vlm2",
+                "vlm2_subtask",
+                "subtask",
+                "pi0_hamlet",
+                "pi0_memoryvla",
+            )
+            safetensors.torch.load_model(model, model_path, strict=load_strict)
+            if is_main:
+                logging.info("Loaded PyTorch weights from %s", config.pytorch_weight_path)
+
+    # Optimizer + LR schedule (reuse logic from train_pytorch.py).
+    warmup_steps = int(config.lr_schedule.warmup_steps)
+    peak_lr = float(config.lr_schedule.peak_lr)
+    decay_steps = int(config.lr_schedule.decay_steps)
+    end_lr = float(config.lr_schedule.decay_lr)
+    if decay_steps <= 0:
+        decay_steps = int(config.num_train_steps)
+        if is_main:
+            logging.info("Auto-set decay_steps=%d to match num_train_steps", decay_steps)
+    elif decay_steps < int(config.num_train_steps):
+        if is_main:
+            logging.warning(
+                "decay_steps=%d < num_train_steps=%d — LR will reach 0 before training ends; overriding to num_train_steps",
+                decay_steps,
+                int(config.num_train_steps),
+            )
+        decay_steps = int(config.num_train_steps)
+
+    optim_params = _trainable_parameters(model)
+    if len(optim_params) == 0:
+        raise RuntimeError("No trainable parameters found (all parameters are frozen).")
+
+    use_8bit_optim = os.environ.get("USE_8BIT_OPTIM", "0") == "1"
+    if use_8bit_optim:
+        try:
+            import bitsandbytes as bnb
+
+            optimizer: torch.optim.Optimizer = bnb.optim.AdamW8bit(
+                optim_params,
+                lr=peak_lr,
+                betas=(config.optimizer.b1, config.optimizer.b2),
+                eps=config.optimizer.eps,
+                weight_decay=config.optimizer.weight_decay,
+            )
+            if is_main:
+                logging.info("Using 8-bit AdamW optimizer from bitsandbytes")
+        except ImportError:
+            if is_main:
+                logging.warning("bitsandbytes not found, falling back to standard AdamW")
+            optimizer = torch.optim.AdamW(
+                optim_params,
+                lr=peak_lr,
+                betas=(config.optimizer.b1, config.optimizer.b2),
+                eps=config.optimizer.eps,
+                weight_decay=config.optimizer.weight_decay,
+            )
+    else:
+        optimizer = torch.optim.AdamW(
+            optim_params,
+            lr=peak_lr,
+            betas=(config.optimizer.b1, config.optimizer.b2),
+            eps=config.optimizer.eps,
+            weight_decay=config.optimizer.weight_decay,
+        )
+
+    def lr_schedule(step: int) -> float:
+        if step < warmup_steps:
+            init_lr = peak_lr / (warmup_steps + 1)
+            return init_lr + (peak_lr - init_lr) * step / max(1, warmup_steps)
+        progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
+        cos = 0.5 * (1 + np.cos(np.pi * progress))
+        return end_lr + (peak_lr - end_lr) * cos
+
+    if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
+        _patch_deepspeed_loss_scaler()
+
+    # Prepare with Accelerator (DDP or DeepSpeed).
+    model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+    # `accelerator.prepare()` may wrap/replace the model parameters (especially for DeepSpeed).
+    # Keep a post-prepare view for gradient clipping/debugging; otherwise debug stats can report
+    # grad_tensors=0 even when DeepSpeed computed a non-zero grad_norm.
+    optim_params = _trainable_parameters(model)
+
+    # Patch DeepSpeed engine to not disable our outer torch.autocast context.
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        _patch_deepspeed_autocast(accelerator)
+
+    # Resume (after prepare so that accelerator can restore distributed states).
+    global_step = 0
+    if resuming:
+        latest = _latest_step_dir(config.checkpoint_dir)
+        if latest is None:
+            raise FileNotFoundError(f"No checkpoints found in {config.checkpoint_dir}")
+        latest_step, latest_dir = latest
+        acc_state_dir = latest_dir / "accelerate_state"
+        if acc_state_dir.exists():
+            accelerator.load_state(str(acc_state_dir))
+        metadata_path = latest_dir / "metadata.pt"
+        if metadata_path.exists():
+            metadata = torch.load(metadata_path, map_location="cpu", weights_only=False)
+            global_step = int(metadata.get("global_step", latest_step))
+        else:
+            global_step = latest_step
+        if is_main:
+            logging.info("Resumed training from step %s", global_step)
+
+    # Pre-training barrier to avoid watchdog timeouts on large init skew.
+    if is_main:
+        logging.info(
+            "Running on: %s | num_processes=%s | distributed_type=%s",
+            platform.node(),
+            accelerator.num_processes,
+            accelerator.distributed_type,
+        )
+        logging.info(
+            "Training config: batch_size=%s effective_batch_size_per_gpu=%s num_train_steps=%s",
+            config.batch_size,
+            effective_batch_size,
+            config.num_train_steps,
+        )
+        logging.info(
+            "LR schedule: warmup=%s peak_lr=%.2e decay_steps=%s end_lr=%.2e",
+            warmup_steps,
+            peak_lr,
+            decay_steps,
+            end_lr,
+        )
+        logging.info(
+            "Optimizer: %s weight_decay=%s clip_norm=%s",
+            type(config.optimizer).__name__,
+            config.optimizer.weight_decay,
+            config.optimizer.clip_gradient_norm,
+        )
+        logging.info("EMA is not supported for PyTorch training")
+        logging.info("Training precision: %s (accelerate mp=%s)", model_cfg.dtype, accelerator.mixed_precision)
+    accelerator.wait_for_everyone()
+
+    if torch.cuda.is_available() and accelerator.device.type == "cuda" and is_main:
+        log_memory_usage(accelerator, global_step, "after_model_prepare")
+
+    model.train()
+
+    start_time = time.time()
+    infos: list[dict[str, float]] = []
+    consecutive_skipped_updates = 0
+    consecutive_nonfinite_losses = 0
+    total_nonfinite_loss_batches = 0
+    total_nonfinite_grad_updates = 0
+    total_ds_overflow_skipped_updates = 0
+    max_consecutive_skipped_updates = int(os.environ.get("OPENPI_MAX_CONSECUTIVE_SKIPPED_UPDATES", "50"))
+    max_consecutive_nonfinite_losses = int(os.environ.get("OPENPI_MAX_CONSECUTIVE_NONFINITE_LOSSES", "50"))
+    let_deepspeed_handle_nonfinite_grad = _env_flag("OPENPI_DS_HANDLE_NONFINITE_GRAD", True)
+    if is_main:
+        logging.info(
+            "FP16 stability guards: max_consecutive_skipped_updates=%s "
+            "max_consecutive_nonfinite_losses=%s ds_handle_nonfinite_grad=%s debug_overflow=%s",
+            max_consecutive_skipped_updates,
+            max_consecutive_nonfinite_losses,
+            let_deepspeed_handle_nonfinite_grad,
+            _debug_overflow_enabled(config),
+        )
+
+    pbar = (
+        tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
+        if is_main
+        else None
+    )
+
+    last_epoch_logged = None
+    while global_step < int(config.num_train_steps):
+        for observation, actions in loader:
+            if global_step >= int(config.num_train_steps):
+                break
+
+            profile_memory = is_main and _should_profile_memory_step(global_step)
+
+            # Move data to device.
+            # NOTE: Observation is a flax.struct.dataclass, which is *not* a dm-tree container.
+            # tree.map_structure would treat it as a leaf and leave nested tensors on CPU.
+            if _model is not None and isinstance(observation, _model.Observation):
+                device = accelerator.device
+
+                def _maybe_to(
+                    x: torch.Tensor | None,
+                    *,
+                    target_device: torch.device = device,
+                ) -> torch.Tensor | None:
+                    if x is None:
+                        return None
+                    return x.to(target_device, non_blocking=True)
+
+                observation = observation.replace(
+                    images={k: v.to(device, non_blocking=True) for k, v in observation.images.items()},
+                    image_masks={k: v.to(device, non_blocking=True) for k, v in observation.image_masks.items()},
+                    state=observation.state.to(device, non_blocking=True),
+                    tokenized_prompt=_maybe_to(observation.tokenized_prompt),
+                    tokenized_prompt_mask=_maybe_to(observation.tokenized_prompt_mask),
+                    token_ar_mask=_maybe_to(observation.token_ar_mask),
+                    token_loss_mask=_maybe_to(observation.token_loss_mask),
+                    subtask_tokens=_maybe_to(observation.subtask_tokens),
+                    subtask_mask=_maybe_to(observation.subtask_mask),
+                    subtask_loss_mask=_maybe_to(observation.subtask_loss_mask),
+                    subtask_ar_mask=_maybe_to(observation.subtask_ar_mask),
+                    pcd_xyz=_maybe_to(observation.pcd_xyz),
+                )
+            else:
+                observation = tree.map_structure(
+                    lambda x: x.to(accelerator.device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
+                    observation,
+                )
+            actions = actions.to(device=accelerator.device, dtype=torch.float32, non_blocking=True)
+
+            with accelerator.accumulate(model):
+                # Update LR per optimizer step (only when syncing grads).
+                if accelerator.sync_gradients:
+                    lr = lr_schedule(global_step)
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = lr
+
+                extra_metrics: dict[str, float] = {}
+                ds_plugin = accelerator.state.deepspeed_plugin if accelerator.distributed_type == DistributedType.DEEPSPEED else None
+                ds_uses_torch_autocast = bool(
+                    ds_plugin is not None
+                    and ds_plugin.deepspeed_config.get("torch_autocast", {}).get("enabled", False)
+                )
+                # If DeepSpeed has torch_autocast enabled, do not wrap another autocast context.
+                # Otherwise, we enable autocast for half-precision modes to avoid dtype mismatch
+                # (e.g., fp16 weights with fp32 activations).
+                use_autocast = (
+                    accelerator.device.type == "cuda"
+                    and config.pytorch_training_precision in ("bfloat16", "float16")
+                    and not ds_uses_torch_autocast
+                )
+                autocast_dtype = (
+                    torch.bfloat16 if config.pytorch_training_precision == "bfloat16" else torch.float16
+                )
+                with torch.autocast(
+                    device_type=accelerator.device.type,
+                    dtype=autocast_dtype,
+                    enabled=use_autocast,
+                ):
+                    if profile_memory:
+                        _reset_peak_memory_stats(accelerator)
+                    if use_vlm2:
+                        if config.pytorch_model_name == "vlm2_subtask":
+                            (
+                                video_frames,
+                                point_maps,
+                                language_tokens,
+                                language_masks,
+                                subtask_tokens,
+                                subtask_mask,
+                                subtask_ar_mask,
+                                subtask_loss_mask,
+                            ) = _prepare_vlm2_inputs(observation, config, accelerator.device, include_subtask=True)
+                            losses = model(
+                                video_frames=video_frames,
+                                point_maps=point_maps,
+                                language_tokens=language_tokens,
+                                language_masks=language_masks,
+                                actions=actions,
+                                subtask_tokens=subtask_tokens,
+                                subtask_mask=subtask_mask,
+                                subtask_ar_mask=subtask_ar_mask,
+                                subtask_loss_mask=subtask_loss_mask,
+                            )
+                        else:
+                            video_frames, point_maps, language_tokens, language_masks = _prepare_vlm2_inputs(
+                                observation, config, accelerator.device
+                            )
+                            losses = model(
+                                video_frames=video_frames,
+                                point_maps=point_maps,
+                                language_tokens=language_tokens,
+                                language_masks=language_masks,
+                                actions=actions,
+                            )
+                    else:
+                        losses = model(observation, actions)
+
+                    if isinstance(losses, dict):
+                        extra_metrics = {
+                            k: v.item()
+                            for k, v in losses.items()
+                            if k != "loss" and isinstance(v, torch.Tensor) and v.numel() == 1
+                        }
+                        loss = losses["loss"]
+                    elif isinstance(losses, (list, tuple)):
+                        loss = torch.stack(list(losses)).mean()
+                    elif not isinstance(losses, torch.Tensor):
+                        loss = torch.tensor(losses, device=accelerator.device, dtype=torch.float32)
+                    else:
+                        loss = losses.mean()
+
+                if _debug_overflow_enabled(config):
+                    extra_metrics.update(_loss_tensor_debug_metrics(losses, actions))
+
+                loss_rank_stats = _gather_scalar_stats(accelerator, loss)
+                any_rank_has_nonfinite_loss = not bool(loss_rank_stats["all_finite"])
+                if any_rank_has_nonfinite_loss and is_main:
+                    logging.error(
+                        "Non-finite loss detected on at least one rank at step=%s: "
+                        "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s std=%s",
+                        global_step,
+                        int(loss_rank_stats["finite_count"]),
+                        int(loss_rank_stats["total_count"]),
+                        int(loss_rank_stats["bad_rank"]),
+                        loss_rank_stats["min"],
+                        loss_rank_stats["max"],
+                        loss_rank_stats["mean"],
+                        loss_rank_stats["std"],
+                    )
+
+                if not torch.isfinite(loss.detach()):
+                    _log_nonfinite_batch_state(loss=loss, actions=actions, observation=observation)
+                    _save_nonfinite_debug_dump(
+                        output_dir=config.log_dir,
+                        global_step=global_step,
+                        accelerator=accelerator,
+                        loss=loss,
+                        actions=actions,
+                        observation=observation,
+                    )
+                if any_rank_has_nonfinite_loss:
+                    consecutive_nonfinite_losses += 1
+                    total_nonfinite_loss_batches += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    accelerator.wait_for_everyone()
+                    if consecutive_nonfinite_losses >= max_consecutive_nonfinite_losses:
+                        raise FloatingPointError(
+                            "Too many consecutive non-finite losses before backward. "
+                            f"Reached {consecutive_nonfinite_losses} skipped batches."
+                        )
+                    if is_main:
+                        logging.warning(
+                            "Skipping non-finite-loss batch at global_step=%s; "
+                            "consecutive_nonfinite_losses=%s/%s",
+                            global_step,
+                            consecutive_nonfinite_losses,
+                            max_consecutive_nonfinite_losses,
+                        )
+                    continue
+
+                consecutive_nonfinite_losses = 0
+
+                if profile_memory:
+                    log_memory_usage(accelerator, global_step, "after_forward")
+
+                if profile_memory:
+                    _reset_peak_memory_stats(accelerator)
+                accelerator.backward(loss)
+                if profile_memory:
+                    log_memory_usage(accelerator, global_step, "after_backward")
+
+                loss_for_log = float(loss.detach().float().item())
+                loss_scale = _get_deepspeed_loss_scale(accelerator)
+                if accelerator.sync_gradients:
+                    if global_step < 5 and is_main and torch.cuda.is_available() and not profile_memory:
+                        log_memory_usage(accelerator, global_step, "after_backward")
+
+                    grad_stats_pre = None
+                    grad_stats_post = None
+                    clip_threshold_override = _env_float("OPENPI_TRAIN_LOOP_GRADIENT_CLIPPING")
+                    if clip_threshold_override is None:
+                        clip_threshold_override = _env_float("OPENPI_DS_GRADIENT_CLIPPING")
+                    default_clip_threshold = (
+                        0.5
+                        if _fp16_stability_profile_enabled() and config.pytorch_training_precision == "float16"
+                        else config.optimizer.clip_gradient_norm
+                    )
+                    clip_threshold = float(
+                        default_clip_threshold if clip_threshold_override is None else clip_threshold_override
+                    )
+                    if _debug_overflow_enabled(config):
+                        grad_stats_pre = _collect_grad_debug_stats(optim_params, accelerator)
+
+                    grad_norm = accelerator.clip_grad_norm_(optim_params, max_norm=clip_threshold)
+                    grad_norm_value = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+                    if not np.isfinite(grad_norm_value):
+                        total_nonfinite_grad_updates += 1
+                        if accelerator.distributed_type == DistributedType.DEEPSPEED and let_deepspeed_handle_nonfinite_grad:
+                            if is_main:
+                                logging.warning(
+                                    "Non-finite grad_norm at global_step=%s loss=%.6f grad_norm=%s; "
+                                    "letting DeepSpeed optimizer.step() handle overflow/loss-scale update "
+                                    "instead of pre-step skipping. total_nonfinite_grad_updates=%s",
+                                    global_step,
+                                    loss_for_log,
+                                    grad_norm_value,
+                                    total_nonfinite_grad_updates,
+                                )
+                        else:
+                            consecutive_skipped_updates += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            accelerator.wait_for_everyone()
+                            if is_main:
+                                logging.warning(
+                                    "Skipping optimizer update because grad_norm is non-finite at global_step=%s "
+                                    "loss=%.6f grad_norm=%s consecutive_skipped_updates=%s/%s "
+                                    "total_nonfinite_grad_updates=%s",
+                                    global_step,
+                                    loss_for_log,
+                                    grad_norm_value,
+                                    consecutive_skipped_updates,
+                                    max_consecutive_skipped_updates,
+                                    total_nonfinite_grad_updates,
+                                )
+                            if consecutive_skipped_updates >= max_consecutive_skipped_updates:
+                                raise RuntimeError(
+                                    "Too many consecutive optimizer updates were skipped due to non-finite gradients. "
+                                    f"Reached {consecutive_skipped_updates} skipped updates."
+                                )
+                            continue
+
+                    if _debug_overflow_enabled(config):
+                        grad_stats_post = _collect_grad_debug_stats(optim_params, accelerator)
+                        if is_main:
+                            clipping_triggered = grad_norm_value > clip_threshold
+                            logging.info(
+                                "overflow_debug step=%s loss=%.6f loss_scale=%s clip_threshold=%.4f "
+                                "loss_all_min=%.6f loss_all_max=%.6f loss_all_mean=%.6f loss_all_std=%.6f "
+                                "loss_all_finite=%d/%d "
+                                "per_sample_loss_max=%.6f per_sample_loss_mean=%.6f per_sample_loss_std=%.6f "
+                                "target_action_abs_max=%.6f "
+                                "grad_norm_pre=%.6f grad_norm_api=%.6f grad_norm_post=%.6f "
+                                "max_abs_pre=%.6f max_abs_post=%.6f nonfinite_pre=%d nonfinite_post=%d "
+                                "finite_ratio_pre=%.8f finite_ratio_post=%.8f grad_tensors=%.0f clipped=%s",
+                                global_step,
+                                loss_for_log,
+                                f"{loss_scale:.1f}" if loss_scale is not None else "n/a",
+                                clip_threshold,
+                                loss_rank_stats["min"],
+                                loss_rank_stats["max"],
+                                loss_rank_stats["mean"],
+                                loss_rank_stats["std"],
+                                int(loss_rank_stats["finite_count"]),
+                                int(loss_rank_stats["total_count"]),
+                                extra_metrics.get("per_sample_loss_max", float("nan")),
+                                extra_metrics.get("per_sample_loss_mean", float("nan")),
+                                extra_metrics.get("per_sample_loss_std", float("nan")),
+                                extra_metrics.get("target_action_abs_max", float("nan")),
+                                grad_stats_pre["global_norm"],
+                                grad_norm_value,
+                                grad_stats_post["global_norm"],
+                                grad_stats_pre["max_abs_grad"],
+                                grad_stats_post["max_abs_grad"],
+                                int(grad_stats_pre["nonfinite_count"]),
+                                int(grad_stats_post["nonfinite_count"]),
+                                grad_stats_pre["finite_ratio"],
+                                grad_stats_post["finite_ratio"],
+                                grad_stats_pre["grad_tensors"],
+                                clipping_triggered,
+                            )
+                            if grad_stats_pre["nonfinite_count"] > 0 or grad_stats_post["nonfinite_count"] > 0:
+                                logging.warning(
+                                    "overflow_debug detected non-finite gradients at step=%s (pre=%d post=%d)",
+                                    global_step,
+                                    int(grad_stats_pre["nonfinite_count"]),
+                                    int(grad_stats_post["nonfinite_count"]),
+                                )
+                            if loss_scale is not None and loss_scale <= 1.0:
+                                logging.warning("overflow_debug loss scale collapsed to %.1f at step=%s", loss_scale, global_step)
+                    if profile_memory:
+                        _reset_peak_memory_stats(accelerator)
+                    optimizer.step()
+                    step_was_skipped = accelerator.optimizer_step_was_skipped
+                    if profile_memory:
+                        log_memory_usage(accelerator, global_step, "after_optimizer_step")
+                    optimizer.zero_grad(set_to_none=True)
+
+                    if step_was_skipped:
+                        consecutive_skipped_updates += 1
+                        total_ds_overflow_skipped_updates += 1
+                        if is_main:
+                            logging.warning(
+                                "Optimizer step skipped due to overflow at global_step=%s loss=%.6f "
+                                "loss_scale=%s consecutive_skipped_updates=%s/%s total_ds_overflow_skipped_updates=%s "
+                                "total_nonfinite_loss_batches=%s total_nonfinite_grad_updates=%s",
+                                global_step,
+                                loss_for_log,
+                                f"{loss_scale:.1f}" if loss_scale is not None else "n/a",
+                                consecutive_skipped_updates,
+                                max_consecutive_skipped_updates,
+                                total_ds_overflow_skipped_updates,
+                                total_nonfinite_loss_batches,
+                                total_nonfinite_grad_updates,
+                            )
+                        if consecutive_skipped_updates >= max_consecutive_skipped_updates:
+                            raise RuntimeError(
+                                "Too many consecutive optimizer steps were skipped due to overflow. "
+                                f"Reached {consecutive_skipped_updates} skipped updates."
+                            )
+                        continue
+
+                    consecutive_skipped_updates = 0
+
+                    # stats/logging use optimizer-step granularity
+                    if is_main:
+                        infos.append(
+                            {
+                                "loss": loss_for_log,
+                                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                                "grad_norm": grad_norm_value,
+                                **extra_metrics,
+                            }
+                        )
+                        if loss_scale is not None:
+                            infos[-1]["loss_scale"] = loss_scale
+                            # Always warn on dangerously low loss scale (regardless of debug mode)
+                            if loss_scale < 1.0:
+                                logging.warning(
+                                    "loss_scale=%.2e at step=%s — training may be numerically unstable",
+                                    loss_scale, global_step,
+                                )
+
+                    if is_main and (global_step % int(config.log_interval) == 0):
+                        elapsed = time.time() - start_time
+                        epoch_idx = global_step // steps_per_epoch
+                        epoch = epoch_idx + 1
+                        epoch_step = (global_step % steps_per_epoch) + 1
+                        if last_epoch_logged != epoch:
+                            if config.num_train_epochs is not None:
+                                logging.info("epoch=%s/%s", epoch, config.num_train_epochs)
+                            else:
+                                logging.info("epoch=%s", epoch)
+                            last_epoch_logged = epoch
+
+                        avg_loss = sum(info["loss"] for info in infos) / len(infos)
+                        avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                        avg_grad_norm = sum(info["grad_norm"] for info in infos) / len(infos)
+                        avg_loss_scale = None
+                        loss_scale_values = [info["loss_scale"] for info in infos if "loss_scale" in info]
+                        if loss_scale_values:
+                            avg_loss_scale = sum(loss_scale_values) / len(loss_scale_values)
+                        logging.info(
+                            "step=%s epoch=%s epoch_step=%s/%s loss=%.4f lr=%.2e grad_norm=%.2f loss_scale=%s time=%.1fs",
+                            global_step,
+                            epoch,
+                            epoch_step,
+                            steps_per_epoch,
+                            avg_loss,
+                            avg_lr,
+                            avg_grad_norm,
+                            f"{avg_loss_scale:.1f}" if avg_loss_scale is not None else "n/a",
+                            elapsed,
+                        )
+
+                        if is_main and config.wandb_enabled and len(infos) > 0:
+                            try:
+                                wandb = _get_wandb()
+                                log_payload: dict[str, float] = {
+                                    "loss": avg_loss,
+                                    "learning_rate": avg_lr,
+                                    "grad_norm": avg_grad_norm,
+                                    "step": float(global_step),
+                                    "epoch": float(epoch),
+                                    "epoch_step": float(epoch_step),
+                                    "steps_per_epoch": float(steps_per_epoch),
+                                    "time_per_step": elapsed / max(1, int(config.log_interval)),
+                                }
+                                if avg_loss_scale is not None:
+                                    log_payload["loss_scale"] = avg_loss_scale
+                                for metric_key in ("flow_loss", "ce_loss"):
+                                    vals = [info[metric_key] for info in infos if metric_key in info]
+                                    if vals:
+                                        log_payload[f"subtask/{metric_key}"] = sum(vals) / len(vals)
+                                wandb.log(log_payload, step=global_step)
+                            except Exception:
+                                logging.warning("wandb log failed; continuing without wandb", exc_info=True)
+                                try:
+                                    object.__setattr__(config, "wandb_enabled", False)
+                                except Exception:
+                                    pass
+
+                        start_time = time.time()
+                        infos = []
+
+                    current_step = global_step + 1
+
+                    # checkpoint/save + progress bar update
+                    save_checkpoint(
+                        accelerator=accelerator,
+                        model=model,
+                        optimizer=optimizer,
+                        global_step=current_step,
+                        config=config,
+                        data_config=data_config,
+                    )
+
+                    if pbar is not None:
+                        pbar.update(1)
+                        pbar.set_postfix(
+                            {
+                                "loss": f"{loss_for_log:.4f}",
+                                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                                "step": current_step,
+                            }
+                        )
+
+                    global_step = current_step
+
+    if pbar is not None:
+        pbar.close()
+    if is_main and config.wandb_enabled:
+        try:
+            wandb = _get_wandb()
+            wandb.finish()
+        except Exception:
+            logging.warning("wandb finish failed", exc_info=True)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            torch.distributed.destroy_process_group()
+        except Exception:
+            logging.warning("destroy_process_group failed during shutdown", exc_info=True)
+
+
+def main():
+    formatter = init_logging()
+    logging.info("Host: %s PID: %s", platform.node(), os.getpid())
+    logging.info("Python: %s (%s)", sys.version.split()[0], sys.executable)
+    logging.info("CWD: %s", os.getcwd())
+    logging.info("OPENPI_DATA_HOME=%s", os.environ.get("OPENPI_DATA_HOME"))
+    logging.info("B1K_VIDEO_BACKEND=%s", os.environ.get("B1K_VIDEO_BACKEND"))
+    logging.info("JAX_PLATFORMS=%s", os.environ.get("JAX_PLATFORMS"))
+    logging.info("CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES"))
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    vggt_dir = os.path.join(repo_root, "src", "openpi", "third_party", "vggt")
+    cut3r_dir = os.path.join(repo_root, "src", "openpi", "third_party", "cut3r")
+    if not os.path.isdir(vggt_dir) or not os.path.isdir(cut3r_dir):
+        raise FileNotFoundError(
+            "Missing third_party dependencies. Expected directories:\n"
+            f"  - {vggt_dir}\n"
+            f"  - {cut3r_dir}\n"
+            "Fix by running: git submodule update --init --recursive"
+        )
+
+    # Import OpenPI modules lazily to keep this file spawn-safe for DataLoader workers.
+    global _config, _data_loader, _model, _normalize
+    if _config is None:
+        import openpi.models.model as _model_mod
+        import openpi.shared.normalize as _normalize_mod
+        import openpi.training.config as _config_mod
+        import openpi.training.data_loader as _data_loader_mod
+
+        importlib.import_module("openpi.models_pytorch.pi0_hamlet")
+        importlib.import_module("openpi.models_pytorch.pi0_memoryvla")
+        importlib.import_module("openpi.models_pytorch.pi0_pytorch")
+        importlib.import_module("openpi.models_pytorch.pi05_subtask")
+
+        _model = _model_mod
+        _normalize = _normalize_mod
+        _config = _config_mod
+        _data_loader = _data_loader_mod
+
+    config = _config.cli()
+    logging.info(
+        "Run: exp_name=%s project=%s wandb=%s num_workers=%s batch_size=%s grad_accum=%s",
+        getattr(config, "exp_name", None),
+        getattr(config, "project_name", None),
+        getattr(config, "wandb_enabled", None),
+        getattr(config, "num_workers", None),
+        getattr(config, "batch_size", None),
+        getattr(config, "gradient_accumulation_steps", 1),
+    )
+    train_loop(config, formatter=formatter)
+
+
+if __name__ == "__main__":
+    main()

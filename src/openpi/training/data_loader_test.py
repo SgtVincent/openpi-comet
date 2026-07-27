@@ -116,8 +116,8 @@ def test_prompt_from_lerobot_item_keeps_subtask_text_when_enabled():
 
 
 def test_subtask_text_routing_matches_model_type():
-    baseline = _config.get_config("pi05_b1k-make_pizza_lr2.5e-6_5ep_sft")
-    subtask = _config.get_config("pi05_subtask_b1k-make_pizza_lr2.5e-6_5ep_sft")
+    baseline = _config.get_config("pi05_b1k-make_pizza_lr1e-4_5ep_sft")
+    subtask = _config.get_config("pi05_subtask_b1k-make_pizza_lr1e-4_5ep_sft")
 
     assert baseline.model.model_type.name == "PI05"
     assert not _data_loader._include_subtask_text(baseline.model)

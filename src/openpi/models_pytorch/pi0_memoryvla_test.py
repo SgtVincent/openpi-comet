@@ -41,7 +41,8 @@ def minimal_memoryvla_model(monkeypatch: pytest.MonkeyPatch) -> Pi05WithMemoryVL
     model = Pi05WithMemoryVLA.__new__(Pi05WithMemoryVLA)
     torch.nn.Module.__init__(model)
     model.training = False
-    model.prefix_summary_proj = torch.nn.Identity()
+    model.prefix_summary_proj = torch.nn.Linear(8, 8, bias=False)
+    torch.nn.init.eye_(model.prefix_summary_proj.weight)
     model.memoryvla = MemoryVLAModule(feature_dim=8, bank_capacity=2, similarity_threshold=0.7)
     model.memory_to_prefix_proj = torch.nn.Identity()
     model.paligemma_with_expert = _DummyPaliGemmaExpert()

@@ -126,7 +126,7 @@ def preprocess_observation_pytorch(
                 for i, meta_key in enumerate(meta_image_keys):
                     meta_image = split_images[i + 1]
                     if is_channels_first:
-                        meta_image = split_images[i + 1].permute(0, 3, 1, 2)
+                        meta_image = meta_image.permute(0, 3, 1, 2)
                     out_images[meta_key] = meta_image * 2.0 - 1.0
 
             # Color augmentations for all cameras

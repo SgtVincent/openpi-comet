@@ -701,6 +701,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
     #     logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
+    if config.pytorch_training_precision == "float16" and os.environ.get("OPENPI_ALLOW_UNSAFE_TRAIN_PYTORCH_FP16", "0") != "1":
+        raise ValueError(
+            "train_pytorch.py does not implement safe standalone float16 training yet: it would update fp16 "
+            "parameters without GradScaler/fp32 master weights. Use scripts/train_accelerate.py + DeepSpeed "
+            "for V100 fp16, or set --pytorch-training-precision to bfloat16/float32. If you are deliberately "
+            "debugging the unsafe legacy path, set OPENPI_ALLOW_UNSAFE_TRAIN_PYTORCH_FP16=1."
+        )
+
     if isinstance(config.model, openpi.models.vlm2_vla_config.VLM2VLAConfig):
         model_cfg = config.model
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
@@ -800,15 +808,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
-    if use_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=False,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
-        )
-
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
@@ -821,11 +820,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             )
         else:
             load_strict = config.pytorch_model_name not in ("vlm2", "vlm2_subtask", "subtask", "pi0_hamlet", "pi0_memoryvla")
-            safetensors.torch.load_model(
-                (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
-                model_path,
-                strict=load_strict,
-            )
+            safetensors.torch.load_model(model, model_path, strict=load_strict)
             logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
@@ -863,7 +858,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         train_lora_only = train_lora_only_env == "1"
 
     if train_lora_only:
-        target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        target = model
         keep_prefixes = (
             "moment_token_pool",
             "hamlet_memory",
@@ -883,6 +878,18 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             num_trainable,
             100.0 * num_trainable / max(1, num_total),
             num_total,
+        )
+
+    # Wrap with DDP only after weight loading and trainable filtering.  DDP builds
+    # reducer buckets from the current requires_grad state; changing many params
+    # after wrapping can cause unused-parameter hangs with find_unused_parameters=False.
+    if use_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            find_unused_parameters=False,  # Disable for memory efficiency
+            gradient_as_bucket_view=True,  # Enable for memory efficiency
+            static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
 
     optim_params = [p for p in model.parameters() if p.requires_grad]

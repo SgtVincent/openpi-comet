@@ -2,6 +2,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional
 
 from openpi.models_pytorch.memory_baselines.memoryvla_memory import MemoryVLAModule
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
@@ -66,25 +67,38 @@ class Pi05WithMemoryVLA(PI0Pytorch):
             self.memoryvla.reset_runtime_state()
 
     def _masked_prefix_summary(self, prefix_embs: torch.Tensor, prefix_pad_masks: torch.Tensor) -> torch.Tensor:
-        weights = prefix_pad_masks.to(dtype=prefix_embs.dtype).unsqueeze(-1)
+        prefix_embs = prefix_embs.float()
+        weights = prefix_pad_masks.to(dtype=torch.float32).unsqueeze(-1)
         denom = torch.clamp(weights.sum(dim=1), min=1.0)
         return (prefix_embs * weights).sum(dim=1) / denom
+
+    @staticmethod
+    def _linear_fp32(layer: nn.Module, value: torch.Tensor) -> torch.Tensor:
+        if not isinstance(layer, nn.Linear):
+            return layer(value.float())
+        return functional.linear(
+            value.float(),
+            layer.weight.float(),
+            layer.bias.float() if layer.bias is not None else None,
+        )
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
         prefix_summary = self._masked_prefix_summary(prefix_embs, prefix_pad_masks)
-        # The MemoryVLA-specific modules are loaded/stored in float32, while the
-        # backbone often runs in bfloat16 during eval. Run the memory branch in
-        # the module dtype and cast back before concatenating with the prefix.
-        memory_dtype = self.prefix_summary_proj.weight.dtype
-        current_tokens = self.prefix_summary_proj(prefix_summary.to(dtype=memory_dtype)).unsqueeze(1)
-        memory_tokens, gate = self.memoryvla(current_tokens, update_memory=not self.training)
+        # Run the numerically sensitive memory branch in fp32, then cast back
+        # before concatenating with the backbone prefix tokens.
+        with torch.autocast(device_type=prefix_embs.device.type, enabled=False):
+            current_tokens = self._linear_fp32(self.prefix_summary_proj, prefix_summary).unsqueeze(1)
+            memory_tokens, gate = self.memoryvla(current_tokens, update_memory=not self.training)
+            memory_tokens = self._linear_fp32(self.memory_to_prefix_proj, memory_tokens)
         self._last_memory_gate = gate
         if not self.training and self._active_session_id is not None:
             self._session_memory_state[self._active_session_id] = self.memoryvla.get_runtime_state()
-        memory_tokens = self.memory_to_prefix_proj(memory_tokens).to(dtype=prefix_embs.dtype)
+        memory_tokens = memory_tokens.to(dtype=prefix_embs.dtype)
 
         extra_pad_masks = torch.ones(
             prefix_embs.shape[0],

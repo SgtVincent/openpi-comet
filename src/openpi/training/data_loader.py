@@ -112,6 +112,9 @@ class FakeDataset(Dataset):
                 return jax.random.uniform(data_rng, shape=shape, minval=-1.0, maxval=1.0)
             if spec.dtype == jnp.int32:
                 return jax.random.randint(data_rng, shape=shape, minval=0, maxval=2048)
+            if spec.dtype == jnp.bool_:
+                # Avoid all-false masks (e.g. tokenized_prompt_mask) which can lead to NaNs in losses.
+                return jnp.ones(shape=shape, dtype=spec.dtype)
             return jnp.zeros(shape=shape, dtype=spec.dtype)
 
         observation = jax.tree.map(make_from_spec, self._observation_spec)
@@ -389,6 +392,9 @@ class TorchDataLoader:
             os.environ.setdefault("JAX_PLATFORMS", "cpu")
             os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
             os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+            # Avoid MKL worker crashes in spawned DataLoader processes on this environment.
+            os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+            os.environ.setdefault("MKL_SERVICE_FORCE_INTEL", "1")
 
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
@@ -496,6 +502,8 @@ def _worker_init_fn(worker_id: int) -> None:
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+    os.environ.setdefault("MKL_SERVICE_FORCE_INTEL", "1")
 
     # In DDP each rank spawns its own set of DataLoader workers.  Without
     # rank-aware seeding every rank's worker-k ends up with the same numpy /

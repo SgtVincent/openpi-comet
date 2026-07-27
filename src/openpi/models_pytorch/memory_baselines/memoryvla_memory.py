@@ -2,6 +2,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional
 
 
 class SingleStreamMemoryBank(nn.Module):
@@ -44,7 +45,7 @@ class SingleStreamMemoryBank(nn.Module):
             and self.memory_bank.shape[1] == self.bank_capacity
             and self.memory_bank.shape[2] == feature_dim
             and self.memory_bank.device == item.device
-            and self.memory_bank.dtype == item.dtype
+            and self.memory_bank.dtype == torch.float32
         ):
             return
         self.memory_bank = torch.zeros(
@@ -52,14 +53,14 @@ class SingleStreamMemoryBank(nn.Module):
             self.bank_capacity,
             feature_dim,
             device=item.device,
-            dtype=item.dtype,
+            dtype=torch.float32,
         )
         self.memory_count = torch.tensor(0, device=item.device)
         self.memory_write_index = torch.tensor(0, device=item.device)
 
     def _cosine_similarity(self, query: torch.Tensor, memory_bank: torch.Tensor) -> torch.Tensor:
-        query = torch.nn.functional.normalize(query, dim=-1)
-        memory_bank = torch.nn.functional.normalize(memory_bank, dim=-1)
+        query = functional.normalize(query.float(), dim=-1)
+        memory_bank = functional.normalize(memory_bank.float(), dim=-1)
         return torch.einsum("bd,bkd->bk", query, memory_bank)
 
     def retrieve(self, query: torch.Tensor) -> torch.Tensor | None:
@@ -72,7 +73,7 @@ class SingleStreamMemoryBank(nn.Module):
         return torch.einsum("bk,bkd->bd", weights, valid_bank)
 
     def update(self, item: torch.Tensor) -> None:
-        item = item.detach()
+        item = item.detach().float()
         self._ensure_memory_bank(item)
         assert self.memory_bank is not None
 
@@ -111,18 +112,43 @@ class GatedMemoryFusion(nn.Module):
         )
         self.gate_bias = nn.Parameter(torch.full((feature_dim,), gate_init))
 
-    def forward(self, current_tokens: torch.Tensor, retrieved_summary: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+    def _mlp_fp32(self, x: torch.Tensor) -> torch.Tensor:
+        first = self.mlp[0]
+        second = self.mlp[2]
+        assert isinstance(first, nn.Linear)
+        assert isinstance(second, nn.Linear)
+        x = functional.linear(
+            x.float(),
+            first.weight.float(),
+            first.bias.float() if first.bias is not None else None,
+        )
+        x = functional.gelu(x)
+        return functional.linear(
+            x,
+            second.weight.float(),
+            second.bias.float() if second.bias is not None else None,
+        )
+
+    def forward(
+        self, current_tokens: torch.Tensor, retrieved_summary: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        original_dtype = current_tokens.dtype
+        current_tokens = current_tokens.float()
         if retrieved_summary is None:
             zero_retrieved = torch.zeros_like(current_tokens)
             # Keep the same parameter-usage pattern across steps so DDP static_graph mode remains valid.
-            gate_logits = self.mlp(torch.cat([current_tokens, zero_retrieved], dim=-1)) + self.gate_bias
+            with torch.autocast(device_type=current_tokens.device.type, enabled=False):
+                gate_logits = self._mlp_fp32(torch.cat([current_tokens, zero_retrieved], dim=-1))
+                gate_logits = gate_logits + self.gate_bias.float()
             gate = torch.zeros_like(gate_logits)
-            return current_tokens + gate_logits * 0.0, gate
-        retrieved_tokens = retrieved_summary[:, None, :].expand_as(current_tokens)
-        gate_logits = self.mlp(torch.cat([current_tokens, retrieved_tokens], dim=-1)) + self.gate_bias
-        gate = torch.sigmoid(gate_logits)
-        fused = gate * retrieved_tokens + (1.0 - gate) * current_tokens
-        return fused, gate
+            return (current_tokens + gate_logits * 0.0).to(dtype=original_dtype), gate
+        retrieved_tokens = retrieved_summary.float()[:, None, :].expand_as(current_tokens)
+        with torch.autocast(device_type=current_tokens.device.type, enabled=False):
+            gate_logits = self._mlp_fp32(torch.cat([current_tokens, retrieved_tokens], dim=-1))
+            gate_logits = gate_logits + self.gate_bias.float()
+            gate = torch.sigmoid(gate_logits)
+            fused = gate * retrieved_tokens + (1.0 - gate) * current_tokens
+        return fused.to(dtype=original_dtype), gate
 
 
 class MemoryVLAModule(nn.Module):

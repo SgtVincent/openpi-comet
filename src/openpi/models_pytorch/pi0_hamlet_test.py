@@ -44,9 +44,11 @@ def minimal_hamlet_model(monkeypatch: pytest.MonkeyPatch) -> Pi05WithHamlet:
     model.config = SimpleNamespace(hamlet_num_moment_tokens=4)
     model.training = False
     model.moment_token_pool = MomentTokenPool(num_tokens=4, feature_dim=8)
-    model.prefix_summary_proj = torch.nn.Identity()
+    model.prefix_summary_proj = torch.nn.Linear(8, 8, bias=False)
+    torch.nn.init.eye_(model.prefix_summary_proj.weight)
     model.hamlet_memory = HamletMemoryAdapter(feature_dim=8, num_moment_tokens=4, history_length=2, num_heads=2, num_layers=1)
-    model.memory_to_prefix_proj = torch.nn.Identity()
+    model.memory_to_prefix_proj = torch.nn.Linear(8, 8, bias=False)
+    torch.nn.init.eye_(model.memory_to_prefix_proj.weight)
     model.paligemma_with_expert = _DummyPaliGemmaExpert()
     model._active_session_id = None
     model._session_memory_state = {}

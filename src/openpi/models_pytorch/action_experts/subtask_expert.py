@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from openpi.models_pytorch.action_experts.base import ActionExpert
+from openpi.models_pytorch.dtype_utils import align_tensors_to_reference_dtype
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 
 
@@ -108,12 +109,12 @@ class SubtaskActionExpert(ActionExpert):
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = model.embed_suffix(state, x_t, time)
 
-        if (
-            model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+        prefix_embs, suffix_embs = align_tensors_to_reference_dtype(
+            model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight,
+            prefix_embs,
+            suffix_embs,
+            context="language model",
+        )
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -182,12 +183,12 @@ class SubtaskActionExpert(ActionExpert):
         # === Build suffix: action tokens ===
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = model.embed_suffix(state, x_t, time)
 
-        if (
-            model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            extended_prefix_embs = extended_prefix_embs.to(dtype=torch.bfloat16)
+        extended_prefix_embs, suffix_embs = align_tensors_to_reference_dtype(
+            model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight,
+            extended_prefix_embs,
+            suffix_embs,
+            context="language model",
+        )
         extended_prefix_att_masks = extended_prefix_att_masks.to(dtype=suffix_att_masks.dtype)
 
         # === Combined forward pass ===
