@@ -72,7 +72,7 @@ class SubtaskActionExpert(ActionExpert):
             prefix_att_masks=prefix_att_masks,
             subtask_tokens=subtask_tokens,
             subtask_mask=subtask_mask,
-            causal=False,
+            causal=True,
         )
         prefix_att_2d_masks = model.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

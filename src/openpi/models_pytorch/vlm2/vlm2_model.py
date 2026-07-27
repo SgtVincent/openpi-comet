@@ -13,6 +13,7 @@ Reference:
 - Pi-0.5 paper: Physical Intelligence π0.5
 """
 
+import dataclasses
 import logging
 import math
 import time
@@ -44,12 +45,19 @@ try:
         create_sinusoidal_pos_embedding,
         sample_beta,
     )
+    from openpi.models_pytorch.cache_utils import PreserveCacheLen
     from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
     import openpi.models.gemma as _gemma
+    import openpi.shared.download as _download
+    import sentencepiece as _sentencepiece
     HAS_PI05 = True
+    HAS_SENTENCEPIECE = True
 except ImportError:
     HAS_PI05 = False
+    HAS_SENTENCEPIECE = False
     _gemma = None  # type: ignore
+    _download = None  # type: ignore
+    _sentencepiece = None  # type: ignore
     make_att_2d_masks = None  # type: ignore
     create_sinusoidal_pos_embedding = None  # type: ignore
     sample_beta = None  # type: ignore
@@ -809,16 +817,20 @@ class VLM2WithPi05(nn.Module):
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         
-        # Forward through expert with KV cache
+        # Forward through expert with KV cache.
+        # Wrap with PreserveCacheLen so the prefix cache isn't mutated by
+        # HF attention layers (they append suffix keys in-place even with
+        # use_cache=False).  The prefix cache is reused across denoise steps.
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+        with PreserveCacheLen(past_key_values):
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
         suffix_out = outputs_embeds[1]
         if suffix_out is None:
             raise RuntimeError("Expected suffix outputs from PaliGemma expert forward pass.")
@@ -840,10 +852,629 @@ class VLM2SubtaskWithPi05(VLM2WithPi05):
     def __init__(self, config: VLM2Config, *, alpha: float = 10.0):
         super().__init__(config)
         self.alpha = alpha
+        self._text_tokenizer = None
+        self._last_predicted_subtasks: list[str] = []
 
     def make_att_2d_masks(self, pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch.Tensor:
         assert make_att_2d_masks is not None
         return make_att_2d_masks(pad_masks, att_masks)
+
+    # ----------------------------------------------------------------------- #
+    #  Subtask inference — public API
+    # ----------------------------------------------------------------------- #
+
+    def _load_text_tokenizer(self):
+        """Lazy-load the PaliGemma sentencepiece tokenizer for subtask decoding."""
+        if not hasattr(self, "_text_tokenizer") or self._text_tokenizer is None:
+            if not HAS_SENTENCEPIECE:
+                raise RuntimeError(
+                    "sentencepiece is required for subtask token decoding but is not available."
+                )
+            assert _download is not None
+            assert _sentencepiece is not None
+            path = _download.maybe_download(
+                "gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"}
+            )
+            with path.open("rb") as f:
+                self._text_tokenizer = _sentencepiece.SentencePieceProcessor(model_proto=f.read())
+        return self._text_tokenizer
+
+    def _eos_token_id(self) -> int:
+        return self._load_text_tokenizer().eos_id()
+
+    def _has_subtask_conditioning(self, observation) -> bool:
+        """Return True if observation already has valid subtask tokens."""
+        subtask_mask = getattr(observation, "subtask_mask", None)
+        return subtask_mask is not None and bool(torch.any(subtask_mask).item())
+
+    @torch.no_grad()
+    def predict_subtask_tokens(
+        self,
+        observation,
+        *,
+        max_tokens: int = 64,
+        temperature: float = 0.0,
+        min_tokens: int = 1,
+    ) -> torch.Tensor:
+        """Generate subtask token IDs from the current observation.
+
+        Runs the VLM2 perception + memory pipeline to build the visual-language
+        prefix, then autoregressively generates subtask text tokens using the
+        PaliGemma language model with KV cache.
+
+        Args:
+            observation: Model observation (images, state, tokenized prompt).
+            max_tokens: Maximum number of subtask tokens to generate.
+            temperature: Sampling temperature (0.0 = greedy).
+            min_tokens: Minimum number of tokens before EOS is allowed.
+
+        Returns:
+            Integer tensor of shape ``(batch, num_generated)`` with subtask token IDs.
+        """
+        # Build visual + language prefix the same way sample_actions does,
+        # using VLM2's perception + memory pipeline.
+        processed = cast(
+            Any,
+            _preprocessing.preprocess_observation_pytorch(
+                observation, train=False, image_keys=("base_0_rgb",)
+            ),
+        )
+        language_tokens = processed.tokenized_prompt
+        language_masks = processed.tokenized_prompt_mask
+        if language_tokens is None or language_masks is None:
+            raise ValueError(
+                "Observation missing tokenized_prompt/tokenized_prompt_mask for subtask prediction."
+            )
+
+        base_image = processed.images["base_0_rgb"]  # (B, C, H, W)
+        video_frames = base_image.unsqueeze(1)  # (B, 1, C, H, W)
+        batch_size = base_image.shape[0]
+        device = base_image.device
+
+        # Embed language tokens for memory retrieval
+        lang_emb = self.paligemma_with_expert.embed_language_tokens(language_tokens)
+        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+
+        # Save memory state before subtask prediction so we can restore it
+        # afterwards.  Gap 3: without this save/restore, hierarchical
+        # inference double-updates streaming memory — once during subtask
+        # prediction and once during action sampling — corrupting the
+        # memory for subsequent timesteps.
+        # The subtask prediction is a "read-only" operation: it needs the
+        # memory to produce good subtasks, but it must not mutate it.
+        # The action-inference path is responsible for the real memory update.
+        # Wrapped in try/finally so memory is restored even if
+        # process_video_with_memory raises an exception.
+        saved_memory_state = self.memory.get_runtime_state()
+        try:
+            # Process video through VLM2 perception and memory
+            memory_enhanced_repr = self.process_video_with_memory(
+                video_frames,
+                text_query=lang_emb,
+                text_mask=language_masks,
+            )
+        finally:
+            # Restore memory state — subtask prediction must not change it,
+            # even if the processing above raises an exception.
+            self.memory.set_runtime_state(saved_memory_state)
+
+        # NOTE: we do NOT update _session_memory_state here — that is the
+        # responsibility of the action-inference path, which performs the
+        # real streaming memory update.
+
+        # Aggregate all camera-view tokens (must match training aggregation).
+        aggregated_repr = rearrange(memory_enhanced_repr, "b t n d -> b (t n) d")
+
+        # Project to language model dimension
+        proj_weight = getattr(self.repr_to_llm, "weight", None)
+        proj_dtype = proj_weight.dtype if proj_weight is not None else aggregated_repr.dtype
+        prefix_embs = self.repr_to_llm(aggregated_repr.to(proj_dtype))
+
+        # Reuse language embeddings
+        lang_emb = lang_emb.to(dtype=prefix_embs.dtype)
+        prefix_embs = torch.cat([prefix_embs, lang_emb], dim=1)
+
+        # Create prefix masks
+        n_visual = aggregated_repr.shape[1]
+        prefix_pad_masks = torch.cat(
+            [
+                torch.ones(batch_size, n_visual, dtype=torch.bool, device=device),
+                language_masks,
+            ],
+            dim=1,
+        )
+        prefix_att_masks = torch.zeros(prefix_embs.shape[1], dtype=torch.bool, device=device)
+        prefix_att_masks = prefix_att_masks[None, :].expand(batch_size, -1)
+
+        # Create prefix attention masks
+        prefix_att_2d_masks = self.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        # Run the prefix through the language model to get initial KV cache.
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        lm_out = self.paligemma_with_expert.paligemma.language_model.forward(
+            inputs_embeds=prefix_embs,
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            use_cache=True,
+        )
+        prefix_hidden = lm_out.last_hidden_state
+        past_kv = lm_out.past_key_values
+
+        embed_weight = self.paligemma_with_expert.paligemma.language_model.embed_tokens.weight
+        emb_dim = embed_weight.shape[1]
+        lm_head = self.paligemma_with_expert.paligemma.lm_head
+
+        bos_token = self._load_text_tokenizer().bos_id()
+        eos_token = self._eos_token_id()
+        generated_tokens = []
+        next_pos = prefix_pad_masks.sum(dim=-1).to(torch.int64)
+
+        # Track which rows have already produced EOS so we can zero out
+        # subsequent tokens in finished rows.  Without this, rows that finish
+        # early keep generating garbage tokens because generation only stops
+        # when ALL rows have produced EOS (torch.all(...) == eos).
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        # Inject BOS token as the first step of subtask generation.
+        # In training, the subtask sequence is [BOS, tok1, tok2, ..., EOS]
+        # with causal attention, and tok1 is predicted from the BOS position.
+        # We replicate this at inference by feeding BOS through the model and
+        # using its hidden state to predict the first real token.
+        bos_token_tensor = torch.full(
+            (batch_size, 1), bos_token, dtype=torch.long, device=device
+        )
+        bos_emb = self.paligemma_with_expert.embed_language_tokens(bos_token_tensor) * math.sqrt(emb_dim)
+        # Attention mask: prefix + 1 (BOS)
+        bos_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        full_mask_bos = torch.cat([prefix_pad_masks, bos_mask], dim=1)
+        full_mask_bos_4d = self._prepare_attention_masks_4d(full_mask_bos[:, None, :])
+
+        bos_out = self.paligemma_with_expert.paligemma.language_model.forward(
+            inputs_embeds=bos_emb,
+            attention_mask=full_mask_bos_4d,
+            position_ids=next_pos[:, None],
+            past_key_values=past_kv,
+            use_cache=True,
+        )
+        past_kv = bos_out.past_key_values
+        logits = lm_head(bos_out.last_hidden_state)
+        next_pos = next_pos + 1
+
+        for step in range(max_tokens):
+            if step < min_tokens:
+                logits[:, -1, eos_token] = -torch.inf
+            if temperature > 0:
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1, dtype=torch.float32).to(logits.dtype)
+                next_token = torch.multinomial(probs, 1)
+            else:
+                next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+
+            # Zero out tokens in rows that have already finished.
+            # This prevents garbage post-EOS tokens from contaminating the
+            # subtask conditioning seen by the action expert.
+            next_token = torch.where(
+                finished.unsqueeze(1),
+                torch.zeros_like(next_token),
+                next_token,
+            )
+
+            generated_tokens.append(next_token)
+
+            # Mark rows that just produced EOS as finished (for future steps).
+            just_finished = (next_token.squeeze(1) == eos_token) & ~finished
+            finished = finished | just_finished
+
+            if torch.all(finished):
+                break
+
+            token_emb = self.paligemma_with_expert.embed_language_tokens(next_token) * math.sqrt(emb_dim)
+            # Generated tokens so far: 1 (BOS) + step+1 (sampled tokens in loop)
+            gen_mask = torch.ones(batch_size, step + 2, dtype=torch.bool, device=device)
+            full_mask = torch.cat([prefix_pad_masks, gen_mask], dim=1)
+            full_mask_4d = self._prepare_attention_masks_4d(full_mask[:, None, :])
+
+            out = self.paligemma_with_expert.paligemma.language_model.forward(
+                inputs_embeds=token_emb,
+                attention_mask=full_mask_4d,
+                position_ids=next_pos[:, None],
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+            last_hidden = out.last_hidden_state
+            past_kv = out.past_key_values
+            logits = lm_head(last_hidden)
+            next_pos = next_pos + 1
+
+        if not generated_tokens:
+            return torch.zeros(batch_size, 0, dtype=torch.int32, device=device)
+        return torch.cat(generated_tokens, dim=1).to(dtype=torch.int32)
+
+    def decode_subtask_tokens(self, token_batch: torch.Tensor) -> list[str]:
+        """Decode a batch of subtask token IDs into human-readable strings.
+
+        Strips BOS, EOS, and padding (zero) tokens before decoding.
+        """
+        sp = self._load_text_tokenizer()
+        bos_token = sp.bos_id()
+        eos_token = self._eos_token_id()
+        results = []
+        for row in token_batch.detach().cpu().tolist():
+            tokens = []
+            for token in row:
+                if token == 0:
+                    continue
+                if token == bos_token:
+                    continue
+                if token == eos_token:
+                    break
+                tokens.append(int(token))
+            results.append(sp.decode(tokens))
+        return results
+
+    def build_hierarchical_observation(self, observation, subtask_tokens: torch.Tensor):
+        """Inject predicted subtask tokens into the observation for action generation.
+
+        Prepends BOS to the predicted subtask tokens so that the action expert
+        sees the same conditioning sequence as during training (``[BOS, tok1,
+        tok2, ..., EOS]``).  ``predict_subtask_tokens`` returns only ``[tok1,
+        ..., EOS]`` (no BOS) because BOS is the generation seed.
+
+        Pads / clips the resulting tokens to ``config.subtask_max_len`` and
+        populates the four subtask fields.  ``subtask_loss_mask`` and
+        ``subtask_ar_mask`` are zeroed because at inference time the subtask
+        is fixed prefix context, not an AR prediction target.
+
+        Args:
+            observation: Original model observation.
+            subtask_tokens: Generated subtask token IDs (batch, seq_len).
+                Must NOT include a leading BOS (output of
+                ``predict_subtask_tokens``).
+
+        Returns:
+            New Observation with subtask fields populated.
+        """
+        batch_size = subtask_tokens.shape[0]
+        # Default max_len: add 1 to generated token count to accommodate BOS prefix.
+        # Without the +1, when config lacks subtask_max_len the last generated
+        # token (typically EOS) would be clipped off.
+        max_len = getattr(self.config, "subtask_max_len", subtask_tokens.shape[1] + 1)
+        device = subtask_tokens.device
+
+        padded_tokens = torch.zeros(batch_size, max_len, dtype=subtask_tokens.dtype, device=device)
+        padded_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=device)
+        padded_loss_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=device)
+        padded_ar_mask = torch.zeros(batch_size, max_len, dtype=torch.int32, device=device)
+
+        # Prepend BOS token to match training's conditioning sequence.
+        # Training uses [BOS, tok1, ..., EOS] as the subtask prefix, and the
+        # action expert's cross-attention sees the full sequence including BOS.
+        bos_token = self._load_text_tokenizer().bos_id()
+        eos_token = self._eos_token_id()
+        bos_col = torch.full(
+            (batch_size, 1), bos_token, dtype=subtask_tokens.dtype, device=device
+        )
+        tokens_with_bos = torch.cat([bos_col, subtask_tokens], dim=1)
+
+        # Leave one slot for BOS (subtract 1 from the available max_len).
+        clipped = tokens_with_bos[:, :max_len]
+        clipped_len = clipped.shape[1]
+        padded_tokens[:, :clipped_len] = clipped
+
+        # EOS-aware mask: mark tokens valid from position 0 up to and
+        # including the first EOS.  Rows without EOS fall back to != 0.
+        # This ensures the action expert never attends to post-EOS garbage
+        # tokens in batches where different rows finish at different times.
+        #
+        # Vectorized implementation (no Python per-row loops):
+        #   eos_cumsum[i, j] = number of EOS tokens seen up to position j
+        #   valid = cumsum < 1          (before any EOS)
+        #         | (cumsum == 1 & is_eos)  (at the first EOS)
+        # This correctly handles multiple EOS per row: only the first counts.
+        eos_mask_bool = clipped == eos_token
+        eos_cumsum = torch.cumsum(eos_mask_bool.to(torch.long), dim=1)  # (batch, clipped_len)
+        has_eos = eos_cumsum[:, -1] > 0  # (batch,)
+
+        # Valid positions: before first EOS, OR at the first EOS itself
+        valid_up_to_eos = (eos_cumsum < 1) | ((eos_cumsum == 1) & eos_mask_bool)
+        # For rows without EOS, use nonzero mask as fallback
+        nonzero_mask = clipped != 0
+        padded_mask[:, :clipped_len] = torch.where(
+            has_eos[:, None], valid_up_to_eos, nonzero_mask
+        )
+
+        # During action generation the predicted subtask is fixed context, not an AR target.
+        return dataclasses.replace(
+            observation,
+            subtask_tokens=padded_tokens,
+            subtask_mask=padded_mask,
+            subtask_loss_mask=padded_loss_mask,
+            subtask_ar_mask=padded_ar_mask,
+        )
+
+    @torch.no_grad()
+    def predict_subtask(
+        self, observation, *, max_tokens: int = 64, temperature: float = 0.0
+    ) -> list[str]:
+        """Generate subtask text strings from observation.
+
+        Convenience wrapper around :meth:`predict_subtask_tokens` +
+        :meth:`decode_subtask_tokens`.  Caches the decoded strings on
+        ``self._last_predicted_subtasks`` for the Policy wrapper to pick up.
+        """
+        generated_tokens = self.predict_subtask_tokens(
+            observation, max_tokens=max_tokens, temperature=temperature
+        )
+        results = self.decode_subtask_tokens(generated_tokens)
+        self._last_predicted_subtasks = results
+        return results
+
+    @torch.no_grad()
+    def sample_actions_hierarchical(
+        self,
+        device: torch.device,
+        observation,
+        noise: Optional[torch.Tensor] = None,
+        num_steps: int = 10,
+        *,
+        max_subtask_tokens: int = 64,
+        temperature: float = 0.0,
+    ) -> torch.Tensor:
+        """End-to-end hierarchical inference: predict subtask, then sample actions.
+
+        1. Generate subtask tokens from the observation.
+        2. Build a hierarchical observation conditioned on the predicted subtask.
+        3. Sample actions using the subtask-conditioned prefix.
+
+        Args:
+            device: Torch device.
+            observation: Model observation.
+            noise: Optional initial noise for flow matching.
+            num_steps: Number of Euler steps for flow matching.
+            max_subtask_tokens: Maximum subtask tokens to generate.
+            temperature: Subtask sampling temperature.
+
+        Returns:
+            Sampled actions ``(batch, action_horizon, action_dim)``.
+        """
+        generated_tokens = self.predict_subtask_tokens(
+            observation, max_tokens=max_subtask_tokens, temperature=temperature
+        )
+        self._last_predicted_subtasks = self.decode_subtask_tokens(generated_tokens)
+        conditioned_observation = self.build_hierarchical_observation(observation, generated_tokens)
+        return self._sample_actions_with_subtask_conditioning(
+            device, conditioned_observation, noise=noise, num_steps=num_steps
+        )
+
+    @torch.no_grad()
+    def sample_actions(
+        self,
+        device: torch.device,
+        observation,
+        noise: Optional[torch.Tensor] = None,
+        num_steps: int = 10,
+        *,
+        max_subtask_tokens: int = 64,
+        temperature: float = 0.0,
+    ) -> torch.Tensor:
+        """Sample actions, dispatching to subtask-conditioned or hierarchical path.
+
+        - If the observation already has subtask conditioning (``subtask_mask``
+          has True entries), use the subtask-conditioned path directly.
+        - Otherwise, generate a subtask first (hierarchical inference).
+
+        This matches the behaviour of :class:`PI05SubtaskPytorch.sample_actions`
+        so that the Policy wrapper sees a uniform interface.
+        """
+        if self._has_subtask_conditioning(observation):
+            return self._sample_actions_with_subtask_conditioning(
+                device, observation, noise=noise, num_steps=num_steps
+            )
+        return self.sample_actions_hierarchical(
+            device,
+            observation,
+            noise=noise,
+            num_steps=num_steps,
+            max_subtask_tokens=max_subtask_tokens,
+            temperature=temperature,
+        )
+
+    # ----------------------------------------------------------------------- #
+    #  Internal helpers
+    # ----------------------------------------------------------------------- #
+
+    @torch.no_grad()
+    def _sample_actions_with_subtask_conditioning(
+        self,
+        device: torch.device,
+        observation,
+        noise: Optional[torch.Tensor] = None,
+        num_steps: int = 10,
+    ) -> torch.Tensor:
+        """Sample actions with subtask tokens included in the prefix.
+
+        Same structure as the base class :meth:`VLM2WithPi05.sample_actions`,
+        but inserts subtask embeddings between the language prefix and the
+        action suffix so the action decoder sees the predicted subtask as
+        additional context.
+
+        Args:
+            device: Torch device.
+            observation: Observation with subtask fields populated.
+            noise: Optional initial noise.
+            num_steps: Number of denoising steps.
+
+        Returns:
+            Sampled actions ``(batch, action_horizon, action_dim)``.
+        """
+        processed = cast(
+            Any,
+            _preprocessing.preprocess_observation_pytorch(
+                observation, train=False, image_keys=("base_0_rgb",)
+            ),
+        )
+        language_tokens = processed.tokenized_prompt
+        language_masks = processed.tokenized_prompt_mask
+        if language_tokens is None or language_masks is None:
+            raise ValueError(
+                "Observation missing tokenized_prompt/tokenized_prompt_mask "
+                "for subtask-conditioned action sampling."
+            )
+
+        subtask_tokens = observation.subtask_tokens
+        subtask_mask = observation.subtask_mask
+        if subtask_tokens is None or subtask_mask is None:
+            raise ValueError(
+                "_sample_actions_with_subtask_conditioning called but subtask_tokens/mask is None."
+            )
+
+        base_image = processed.images["base_0_rgb"]  # (B, C, H, W)
+        video_frames = base_image.unsqueeze(1)  # (B, 1, C, H, W)
+        batch_size = base_image.shape[0]
+        device = base_image.device
+
+        if noise is None:
+            actions_shape = (batch_size, self.action_horizon, self.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        # Embed language tokens for memory retrieval
+        lang_emb = self.paligemma_with_expert.embed_language_tokens(language_tokens)
+        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+
+        # Process video through VLM2 perception and memory
+        memory_enhanced_repr = self.process_video_with_memory(
+            video_frames,
+            text_query=lang_emb,
+            text_mask=language_masks,
+        )
+
+        # Persist runtime memory for the current session (if any).
+        if self._active_session_id is not None:
+            self._session_memory_state[self._active_session_id] = self.memory.get_runtime_state()
+
+        # Aggregate all camera-view tokens (must match training aggregation).
+        aggregated_repr = rearrange(memory_enhanced_repr, "b t n d -> b (t n) d")
+
+        # Project to language model dimension
+        proj_weight = getattr(self.repr_to_llm, "weight", None)
+        proj_dtype = proj_weight.dtype if proj_weight is not None else aggregated_repr.dtype
+        prefix_embs = self.repr_to_llm(aggregated_repr.to(proj_dtype))
+
+        # Append language embeddings
+        lang_emb = lang_emb.to(dtype=prefix_embs.dtype)
+        prefix_embs = torch.cat([prefix_embs, lang_emb], dim=1)
+
+        n_visual = aggregated_repr.shape[1]
+        prefix_pad_masks = torch.cat(
+            [
+                torch.ones(batch_size, n_visual, dtype=torch.bool, device=device),
+                language_masks,
+            ],
+            dim=1,
+        )
+        prefix_att_masks = torch.zeros(prefix_embs.shape[1], dtype=torch.bool, device=device)
+        prefix_att_masks = prefix_att_masks[None, :].expand(batch_size, -1)
+
+        # Append subtask embeddings to the prefix.
+        subtask_embs = self.paligemma_with_expert.embed_language_tokens(subtask_tokens)
+        subtask_embs = subtask_embs * math.sqrt(subtask_embs.shape[-1])
+        subtask_embs = subtask_embs.to(dtype=prefix_embs.dtype)
+        prefix_embs = torch.cat([prefix_embs, subtask_embs], dim=1)
+
+        prefix_pad_masks = torch.cat([prefix_pad_masks, subtask_mask], dim=1)
+        prefix_att_masks = torch.cat(
+            [
+                prefix_att_masks,
+                torch.ones_like(subtask_mask, dtype=prefix_att_masks.dtype),
+            ],
+            dim=1,
+        )
+
+        # Build prefix attention masks and KV cache
+        prefix_att_2d_masks = self.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        # Euler integration for sampling
+        dt = -1.0 / num_steps
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+        while time >= -dt / 2:
+            expanded_time = time.expand(batch_size)
+            v_t = self._denoise_step_subtask(
+                x_t, expanded_time, prefix_pad_masks, past_key_values
+            )
+            x_t = x_t + dt * v_t
+            time = time + dt
+
+        return x_t
+
+    def _denoise_step_subtask(
+        self,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values: Any,
+    ) -> torch.Tensor:
+        """Single denoising step (subtask-conditioned version).
+
+        Mirrors :meth:`VLM2WithPi05._denoise_step` but uses the expert's
+        forward with KV cache that already includes the subtask context.
+        The logic is identical — the difference is entirely in how the
+        prefix KV cache was built.  Kept as a separate method for clarity
+        and to avoid any hidden coupling with the base implementation.
+        """
+        # Embed action suffix
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_action_suffix(x_t, timestep)
+
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        suffix_len = suffix_pad_masks.shape[1]
+
+        # Create attention masks: suffix tokens can attend to all prefix tokens
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = self.make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        # Position IDs
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        # Prepare attention masks
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+
+        # Forward through expert with KV cache.
+        # Wrap with PreserveCacheLen so the prefix cache isn't mutated by
+        # HF attention layers (they append suffix keys in-place even with
+        # use_cache=False).  The prefix cache is reused across denoise steps.
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        with PreserveCacheLen(past_key_values):
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+        suffix_out = outputs_embeds[1]
+        if suffix_out is None:
+            raise RuntimeError("Expected suffix outputs from PaliGemma expert forward pass.")
+        suffix_out = suffix_out[:, -self.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+
+        return self.action_out_proj(suffix_out)
 
     def forward(
         self,

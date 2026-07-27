@@ -10,6 +10,7 @@ import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.action_experts import create_action_expert
+from openpi.models_pytorch.cache_utils import PreserveCacheLen
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -461,14 +462,18 @@ class PI0Pytorch(nn.Module):
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+        # Preserve prefix cache length: HF attention layers mutate past_key_values
+        # in-place even with use_cache=False, which would break subsequent
+        # denoising steps that expect a fixed-length prefix cache.
+        with PreserveCacheLen(past_key_values):
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.action_horizon :]

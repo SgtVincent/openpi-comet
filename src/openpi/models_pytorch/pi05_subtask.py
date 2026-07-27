@@ -76,8 +76,22 @@ class PI05SubtaskPytorch(PI0Pytorch):
         return results
 
     def build_hierarchical_observation(self, observation, subtask_tokens: torch.Tensor):
+        """Build subtask-conditioned observation for action generation.
+
+        Prepends BOS to the predicted subtask tokens so that the action expert
+        sees the same conditioning sequence as during training, where the
+        subtask sequence is ``[BOS, tok1, tok2, ..., EOS]``.
+
+        ``predict_subtask_tokens`` returns only ``[tok1, ..., EOS]`` (no BOS)
+        because the BOS is used as the seed token during generation and is not
+        part of the generated output.  We add it back here so the conditioning
+        prefix matches training.
+        """
         batch_size = subtask_tokens.shape[0]
-        max_len = getattr(self.config, "subtask_max_len", subtask_tokens.shape[1])
+        # Default max_len: add 1 to generated token count to accommodate BOS prefix.
+        # Without the +1, when config lacks subtask_max_len the last generated
+        # token (typically EOS) would be clipped off.
+        max_len = getattr(self.config, "subtask_max_len", subtask_tokens.shape[1] + 1)
         device = subtask_tokens.device
 
         padded_tokens = torch.zeros(batch_size, max_len, dtype=subtask_tokens.dtype, device=device)
@@ -85,10 +99,42 @@ class PI05SubtaskPytorch(PI0Pytorch):
         padded_loss_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=device)
         padded_ar_mask = torch.zeros(batch_size, max_len, dtype=torch.int32, device=device)
 
-        clipped = subtask_tokens[:, :max_len]
+        # Prepend BOS token to match training's conditioning sequence.
+        # Training uses [BOS, tok1, ..., EOS] as the subtask prefix, and the
+        # action expert's cross-attention sees the full sequence including BOS.
+        bos_token = self._load_text_tokenizer().bos_id()
+        eos_token = self._eos_token_id()
+        bos_col = torch.full(
+            (batch_size, 1), bos_token, dtype=subtask_tokens.dtype, device=device
+        )
+        tokens_with_bos = torch.cat([bos_col, subtask_tokens], dim=1)
+
+        # Leave one slot for BOS (subtract 1 from the available max_len).
+        clipped = tokens_with_bos[:, :max_len]
         clipped_len = clipped.shape[1]
         padded_tokens[:, :clipped_len] = clipped
-        padded_mask[:, :clipped_len] = clipped != 0
+
+        # EOS-aware mask: mark tokens valid from position 0 up to and
+        # including the first EOS.  Rows without EOS fall back to != 0.
+        # This ensures the action expert never attends to post-EOS garbage
+        # tokens in batches where different rows finish at different times.
+        #
+        # Vectorized implementation (no Python per-row loops):
+        #   eos_cumsum[i, j] = number of EOS tokens seen up to position j
+        #   valid = cumsum < 1          (before any EOS)
+        #         | (cumsum == 1 & is_eos)  (at the first EOS)
+        # This correctly handles multiple EOS per row: only the first counts.
+        eos_mask_bool = clipped == eos_token
+        eos_cumsum = torch.cumsum(eos_mask_bool.to(torch.long), dim=1)  # (batch, clipped_len)
+        has_eos = eos_cumsum[:, -1] > 0  # (batch,)
+
+        # Valid positions: before first EOS, OR at the first EOS itself
+        valid_up_to_eos = (eos_cumsum < 1) | ((eos_cumsum == 1) & eos_mask_bool)
+        # For rows without EOS, use nonzero mask as fallback
+        nonzero_mask = clipped != 0
+        padded_mask[:, :clipped_len] = torch.where(
+            has_eos[:, None], valid_up_to_eos, nonzero_mask
+        )
 
         # During action generation the predicted subtask is fixed context, not an AR target.
         return dataclasses.replace(
@@ -295,17 +341,41 @@ class PI05SubtaskPytorch(PI0Pytorch):
         emb_dim = embed_weight.shape[1]
         lm_head = self.paligemma_with_expert.paligemma.lm_head
 
-        seq_indices = torch.arange(prefix_hidden.shape[1], device=device).unsqueeze(0)
-        last_pos = torch.max(
-            torch.where(prefix_pad_masks, seq_indices, torch.full_like(seq_indices, -1)),
-            dim=1,
-        ).values
-        last_hidden = prefix_hidden[torch.arange(batch_size, device=device), last_pos][:, None, :]
-        logits = lm_head(last_hidden)
-
+        bos_token = self._load_text_tokenizer().bos_id()
         eos_token = self._eos_token_id()
         generated_tokens = []
         next_pos = prefix_pad_masks.sum(dim=-1).to(torch.int64)
+
+        # Track which rows have already produced EOS so we can zero out
+        # subsequent tokens in finished rows.  Without this, rows that finish
+        # early keep generating garbage tokens because generation only stops
+        # when ALL rows have produced EOS (torch.all(...) == eos).
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        # Inject BOS token as the first step of subtask generation.
+        # In training, the subtask sequence is [BOS, tok1, tok2, ..., EOS]
+        # with causal attention, and tok1 is predicted from the BOS position.
+        # We replicate this at inference by feeding BOS through the model and
+        # using its hidden state to predict the first real token.
+        bos_token_tensor = torch.full(
+            (batch_size, 1), bos_token, dtype=torch.long, device=device
+        )
+        bos_emb = self.paligemma_with_expert.embed_language_tokens(bos_token_tensor) * math.sqrt(emb_dim)
+        # Attention mask: prefix + 1 (BOS)
+        bos_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        full_mask_bos = torch.cat([prefix_pad_masks, bos_mask], dim=1)
+        full_mask_bos_4d = self._prepare_attention_masks_4d(full_mask_bos[:, None, :])
+
+        bos_out = self.paligemma_with_expert.paligemma.language_model.forward(
+            inputs_embeds=bos_emb,
+            attention_mask=full_mask_bos_4d,
+            position_ids=next_pos[:, None],
+            past_key_values=past_kv,
+            use_cache=True,
+        )
+        past_kv = bos_out.past_key_values
+        logits = lm_head(bos_out.last_hidden_state)
+        next_pos = next_pos + 1
 
         for step in range(max_tokens):
             if step < min_tokens:
@@ -316,12 +386,27 @@ class PI05SubtaskPytorch(PI0Pytorch):
             else:
                 next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
 
+            # Zero out tokens in rows that have already finished.
+            # This prevents garbage post-EOS tokens from contaminating the
+            # subtask conditioning seen by the action expert.
+            next_token = torch.where(
+                finished.unsqueeze(1),
+                torch.zeros_like(next_token),
+                next_token,
+            )
+
             generated_tokens.append(next_token)
-            if torch.all(next_token == eos_token):
+
+            # Mark rows that just produced EOS as finished (for future steps).
+            just_finished = (next_token.squeeze(1) == eos_token) & ~finished
+            finished = finished | just_finished
+
+            if torch.all(finished):
                 break
 
             token_emb = self.paligemma_with_expert.embed_language_tokens(next_token) * math.sqrt(emb_dim)
-            gen_mask = torch.ones(batch_size, step + 1, dtype=torch.bool, device=device)
+            # Generated tokens so far: 1 (BOS) + step+1 (sampled tokens in loop)
+            gen_mask = torch.ones(batch_size, step + 2, dtype=torch.bool, device=device)
             full_mask = torch.cat([prefix_pad_masks, gen_mask], dim=1)
             full_mask_4d = self._prepare_attention_masks_4d(full_mask[:, None, :])
 
