@@ -82,7 +82,7 @@ import torch
 import tqdm
 import tree
 from accelerate import Accelerator
-from accelerate.utils import DistributedType
+from accelerate.utils import DistributedDataParallelKwargs, DistributedType
 
 
 def _strip_wandb_vendor_from_sys_path() -> None:
@@ -320,6 +320,61 @@ def build_datasets(config: _config.TrainConfig):
                 delay_s,
             )
             time.sleep(delay_s)
+
+
+def build_val_datasets(config: _config.TrainConfig):
+    """Build validation data loader(s) from config.val_data.
+
+    Returns (val_loader, val_data_config) or (None, None) if val_data is empty.
+    Uses shuffle=False and reuses the same norm stats as the training data.
+    """
+    if not config.val_data:
+        return None, None
+
+    # Temporarily swap config.data → config.val_data to reuse create_data_loader.
+    # We use a mutable copy approach: swap, build, swap back.
+    original_data = config.data
+    try:
+        object.__setattr__(config, "data", config.val_data)
+        # val batch size: use val_batch_size if set, else same as train
+        if getattr(config, "val_batch_size", None) is not None:
+            original_bs = config.batch_size
+            object.__setattr__(config, "batch_size", config.val_batch_size)
+        else:
+            original_bs = None
+
+        skip_norm_stats = os.environ.get("OPENPI_SKIP_NORM_STATS", "0") == "1"
+        retries = max(1, int(os.environ.get("OPENPI_BUILD_DATASET_RETRIES", "3")))
+        rank = int(os.environ.get("RANK", "0"))
+
+        for attempt in range(1, retries + 1):
+            try:
+                val_loader = _data_loader.create_data_loader(
+                    config,
+                    framework="pytorch",
+                    shuffle=False,  # no shuffle for validation
+                    num_batches=getattr(config, "val_num_batches", None),
+                    skip_norm_stats=skip_norm_stats,
+                )
+                val_data_config = val_loader.data_config()
+                break
+            except FileNotFoundError as exc:
+                transient_lock_race = exc.filename is None and int(os.environ.get("WORLD_SIZE", "1")) > 1
+                if (not transient_lock_race) or attempt >= retries:
+                    raise
+                delay_s = float(os.environ.get("OPENPI_BUILD_DATASET_RETRY_SLEEP_S", "2")) * attempt
+                logging.warning(
+                    "Rank %s hit transient ENOENT during val dataset init (attempt %s/%s). Retrying in %.1fs",
+                    rank, attempt, retries, delay_s,
+                )
+                time.sleep(delay_s)
+
+        if original_bs is not None:
+            object.__setattr__(config, "batch_size", original_bs)
+    finally:
+        object.__setattr__(config, "data", original_data)
+
+    return val_loader, val_data_config
 
 
 def log_memory_usage(accelerator: Accelerator, step: int, phase: str = "unknown") -> None:
@@ -885,31 +940,80 @@ def _loss_tensor_debug_metrics(losses: object, actions: torch.Tensor) -> dict[st
 
 
 def _gather_scalar_stats(accelerator: Accelerator, scalar: torch.Tensor) -> dict[str, float]:
+    """Gather cross-rank scalar statistics using torch.distributed all_reduce.
+
+    Uses raw ``torch.distributed.all_reduce`` (SUM / MIN / MAX) instead of
+    ``accelerator.gather`` for reliability under DeepSpeed ZeRO-2.  Computes
+    mean / std from the reduced sum / sum-of-squares / count so that every
+    rank has the same global values without depending on gather shape.
+    """
+    import torch.distributed as dist
+
     value = scalar.detach().float().reshape(1).to(accelerator.device)
-    gathered = accelerator.gather(value)
-    finite = torch.isfinite(gathered)
+    finite = torch.isfinite(value)
+
+    local_finite_count = finite.sum().float()
+    local_total = torch.tensor(float(value.numel()), device=accelerator.device, dtype=torch.float32)
+
+    # In-place all-reduce for count and total
+    dist.all_reduce(local_finite_count, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
+
+    finite_count = float(local_finite_count.item())
+    total_count = float(local_total.item())
+
     stats = {
-        "finite_count": float(finite.sum().item()),
-        "total_count": float(gathered.numel()),
-        "all_finite": float(bool(finite.all().item())),
+        "finite_count": finite_count,
+        "total_count": total_count,
+        "all_finite": float(finite_count == total_count),
         "bad_rank": -1.0,
         "min": float("nan"),
         "max": float("nan"),
         "mean": float("nan"),
         "std": float("nan"),
     }
-    if finite.any():
-        finite_values = gathered[finite]
-        stats.update(
-            {
-                "min": _safe_float(finite_values.amin()),
-                "max": _safe_float(finite_values.amax()),
-                "mean": _safe_float(finite_values.mean()),
-                "std": _safe_float(finite_values.std(unbiased=False)),
-            }
+
+    if finite_count > 0:
+        # Use finite values only; replace non-finite with extreme sentinels for min/max
+        finite_val = torch.where(
+            finite,
+            value,
+            torch.tensor(float("inf"), device=accelerator.device, dtype=torch.float32),
         )
-    if not finite.all():
-        stats["bad_rank"] = _safe_float(torch.nonzero(~finite, as_tuple=False).reshape(-1)[0])
+        # min: all_reduce MIN with inf sentinel for non-finite (inf is identity for min)
+        min_tensor = finite_val.clone()
+        dist.all_reduce(min_tensor, op=dist.ReduceOp.MIN)
+
+        finite_val_max = torch.where(
+            finite,
+            value,
+            torch.tensor(float("-inf"), device=accelerator.device, dtype=torch.float32),
+        )
+        # max: all_reduce MAX with -inf sentinel for non-finite
+        max_tensor = finite_val_max.clone()
+        dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
+
+        # For mean and std: sum and sum-of-squares of finite values only
+        local_sum = torch.where(finite, value, torch.zeros_like(value)).sum().float()
+        local_sq_sum = torch.where(finite, value ** 2, torch.zeros_like(value)).sum().float()
+        dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_sq_sum, op=dist.ReduceOp.SUM)
+
+        mean_val = float(local_sum.item()) / finite_count
+        sq_mean = float(local_sq_sum.item()) / finite_count
+        var_val = max(0.0, sq_mean - mean_val * mean_val)
+        std_val = var_val ** 0.5
+
+        stats["min"] = float(min_tensor.item())
+        stats["max"] = float(max_tensor.item())
+        stats["mean"] = mean_val
+        stats["std"] = std_val
+
+    if finite_count < total_count:
+        # We don't have per-rank bad rank info with all_reduce-only,
+        # but we can report that there was a non-finite rank.
+        stats["bad_rank"] = -2.0  # sentinel: "some rank(s) non-finite, rank unknown"
+
     return stats
 
 
@@ -1117,6 +1221,360 @@ def _build_data_fingerprint(config, data_config) -> dict:
         return {"error": "failed_to_build_fingerprint"}
 
 
+def _compute_data_manifest(
+    *,
+    config,
+    data_config,
+    train_loader,
+    val_loader=None,
+    val_data_config=None,
+    steps_per_epoch: int,
+    world_size: int,
+    grad_accum_steps: int,
+    seed: int,
+    train_shuffle: bool = True,
+    val_shuffle: bool = False,
+    num_probe_batches: int = 5,
+) -> dict:
+    """Compute a comprehensive data manifest describing training and validation data.
+
+    Samples ``num_probe_batches`` batches from each loader to inspect tensor shapes,
+    image keys, padding stats, episode diversity, and subtask token presence.
+    Results are honest about streaming dataset semantics (no false "1 epoch" claims).
+
+    Args:
+        config: TrainConfig instance.
+        data_config: DataConfig for training data.
+        train_loader: Training data loader (iterable of (observation, actions)).
+        val_loader: Optional validation data loader.
+        val_data_config: Optional DataConfig for validation data.
+        steps_per_epoch: Computed steps per epoch (optimizer-step granularity).
+        world_size: Number of distributed processes.
+        grad_accum_steps: Gradient accumulation steps.
+        seed: Base random seed used by the data loader.
+        train_shuffle: Whether the training loader uses shuffle.
+        val_shuffle: Whether the validation loader uses shuffle.
+        num_probe_batches: Number of batches to sample for stats inspection.
+
+    Returns:
+        dict with data_manifest fields (see docstring in code for schema).
+    """
+    manifest: dict = {}
+
+    # -- Metadata --
+    manifest["generated_at"] = time.time()
+    manifest["generated_at_iso"] = datetime.datetime.now().isoformat()
+
+    # -- Basic shape / structure from config and data_config --
+    try:
+        manifest["action_horizon"] = int(config.model.action_horizon)
+    except Exception:
+        manifest["action_horizon"] = None
+
+    # Episode counts from data_config (when available)
+    train_episodes_index = getattr(data_config, "episodes_index", None)
+    manifest["n_train_episodes"] = len(train_episodes_index) if train_episodes_index is not None else None
+    manifest["train_tasks"] = list(getattr(data_config, "tasks", []) or [])
+    manifest["train_repo_id"] = getattr(data_config, "repo_id", None)
+    manifest["train_modalities"] = list(getattr(data_config, "modalities", []) or [])
+    manifest["train_fine_grained_level"] = getattr(data_config, "fine_grained_level", 0)
+    manifest["train_subtask_source"] = getattr(data_config, "subtask_source", None)
+    manifest["train_prompt_from_task"] = getattr(data_config, "prompt_from_task", False)
+
+    # -- Validation data info --
+    manifest["has_val_data"] = val_loader is not None
+    if val_loader is not None and val_data_config is not None:
+        val_episodes_index = getattr(val_data_config, "episodes_index", None)
+        manifest["n_val_episodes"] = len(val_episodes_index) if val_episodes_index is not None else None
+        manifest["val_tasks"] = list(getattr(val_data_config, "tasks", []) or [])
+        manifest["val_repo_id"] = getattr(val_data_config, "repo_id", None)
+    else:
+        manifest["n_val_episodes"] = None
+        manifest["val_tasks"] = []
+        manifest["val_repo_id"] = None
+
+    # -- Loader length / steps_per_epoch --
+    try:
+        train_len_micro = len(train_loader)
+    except Exception:
+        train_len_micro = None
+
+    manifest["n_train_frames_per_rank_micro"] = train_len_micro  # DEPRECATED: use n_train_microbatches_per_rank
+    manifest["n_train_microbatches_per_rank"] = train_len_micro  # micro-batches per rank per "epoch"
+    if train_len_micro is not None and world_size > 0:
+        manifest["n_train_frames_total_estimate"] = train_len_micro * world_size  # DEPRECATED: use n_train_microbatches_total_estimate
+        manifest["n_train_microbatches_total_estimate"] = train_len_micro * world_size
+    else:
+        manifest["n_train_frames_total_estimate"] = None
+        manifest["n_train_microbatches_total_estimate"] = None
+
+    manifest["steps_per_epoch"] = int(steps_per_epoch)
+    manifest["world_size"] = int(world_size)
+    manifest["grad_accum_steps"] = int(grad_accum_steps)
+
+    # val loader length
+    if val_loader is not None:
+        try:
+            val_len_micro = len(val_loader)
+            manifest["n_val_frames_per_rank_micro"] = val_len_micro  # DEPRECATED: use n_val_microbatches_per_rank
+            manifest["n_val_microbatches_per_rank"] = val_len_micro
+            manifest["n_val_frames_total_estimate"] = val_len_micro * world_size  # DEPRECATED: use n_val_microbatches_total_estimate
+            manifest["n_val_microbatches_total_estimate"] = val_len_micro * world_size
+        except Exception:
+            manifest["n_val_frames_per_rank_micro"] = None
+            manifest["n_val_microbatches_per_rank"] = None
+            manifest["n_val_frames_total_estimate"] = None
+            manifest["n_val_microbatches_total_estimate"] = None
+    else:
+        manifest["n_val_frames_per_rank_micro"] = None
+        manifest["n_val_microbatches_per_rank"] = None
+        manifest["n_val_frames_total_estimate"] = None
+        manifest["n_val_microbatches_total_estimate"] = None
+
+    # -- FPS --
+    manifest["fps"] = 30  # B1K datasets use 30 FPS; lerobot meta has fps too
+    # Try to get fps from data_config or dataset metadata
+    try:
+        if hasattr(data_config, "fps") and data_config.fps is not None:
+            manifest["fps"] = int(data_config.fps)
+    except Exception:
+        pass
+
+    # -- Norm info --
+    norm_stats = getattr(data_config, "norm_stats", None)
+    if norm_stats is not None:
+        manifest["norm_info"] = {
+            "available": True,
+            "num_keys": len(norm_stats),
+            "keys": sorted(list(norm_stats.keys()))[:20],  # first 20 keys for preview
+        }
+        # Include a summary of first norm stat's shape
+        if norm_stats:
+            first_key = sorted(norm_stats.keys())[0]
+            ns = norm_stats[first_key]
+            try:
+                manifest["norm_info"]["sample_key"] = first_key
+                manifest["norm_info"]["sample_loc_shape"] = list(np.asarray(ns.loc).shape) if hasattr(ns, "loc") else None
+            except Exception:
+                pass
+    else:
+        manifest["norm_info"] = {"available": False}
+
+    # -- Data fingerprint (SHA256 of data selection params) --
+    manifest["data_sha"] = _build_data_fingerprint(config, data_config)
+
+    # -- Streaming dataset validation: probe actual batches --
+    probe_stats = _probe_data_loader(
+        train_loader,
+        num_batches=num_probe_batches,
+        label="train",
+    )
+    manifest["train_probe"] = probe_stats
+
+    # Action dim and state dim from probe
+    manifest["action_dim"] = probe_stats.get("action_dim")
+    manifest["state_dim"] = probe_stats.get("state_dim")
+    manifest["image_keys"] = probe_stats.get("image_keys", [])
+    manifest["has_subtask_tokens"] = probe_stats.get("has_subtask_tokens", False)
+    manifest["subtask_max_len"] = probe_stats.get("subtask_max_len")
+    manifest["padding_stats"] = probe_stats.get("padding_stats", {})
+
+    # Sample count estimates (microbatches * batch_size per rank * world_size)
+    train_bs = probe_stats.get("batch_size")
+    if train_len_micro is not None and train_bs is not None and world_size > 0:
+        manifest["n_train_samples_per_rank_estimate"] = train_len_micro * train_bs
+        manifest["n_train_samples_total_estimate"] = train_len_micro * train_bs * world_size
+        # n_train_frames = total samples across all ranks (spec naming)
+        manifest["n_train_frames"] = train_len_micro * train_bs * world_size
+    else:
+        manifest["n_train_samples_per_rank_estimate"] = None
+        manifest["n_train_samples_total_estimate"] = None
+        manifest["n_train_frames"] = None
+
+    # Val sample count estimates
+    if val_loader is not None:
+        val_probe_stats = _probe_data_loader(
+            val_loader,
+            num_batches=min(num_probe_batches, manifest.get("n_val_microbatches_per_rank") or num_probe_batches),
+            label="val",
+        )
+        manifest["val_probe"] = val_probe_stats
+
+        # Val sample count estimates
+        val_bs = val_probe_stats.get("batch_size")
+        val_len = manifest.get("n_val_microbatches_per_rank")
+        if val_len is not None and val_bs is not None and world_size > 0:
+            manifest["n_val_samples_per_rank_estimate"] = val_len * val_bs
+            manifest["n_val_samples_total_estimate"] = val_len * val_bs * world_size
+            manifest["n_val_frames"] = val_len * val_bs * world_size
+        else:
+            manifest["n_val_samples_per_rank_estimate"] = None
+            manifest["n_val_samples_total_estimate"] = None
+            manifest["n_val_frames"] = None
+    else:
+        manifest["val_probe"] = None
+        manifest["n_val_samples_per_rank_estimate"] = None
+        manifest["n_val_samples_total_estimate"] = None
+        manifest["n_val_frames"] = None
+
+    # -- Streaming dataset semantics (honest assessment) --
+    # The BehaviorLeRobotDataset is a streaming/chunking dataset that may not
+    # guarantee full coverage of all episodes in one "epoch" of __len__ batches.
+    is_streaming = True  # B1K datasets use chunk streaming
+    manifest["streaming_dataset"] = {
+        "is_streaming": is_streaming,
+        "shuffle_train": train_shuffle,
+        "shuffle_val": val_shuffle,
+        "train_seed": int(seed),
+        "val_seed": int(seed),
+        "epoch_semantics_note": (
+            "Streaming/chunking dataset: len(loader) micro-batches per rank does NOT "
+            "guarantee full coverage of all configured episodes in one pass. "
+            "Episode coverage depends on chunk size, keyframe stride, and shuffling. "
+            "Use train_probe.episode_ids_sample to verify which episodes appear."
+        ),
+        "action_horizon_boundary_note": (
+            "Action horizon windows near episode boundaries may include padded frames. "
+            "If action_is_pad is available, padding_stats reports the fraction of "
+            "padded action positions across sampled batches."
+        ),
+        "episode_id_probe_note": (
+            "episode_ids_sample may be empty because the Observation.from_dict() wrapper "
+            "strips raw dataset fields like episode_index and task_index. The streaming "
+            "dataset still respects the episodes_index filter in data_config; use "
+            "n_train_episodes / n_val_episodes from data_config for the configured count."
+        ),
+    }
+
+    # Validation loader determinism note
+    manifest["val_determinism"] = {
+        "shuffle_enabled": val_shuffle,
+        "fixed_seed": True,
+        "seed": int(seed),
+        "note": (
+            "Validation loader uses shuffle=False on the outer DataLoader with a fixed seed. "
+            "Note: the inner BehaviorLeRobotDataset may have chunk-level shuffling enabled; "
+            "the outer DataLoader's sequential index access should still produce deterministic "
+            "iteration order for the same seed and dataset configuration."
+        ),
+    }
+
+    return manifest
+
+
+def _probe_data_loader(loader, num_batches: int, label: str = "train") -> dict:
+    """Probe a data loader by sampling ``num_batches`` batches and collecting stats.
+
+    Returns a dict with:
+    - action_dim, state_dim, image_keys
+    - has_subtask_tokens, subtask_max_len
+    - padding_stats (action_is_pad ratio if available)
+    - episode_ids_sample (list of unique episode indices seen)
+    - task_ids_sample (list of unique task indices seen)
+    - timestamp_range (min/max of timestamps if available)
+    - batch_size (observed local batch size)
+    - num_batches_sampled (how many batches were actually iterated)
+    - error (if probing failed)
+    """
+    stats: dict = {
+        "num_batches_requested": num_batches,
+        "num_batches_sampled": 0,
+        "action_dim": None,
+        "state_dim": None,
+        "image_keys": [],
+        "has_subtask_tokens": False,
+        "subtask_max_len": None,
+        "padding_stats": {
+            "action_is_pad_available": False,
+            "pad_ratio_mean": None,
+            "pad_ratio_min": None,
+            "pad_ratio_max": None,
+        },
+        "episode_ids_sample": [],
+        "task_ids_sample": [],
+        "batch_size": None,
+        "error": None,
+    }
+
+    pad_ratios = []
+    episode_ids_set: set = set()
+    task_ids_set: set = set()
+
+    try:
+        iterator = iter(loader)
+        for i in range(num_batches):
+            try:
+                observation, actions = next(iterator)
+            except StopIteration:
+                break
+
+            stats["num_batches_sampled"] = i + 1
+
+            # Action shape: [B, action_horizon, action_dim]
+            if hasattr(actions, "shape"):
+                stats["batch_size"] = int(actions.shape[0])
+                if len(actions.shape) >= 3:
+                    stats["action_dim"] = int(actions.shape[-1])
+
+            # State shape: [B, state_dim]
+            if hasattr(observation, "state") and observation.state is not None:
+                state = observation.state
+                if hasattr(state, "shape") and len(state.shape) >= 2:
+                    stats["state_dim"] = int(state.shape[-1])
+
+            # Image keys
+            if hasattr(observation, "images") and observation.images is not None:
+                if isinstance(observation.images, dict):
+                    stats["image_keys"] = sorted(list(observation.images.keys()))
+
+            # Subtask tokens
+            if hasattr(observation, "subtask_tokens") and observation.subtask_tokens is not None:
+                stats["has_subtask_tokens"] = True
+                st = observation.subtask_tokens
+                if hasattr(st, "shape") and len(st.shape) >= 2:
+                    stats["subtask_max_len"] = int(st.shape[-1])
+
+            # Padding stats (action_is_pad on observation)
+            action_is_pad = getattr(observation, "action_is_pad", None)
+            if action_is_pad is not None and hasattr(action_is_pad, "float"):
+                stats["padding_stats"]["action_is_pad_available"] = True
+                pad_ratio = float(action_is_pad.float().mean().item())
+                pad_ratios.append(pad_ratio)
+
+            # Episode / task IDs (if available in raw dict)
+            # Try to get from the batch dict before Observation wrapping
+            # Some datasets include episode_index and task_index in the item
+            for attr_name in ("episode_index", "episode_id"):
+                val = getattr(observation, attr_name, None)
+                if val is not None and hasattr(val, "tolist"):
+                    episode_ids_set.update(int(v) for v in val.tolist())
+                    break
+
+            for attr_name in ("task_index", "task_id"):
+                val = getattr(observation, attr_name, None)
+                if val is not None and hasattr(val, "tolist"):
+                    task_ids_set.update(int(v) for v in val.tolist())
+                    break
+
+    except Exception as e:
+        stats["error"] = f"{type(e).__name__}: {e}"
+        logging.warning("Data manifest probe failed for %s loader: %s", label, stats["error"])
+
+    # Aggregate padding stats
+    if pad_ratios:
+        stats["padding_stats"]["pad_ratio_mean"] = float(np.mean(pad_ratios))
+        stats["padding_stats"]["pad_ratio_min"] = float(np.min(pad_ratios))
+        stats["padding_stats"]["pad_ratio_max"] = float(np.max(pad_ratios))
+
+    # Episode / task ID samples (sorted, limited to first 20 for preview)
+    stats["episode_ids_sample"] = sorted(list(episode_ids_set))[:20]
+    stats["n_unique_episodes_observed"] = len(episode_ids_set)
+    stats["task_ids_sample"] = sorted(list(task_ids_set))[:20]
+    stats["n_unique_tasks_observed"] = len(task_ids_set)
+
+    return stats
+
+
 def _build_checkpoint_manifest(
     *,
     config,
@@ -1124,6 +1582,7 @@ def _build_checkpoint_manifest(
     global_step: int,
     accelerator: Accelerator,
     precision: str,
+    data_manifest: dict | None = None,
 ) -> dict:
     """Build the checkpoint manifest.json dict with metadata."""
     git_info = _get_git_info()
@@ -1155,6 +1614,8 @@ def _build_checkpoint_manifest(
             "strategy": str(accelerator.distributed_type),
         },
     }
+    if data_manifest is not None:
+        manifest["data_manifest"] = data_manifest
     return manifest
 
 
@@ -1162,6 +1623,220 @@ def _atomic_write_checkpoint_dir(tmp_dir: Path, final_dir: Path) -> None:
     if final_dir.exists():
         shutil.rmtree(final_dir)
     tmp_dir.rename(final_dir)
+
+
+def run_validation(
+    *,
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    val_loader,
+    config: _config.TrainConfig,
+    global_step: int,
+    steps_per_epoch: int,
+    is_pi05_ki_joint: bool,
+    use_vlm2: bool,
+    use_autocast: bool,
+    autocast_dtype: torch.dtype,
+    metrics_file,
+    slow_metrics: bool = False,
+    val_label: str = "val",
+) -> dict[str, float]:
+    """Run validation on val_loader and return aggregated metrics.
+
+    Runs ``val_num_batches`` batches from the val loader in eval mode with
+    ``torch.no_grad()``.  Metrics are averaged across batches and gathered
+    across DDP ranks.
+
+    Args:
+        accelerator: Accelerator instance
+        model: the model (already wrapped by accelerator)
+        val_loader: validation data loader
+        config: training config
+        global_step: current training step (for logging)
+        steps_per_epoch: steps per epoch (for W&B logging)
+        is_pi05_ki_joint: whether model is PI05KIJointQueryPytorch
+        use_vlm2: whether model is VLM2
+        use_autocast: whether to use autocast
+        autocast_dtype: autocast dtype
+        metrics_file: rank-0 metrics.jsonl file handle (may be None)
+        slow_metrics: if True, compute slow-path metrics (flow_l1 via Euler
+            integration).  For epoch-end validation only.
+        val_label: label for this validation run (e.g. "val", "val_epoch_end")
+        autocast_dtype: autocast dtype
+        metrics_file: rank-0 metrics.jsonl file handle (may be None)
+
+    Returns:
+        dict of aggregated validation metrics (scalar floats, rank 0 values)
+    """
+    if val_loader is None:
+        return {}
+
+    is_main = accelerator.is_main_process
+    val_num_batches = getattr(config, "val_num_batches", 10)
+
+    if is_main:
+        logging.info("Running validation at step %s (%s batches)...", global_step, val_num_batches)
+
+    # Switch to eval mode
+    unwrapped = accelerator.unwrap_model(model)
+    was_training = unwrapped.training
+    unwrapped.eval()
+
+    batch_metrics_list: list[dict[str, float]] = []
+
+    try:
+        with torch.no_grad():
+            for batch_idx, (observation, actions) in enumerate(val_loader):
+                if batch_idx >= val_num_batches:
+                    break
+
+                # Move data to device
+                if _model is not None and isinstance(observation, _model.Observation):
+                    device = accelerator.device
+
+                    def _maybe_to_val(x, *, target_device=device):
+                        if x is None:
+                            return None
+                        return x.to(target_device, non_blocking=True)
+
+                    observation = observation.replace(
+                        images={k: v.to(device, non_blocking=True) for k, v in observation.images.items()},
+                        image_masks={k: v.to(device, non_blocking=True) for k, v in observation.image_masks.items()},
+                        state=observation.state.to(device, non_blocking=True),
+                        tokenized_prompt=_maybe_to_val(observation.tokenized_prompt),
+                        tokenized_prompt_mask=_maybe_to_val(observation.tokenized_prompt_mask),
+                        token_ar_mask=_maybe_to_val(observation.token_ar_mask),
+                        token_loss_mask=_maybe_to_val(observation.token_loss_mask),
+                        subtask_tokens=_maybe_to_val(observation.subtask_tokens),
+                        subtask_mask=_maybe_to_val(observation.subtask_mask),
+                        subtask_loss_mask=_maybe_to_val(observation.subtask_loss_mask),
+                        subtask_ar_mask=_maybe_to_val(observation.subtask_ar_mask),
+                        pcd_xyz=_maybe_to_val(observation.pcd_xyz),
+                    )
+                else:
+                    observation = tree.map_structure(
+                        lambda x: x.to(accelerator.device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
+                        observation,
+                    )
+                actions = actions.to(device=accelerator.device, dtype=torch.float32, non_blocking=True)
+
+                if is_pi05_ki_joint:
+                    with torch.autocast(
+                        device_type=accelerator.device.type,
+                        dtype=autocast_dtype,
+                        enabled=use_autocast,
+                    ):
+                        eval_metrics = unwrapped.compute_eval_metrics(
+                            observation, actions,
+                            compute_flow_l1=slow_metrics,
+                            num_denoise_steps=10,
+                            flow_l1_seed=int(config.seed) + 9999,
+                        )
+                elif use_vlm2:
+                    # TODO: VLM2 validation path
+                    continue
+                else:
+                    # Standard single-forward path
+                    with torch.autocast(
+                        device_type=accelerator.device.type,
+                        dtype=autocast_dtype,
+                        enabled=use_autocast,
+                    ):
+                        losses = model(observation, actions)
+                        if isinstance(losses, dict):
+                            eval_metrics = {
+                                "total_loss": losses["loss"].detach(),
+                                **{k: v.detach() for k, v in losses.items() if k != "loss" and isinstance(v, torch.Tensor) and v.numel() == 1},
+                            }
+                        else:
+                            eval_metrics = {"total_loss": losses.mean().detach()}
+
+                # Convert to float dict for this batch
+                batch_metrics = {
+                    k: float(v.detach().float().item())
+                    for k, v in eval_metrics.items()
+                    if isinstance(v, torch.Tensor) and v.numel() == 1
+                }
+                batch_metrics_list.append(batch_metrics)
+
+    finally:
+        # Restore training mode
+        if was_training:
+            unwrapped.train()
+
+    if not batch_metrics_list:
+        if is_main:
+            logging.warning("Validation produced no batches; skipping val logging.")
+        return {}
+
+    # Average across batches (per-rank)
+    all_keys = set()
+    for m in batch_metrics_list:
+        all_keys.update(m.keys())
+
+    # NOTE: sorted keys are critical for correctness — we call
+    # torch.distributed.all_reduce inside _gather_scalar_stats, and all ranks
+    # must issue collectives in the same order.  A set has non-deterministic
+    # iteration order across ranks (hash randomization), which would cause
+    # different metrics to be reduced together, producing garbage.
+    sorted_keys = sorted(all_keys)
+
+    per_rank_means: dict[str, float] = {}
+    for key in sorted_keys:
+        vals = [m[key] for m in batch_metrics_list if key in m]
+        if vals:
+            per_rank_means[key] = sum(vals) / len(vals)
+
+    # DDP gather: average across ranks
+    global_means: dict[str, float] = {}
+    for key in sorted_keys:
+        val_tensor = torch.tensor(per_rank_means.get(key, 0.0), device=accelerator.device)
+        stats = _gather_scalar_stats(accelerator, val_tensor)
+        global_means[key] = float(stats["mean"])
+
+    if is_main:
+        epoch = (global_step // steps_per_epoch) + 1 if steps_per_epoch > 0 else 1
+        epoch_step = (global_step % steps_per_epoch) + 1 if steps_per_epoch > 0 else global_step
+
+        # Log to metrics.jsonl
+        if metrics_file is not None:
+            val_record = {
+                "step": int(global_step),
+                "epoch": int(epoch),
+                "type": "validation",
+            }
+            for key in sorted(global_means.keys()):
+                val_record[f"val_{key}"] = global_means[key]
+            metrics_file.write(json.dumps(val_record, default=str) + "\n")
+            metrics_file.flush()
+
+        # Log to W&B
+        if config.wandb_enabled:
+            try:
+                wandb = _get_wandb()
+                log_payload: dict[str, float] = {
+                    "step": float(global_step),
+                    "epoch": float(epoch),
+                    "epoch_step": float(epoch_step),
+                    "val/steps_per_epoch": float(steps_per_epoch),
+                }
+                for key, val in global_means.items():
+                    log_payload[f"val/{key}"] = val
+                wandb.log(log_payload, step=global_step)
+            except Exception:
+                logging.warning("wandb val log failed; continuing without wandb", exc_info=True)
+
+        # Log summary line
+        loss_total = global_means.get("total_loss", float("nan"))
+        subtask_acc = global_means.get("subtask_accuracy", float("nan"))
+        flow_mse = global_means.get("flow_mse", float("nan"))
+        query_l1 = global_means.get("query_l1", float("nan"))
+        logging.info(
+            "  [VAL] step=%s loss_total=%.4f subtask_acc=%.4f flow_mse=%.6f query_l1=%.6f",
+            global_step, loss_total, subtask_acc, flow_mse, query_l1,
+        )
+
+    return global_means
 
 
 def save_checkpoint(
@@ -1172,6 +1847,7 @@ def save_checkpoint(
     global_step: int,
     config: _config.TrainConfig,
     data_config: _config.DataConfig,
+    data_manifest: dict | None = None,
 ) -> None:
     if os.environ.get("OPENPI_DISABLE_CHECKPOINT", "0") in {"1", "true", "TRUE", "True"}:
         return
@@ -1252,6 +1928,7 @@ def save_checkpoint(
                 global_step=global_step,
                 accelerator=accelerator,
                 precision=config.pytorch_training_precision,
+                data_manifest=data_manifest,
             )
             manifest_path = tmp_ckpt_dir / "manifest.json"
             with open(manifest_path, "w") as f:
@@ -1282,9 +1959,19 @@ def save_checkpoint(
 
 
 def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> None:
+    kwargs_handlers = []
+    if config.pytorch_model_name == "pi05_ki_joint_query":
+        # Each KI optimizer step uses two distinct wrapped forwards.  DDP must
+        # discover the parameters unused by each phase so both reducer passes
+        # complete and synchronize the correct parameter subset.
+        kwargs_handlers.append(
+            DistributedDataParallelKwargs(find_unused_parameters=True)
+        )
+
     accelerator = Accelerator(
         mixed_precision=_infer_accelerate_mixed_precision(config),
         gradient_accumulation_steps=int(getattr(config, "gradient_accumulation_steps", 1)),
+        kwargs_handlers=kwargs_handlers,
     )
 
     is_main = accelerator.is_main_process
@@ -1418,6 +2105,22 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             logging.info("Offline HF cache preparation completed; exiting as requested.")
         return
 
+    # Build validation data loader (if val_data is configured)
+    val_loader = None
+    val_data_config = None
+    if config.val_data:
+        val_loader, val_data_config = build_val_datasets(config)
+        if is_main:
+            val_eps = getattr(val_data_config, "episodes_index", None)
+            val_tasks = getattr(val_data_config, "tasks", None)
+            logging.info(
+                "Validation data: tasks=%s episodes=%s val_num_batches=%s val_log_interval=%s",
+                val_tasks,
+                len(val_eps) if val_eps is not None else "N/A",
+                config.val_num_batches,
+                config.val_log_interval,
+            )
+
     # Epoch accounting: len(loader) is per-rank micro-batch count.
     steps_per_epoch_micro = len(loader)
     steps_per_epoch = max(1, steps_per_epoch_micro // accelerator.gradient_accumulation_steps)
@@ -1444,6 +2147,70 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             object.__setattr__(config, "save_interval", target_steps)
             if is_main:
                 logging.info("save_at_epoch_end_only enabled: save_interval=%s", target_steps)
+
+    # ---- Data manifest: compute after data loaders are built, before training starts ----
+    # Computed on all ranks for symmetry, but only logged/saved on rank 0.
+    _data_manifest: dict | None = None
+    try:
+        _data_manifest = _compute_data_manifest(
+            config=config,
+            data_config=data_config,
+            train_loader=loader,
+            val_loader=val_loader,
+            val_data_config=val_data_config,
+            steps_per_epoch=steps_per_epoch,
+            world_size=world_size,
+            grad_accum_steps=accelerator.gradient_accumulation_steps,
+            seed=int(config.seed),
+            train_shuffle=True,
+            val_shuffle=False,
+            num_probe_batches=int(os.environ.get("OPENPI_DATA_MANIFEST_PROBE_BATCHES", "5")),
+        )
+        if is_main:
+            # Write data_manifest.json to log dir
+            manifest_path = config.log_dir / "data_manifest.json"
+            with open(manifest_path, "w") as f:
+                json.dump(_data_manifest, f, indent=2, default=str)
+            logging.info("Data manifest written to %s", manifest_path)
+
+            # Also log a "manifest" record to metrics.jsonl at step 0
+            if _metrics_file is not None:
+                manifest_record = {
+                    "step": 0,
+                    "epoch": 1,
+                    "type": "manifest",
+                    "action_horizon": _data_manifest.get("action_horizon"),
+                    "action_dim": _data_manifest.get("action_dim"),
+                    "state_dim": _data_manifest.get("state_dim"),
+                    "image_keys": _data_manifest.get("image_keys", []),
+                    "n_train_episodes": _data_manifest.get("n_train_episodes"),
+                    "n_val_episodes": _data_manifest.get("n_val_episodes"),
+                    "steps_per_epoch": _data_manifest.get("steps_per_epoch"),
+                    "has_val_data": _data_manifest.get("has_val_data"),
+                    "has_subtask_tokens": _data_manifest.get("has_subtask_tokens"),
+                    "train_sha256": (_data_manifest.get("data_sha") or {}).get("sha256"),
+                    "is_streaming": (_data_manifest.get("streaming_dataset") or {}).get("is_streaming"),
+                }
+                _metrics_file.write(json.dumps(manifest_record, default=str) + "\n")
+                _metrics_file.flush()
+
+            train_probe = _data_manifest.get("train_probe", {}) or {}
+            val_probe = _data_manifest.get("val_probe", {}) or {}
+            logging.info(
+                "Data manifest: train_eps=%s val_eps=%s action_dim=%s state_dim=%s "
+                "action_horizon=%s steps_per_epoch=%s train_batches_sampled=%s val_batches_sampled=%s",
+                _data_manifest.get("n_train_episodes"),
+                _data_manifest.get("n_val_episodes"),
+                _data_manifest.get("action_dim"),
+                _data_manifest.get("state_dim"),
+                _data_manifest.get("action_horizon"),
+                _data_manifest.get("steps_per_epoch"),
+                train_probe.get("num_batches_sampled", 0),
+                val_probe.get("num_batches_sampled", 0),
+            )
+    except Exception:
+        logging.warning("Failed to compute data manifest; continuing without it", exc_info=True)
+        _data_manifest = None
 
     # Build model (same logic as train_pytorch.py).
     import openpi.models.pi0_config as _pi0_config
@@ -1798,6 +2565,21 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     model.train()
 
+    # Pre-compute autocast settings (used in both training and validation)
+    ds_plugin_val = accelerator.state.deepspeed_plugin if accelerator.distributed_type == DistributedType.DEEPSPEED else None
+    ds_uses_torch_autocast_val = bool(
+        ds_plugin_val is not None
+        and ds_plugin_val.deepspeed_config.get("torch_autocast", {}).get("enabled", False)
+    )
+    use_autocast = (
+        accelerator.device.type == "cuda"
+        and config.pytorch_training_precision in ("bfloat16", "float16")
+        and not ds_uses_torch_autocast_val
+    )
+    autocast_dtype = (
+        torch.bfloat16 if config.pytorch_training_precision == "bfloat16" else torch.float16
+    )
+
     start_time = time.time()
     infos: list[dict[str, float]] = []
     consecutive_skipped_updates = 0
@@ -1923,7 +2705,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         dtype=autocast_dtype,
                         enabled=use_autocast,
                     ):
-                        bb_losses = model.compute_backbone_losses(observation, actions)
+                        # Use the wrapper-visible forward path so DDP reducer
+                        # and DeepSpeed/autocast hooks run for this phase.
+                        bb_losses = model(observation, actions, phase="backbone")
                         bb_loss = bb_losses["backbone_loss"]
 
                     # Cross-rank finiteness check for backbone loss
@@ -2001,7 +2785,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         dtype=autocast_dtype,
                         enabled=use_autocast,
                     ):
-                        ex_losses = model.compute_expert_loss(observation, actions)
+                        ex_losses = model(observation, actions, phase="expert")
                         ex_loss = ex_losses["expert_loss"]
 
                     # Cross-rank finiteness check for expert loss
@@ -2588,6 +3372,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         global_step=current_step,
                         config=config,
                         data_config=data_config,
+                        data_manifest=_data_manifest,
                     )
 
                     if pbar is not None:
@@ -2601,6 +3386,59 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         )
 
                     global_step = current_step
+
+                    # ---- Validation (at val_log_interval, after optimizer step) ----
+                    if val_loader is not None and global_step % int(config.val_log_interval) == 0 and global_step > 0:
+                        run_validation(
+                            accelerator=accelerator,
+                            model=model,
+                            val_loader=val_loader,
+                            config=config,
+                            global_step=global_step,
+                            steps_per_epoch=steps_per_epoch,
+                            is_pi05_ki_joint=is_pi05_ki_joint,
+                            use_vlm2=use_vlm2,
+                            use_autocast=use_autocast,
+                            autocast_dtype=autocast_dtype,
+                            metrics_file=_metrics_file,
+                        )
+
+                    # ---- Epoch-end validation with slow metrics (flow_l1) ----
+                    if val_loader is not None and steps_per_epoch > 0 and global_step % steps_per_epoch == 0 and global_step > 0:
+                        run_validation(
+                            accelerator=accelerator,
+                            model=model,
+                            val_loader=val_loader,
+                            config=config,
+                            global_step=global_step,
+                            steps_per_epoch=steps_per_epoch,
+                            is_pi05_ki_joint=is_pi05_ki_joint,
+                            use_vlm2=use_vlm2,
+                            use_autocast=use_autocast,
+                            autocast_dtype=autocast_dtype,
+                            metrics_file=_metrics_file,
+                            slow_metrics=True,
+                            val_label="val_epoch_end",
+                        )
+
+    # Final validation at end of training (if val data configured)
+    # Includes slow metrics (flow_l1) for final evaluation.
+    if val_loader is not None:
+        run_validation(
+            accelerator=accelerator,
+            model=model,
+            val_loader=val_loader,
+            config=config,
+            global_step=int(config.num_train_steps),
+            steps_per_epoch=steps_per_epoch,
+            is_pi05_ki_joint=is_pi05_ki_joint,
+            use_vlm2=use_vlm2,
+            use_autocast=use_autocast,
+            autocast_dtype=autocast_dtype,
+            metrics_file=_metrics_file,
+            slow_metrics=True,
+            val_label="val_final",
+        )
 
     if pbar is not None:
         pbar.close()

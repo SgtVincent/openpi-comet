@@ -147,6 +147,8 @@ _ALL_CONFIG_NAMES = [
     "pi05_ki_joint_query_b1k-ki_off_smoke",
     "pi05_ki_joint_query_b1k-ki_on_smoke_fp32",
     "pi05_ki_joint_query_b1k-ki_off_smoke_fp32",
+    "pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp32",
+    "pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp16",
 ]
 
 
@@ -306,4 +308,154 @@ def test_long_baseline_configs_use_multitask_data():
         )
         assert base.subtask_source == "annotations_skill", (
             f"{config_name}: expected subtask_source=annotations_skill, got {base.subtask_source}"
+        )
+
+
+# ======================================================================
+#  Single-task overfit configs (validation split)
+# ======================================================================
+
+_SINGLE_TASK_CONFIGS = [
+    "pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp32",
+    "pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp16",
+]
+
+
+def test_single_task_configs_resolve():
+    """Single-task overfit configs should be registered and resolve via get_config."""
+    from openpi.training.train_config import get_config
+
+    for name in _SINGLE_TASK_CONFIGS:
+        config = get_config(name)
+        assert config is not None, f"Config {name} not found"
+        assert config.name == name
+
+
+def test_single_task_configs_use_single_turning_on_radio():
+    """Single-task configs should use exactly one task: turning_on_radio."""
+    from openpi.training.train_config import get_config
+
+    for name in _SINGLE_TASK_CONFIGS:
+        config = get_config(name)
+        data_factory = config.data[0]
+        base = data_factory.base_config
+        assert base.tasks is not None, f"{name}: tasks should not be None"
+        assert len(base.tasks) == 1, (
+            f"{name}: expected 1 task, got {len(base.tasks)}: {base.tasks}"
+        )
+        assert base.tasks[0] == "turning_on_radio", (
+            f"{name}: expected task 'turning_on_radio', got '{base.tasks[0]}'"
+        )
+
+
+def test_single_task_train_episodes_180():
+    """Single-task train data should have 180 episodes (0..179)."""
+    from openpi.training.train_config import get_config
+
+    for name in _SINGLE_TASK_CONFIGS:
+        config = get_config(name)
+        data_factory = config.data[0]
+        base = data_factory.base_config
+        assert len(base.episodes_index) == 180, (
+            f"{name}: expected 180 train episodes, got {len(base.episodes_index)}"
+        )
+        assert base.episodes_index[0] == 0, (
+            f"{name}: first train episode should be 0, got {base.episodes_index[0]}"
+        )
+        assert base.episodes_index[-1] == 179, (
+            f"{name}: last train episode should be 179, got {base.episodes_index[-1]}"
+        )
+
+
+def test_single_task_val_data_config_exists():
+    """Single-task configs should have val_data set (not None)."""
+    from openpi.training.train_config import get_config
+
+    for name in _SINGLE_TASK_CONFIGS:
+        config = get_config(name)
+        assert config.val_data, (
+            f"{name}: val_data should not be empty"
+        )
+        assert len(config.val_data) == 1, (
+            f"{name}: expected 1 val data config, got {len(config.val_data)}"
+        )
+
+
+def test_single_task_val_episodes_20_disjoint_from_train():
+    """Single-task val data should have 20 episodes (180..199), disjoint from train."""
+    from openpi.training.train_config import get_config
+
+    for name in _SINGLE_TASK_CONFIGS:
+        config = get_config(name)
+        val_factory = config.val_data[0]
+        val_base = val_factory.base_config
+
+        # Same task
+        assert val_base.tasks is not None
+        assert len(val_base.tasks) == 1
+        assert val_base.tasks[0] == "turning_on_radio"
+
+        # 20 val episodes
+        assert len(val_base.episodes_index) == 20, (
+            f"{name}: expected 20 val episodes, got {len(val_base.episodes_index)}"
+        )
+        assert val_base.episodes_index[0] == 180, (
+            f"{name}: first val episode should be 180, got {val_base.episodes_index[0]}"
+        )
+        assert val_base.episodes_index[-1] == 199, (
+            f"{name}: last val episode should be 199, got {val_base.episodes_index[-1]}"
+        )
+
+        # Disjoint from train
+        train_eps = set(config.data[0].base_config.episodes_index)
+        val_eps = set(val_base.episodes_index)
+        overlap = train_eps & val_eps
+        assert len(overlap) == 0, (
+            f"{name}: train and val episode indices overlap: {sorted(overlap)}"
+        )
+
+
+def test_single_task_fp32_fp16_differ_only_in_precision():
+    """FP32 and FP16 single-task configs should differ only in precision settings."""
+    from openpi.training.train_config import get_config
+
+    fp32 = get_config("pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp32")
+    fp16 = get_config("pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp16")
+
+    # Both should have KI=ON, same task, same train/val split
+    assert fp32.model.knowledge_insulation == fp16.model.knowledge_insulation == True
+    assert fp32.data[0].base_config.tasks == fp16.data[0].base_config.tasks
+    assert fp32.data[0].base_config.episodes_index == fp16.data[0].base_config.episodes_index
+    assert fp32.val_data[0].base_config.episodes_index == fp16.val_data[0].base_config.episodes_index
+    assert fp32.num_train_epochs == fp16.num_train_epochs
+    assert fp32.batch_size_per_gpu == fp16.batch_size_per_gpu
+    assert fp32.val_log_interval == fp16.val_log_interval
+    assert fp32.val_num_batches == fp16.val_num_batches
+    assert fp32.save_interval == fp16.save_interval
+
+    # Precision should differ
+    assert fp32.pytorch_training_precision == "float32"
+    assert fp16.pytorch_training_precision == "float16"
+    assert fp32.accelerate_mixed_precision == "no"
+    assert fp16.accelerate_mixed_precision == "fp16"
+
+
+def test_single_task_configs_have_val_log_interval_and_val_num_batches():
+    """Single-task configs should have non-default val_log_interval and val_num_batches."""
+    from openpi.training.train_config import get_config
+
+    for name in _SINGLE_TASK_CONFIGS:
+        config = get_config(name)
+        assert config.val_log_interval > 0, f"{name}: val_log_interval should be > 0"
+        assert config.val_num_batches > 0, f"{name}: val_num_batches should be > 0"
+
+
+def test_single_task_configs_have_num_train_epochs():
+    """Single-task configs should use num_train_epochs=1 (epoch-based training)."""
+    from openpi.training.train_config import get_config
+
+    for name in _SINGLE_TASK_CONFIGS:
+        config = get_config(name)
+        assert config.num_train_epochs == 1, (
+            f"{name}: expected num_train_epochs=1, got {config.num_train_epochs}"
         )

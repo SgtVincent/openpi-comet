@@ -27,6 +27,7 @@ Or as a pytest (single-rank, validates logic without distributed)::
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -167,6 +168,43 @@ class _MockPI05KIJointQuery(nn.Module):
         return {
             "flow_loss": flow_loss,
             "expert_loss": expert_loss,
+        }
+
+    def forward(
+        self,
+        observation: torch.Tensor,
+        actions: torch.Tensor,
+        noise: torch.Tensor | None = None,
+        time: torch.Tensor | None = None,
+        *,
+        phase: str = "all",
+    ) -> dict[str, torch.Tensor]:
+        """Dispatch phases through the wrapper-visible ``forward`` path."""
+        if phase == "backbone":
+            return self.compute_backbone_losses(observation, actions)
+        if phase == "expert":
+            return self.compute_expert_loss(
+                observation,
+                actions,
+                noise=noise,
+                time=time,
+            )
+        if phase != "all":
+            raise ValueError(
+                f"Unsupported training phase {phase!r}; expected 'backbone', 'expert', or 'all'."
+            )
+
+        backbone_losses = self.compute_backbone_losses(observation, actions)
+        expert_losses = self.compute_expert_loss(
+            observation,
+            actions,
+            noise=noise,
+            time=time,
+        )
+        return {
+            **backbone_losses,
+            **expert_losses,
+            "loss": backbone_losses["backbone_loss"] + expert_losses["expert_loss"],
         }
 
     def get_backbone_params(self) -> list[nn.Parameter]:
@@ -400,6 +438,17 @@ def test_checkpoint_save_resume():
     assert restored_opt_state["param_groups"][1]["name"] == "expert"
 
 
+def test_train_entrypoint_uses_wrapper_visible_phase_dispatch():
+    """The production loop must not bypass DDP/DeepSpeed forward hooks."""
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts" / "train_accelerate.py"
+    ).read_text()
+
+    assert 'model(observation, actions, phase="backbone")' in source
+    assert 'model(observation, actions, phase="expert")' in source
+    assert "DistributedDataParallelKwargs(find_unused_parameters=True)" in source
+
+
 # ===========================================================================
 #  Accelerate integration test (runs when launched via accelerate launch)
 # ===========================================================================
@@ -418,6 +467,67 @@ def _broadcast_path(accelerator, path: str) -> str:
     torch.distributed.broadcast(path_tensor, src=0)
     chars = [int(c) for c in path_tensor.tolist() if int(c) != 0]
     return "".join(chr(c) for c in chars)
+
+
+def _assert_named_tensors_synchronized(
+    accelerator,
+    named_tensors,
+    *,
+    label: str,
+    atol: float = 1e-6,
+) -> None:
+    """Assert every tensor equals rank 0's value on every process."""
+    if not torch.distributed.is_initialized() or accelerator.num_processes == 1:
+        return
+
+    mismatches = []
+    for name, tensor in named_tensors:
+        reference = tensor.detach().clone()
+        torch.distributed.broadcast(reference, src=0)
+        max_diff = (tensor.detach() - reference).abs().max()
+        torch.distributed.all_reduce(max_diff, op=torch.distributed.ReduceOp.MAX)
+        if float(max_diff.item()) > atol:
+            mismatches.append((name, float(max_diff.item())))
+
+    assert not mismatches, f"{label} differ across ranks: {mismatches[:5]}"
+
+
+def _assert_parameters_synchronized(accelerator, model, *, label: str) -> None:
+    unwrapped = accelerator.unwrap_model(model)
+    _assert_named_tensors_synchronized(
+        accelerator,
+        unwrapped.named_parameters(),
+        label=label,
+    )
+
+
+def _assert_gradients_synchronized(accelerator, model, *, label: str) -> None:
+    if not torch.distributed.is_initialized() or accelerator.num_processes == 1:
+        return
+
+    unwrapped = accelerator.unwrap_model(model)
+    named_gradients = []
+    for name, parameter in unwrapped.named_parameters():
+        has_gradient = torch.tensor(
+            int(parameter.grad is not None),
+            device=accelerator.device,
+            dtype=torch.int32,
+        )
+        minimum = has_gradient.clone()
+        maximum = has_gradient.clone()
+        torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
+        assert int(minimum.item()) == int(maximum.item()), (
+            f"{label}: gradient presence differs across ranks for {name}"
+        )
+        if parameter.grad is not None:
+            named_gradients.append((name, parameter.grad))
+
+    _assert_named_tensors_synchronized(
+        accelerator,
+        named_gradients,
+        label=label,
+    )
 
 
 def _run_accelerate_smoke(
@@ -441,13 +551,16 @@ def _run_accelerate_smoke(
     """
     try:
         from accelerate import Accelerator
-        from accelerate.utils import DistributedType
+        from accelerate.utils import DistributedDataParallelKwargs, DistributedType
     except ImportError:
         print("SKIP: accelerate not installed")
         return 0
 
     accelerator = Accelerator(
         gradient_accumulation_steps=1,
+        kwargs_handlers=[
+            DistributedDataParallelKwargs(find_unused_parameters=True),
+        ],
     )
     device = accelerator.device
     rank = accelerator.process_index
@@ -530,6 +643,14 @@ def _run_accelerate_smoke(
     if is_main:
         print(f"[rank {rank}] ✓ Two param groups preserved after accelerator.prepare()")
 
+    _assert_parameters_synchronized(
+        accelerator,
+        model,
+        label="parameters after accelerator.prepare",
+    )
+    if is_main:
+        print(f"[rank {rank}] ✓ Initial parameters synchronized across {world_size} rank(s)")
+
     # ---- KI gradient isolation verification (clean state, before training) ----
     if knowledge_insulation:
         unwrapped = accelerator.unwrap_model(model)
@@ -539,8 +660,8 @@ def _run_accelerate_smoke(
         # Zero all grads
         optimizer.zero_grad(set_to_none=True)
 
-        # Only expert backward
-        ex_losses = model.compute_expert_loss(obs, actions)
+        # Only expert backward, dispatched through the wrapped forward path.
+        ex_losses = model(obs, actions, phase="expert")
         accelerator.backward(ex_losses["expert_loss"])
 
         # Critical KI property: backbone grad must be exactly zero from expert loss
@@ -571,13 +692,19 @@ def _run_accelerate_smoke(
     for step in range(num_steps):
         optimizer.zero_grad(set_to_none=True)
 
-        # Phase 1: backbone forward + backward
-        bb_losses = model.compute_backbone_losses(obs, actions)
+        # Both phases call the wrapped model so DDP reducer hooks run.
+        bb_losses = model(obs, actions, phase="backbone")
         accelerator.backward(bb_losses["backbone_loss"])
 
-        # Phase 2: expert forward + backward
-        ex_losses = model.compute_expert_loss(obs, actions)
+        ex_losses = model(obs, actions, phase="expert")
         accelerator.backward(ex_losses["expert_loss"])
+
+        if step == 0:
+            _assert_gradients_synchronized(
+                accelerator,
+                model,
+                label="phase gradients before optimizer step",
+            )
 
         # Gradient clipping + step
         if accelerator.sync_gradients:
@@ -585,11 +712,24 @@ def _run_accelerate_smoke(
 
         optimizer.step()
 
+        if step == 0:
+            _assert_parameters_synchronized(
+                accelerator,
+                model,
+                label="parameters after first optimizer step",
+            )
+
         total_loss = bb_losses["backbone_loss"].detach().float().item() + ex_losses["expert_loss"].detach().float().item()
         losses.append(total_loss)
 
+    _assert_parameters_synchronized(
+        accelerator,
+        model,
+        label="parameters after main training loop",
+    )
     if is_main:
         print(f"[rank {rank}] ✓ {num_steps} two-phase training steps completed without crash")
+        print(f"[rank {rank}] ✓ Gradients and parameters synchronized across {world_size} rank(s)")
 
     # ---- Verify loss decreases ----
     avg_first = sum(losses[:3]) / 3
@@ -600,14 +740,14 @@ def _run_accelerate_smoke(
     if is_main:
         print(f"[rank {rank}] ✓ Loss decreases (first={avg_first:.4f} → last={avg_last:.4f})")
 
-    # Compute loss at current state (BEFORE save) so we can verify restore
+    # Evaluation-only direct calls do not require reducer hooks.
+    unwrapped = accelerator.unwrap_model(model)
     with torch.no_grad():
-        bb_before_save = model.compute_backbone_losses(obs, actions)["backbone_loss"].item()
-        ex_before_save = model.compute_expert_loss(obs, actions)["expert_loss"].item()
+        bb_before_save = unwrapped.compute_backbone_losses(obs, actions)["backbone_loss"].item()
+        ex_before_save = unwrapped.compute_expert_loss(obs, actions)["expert_loss"].item()
         loss_before_save = bb_before_save + ex_before_save
 
     # Save parameter state for comparison
-    unwrapped = accelerator.unwrap_model(model)
     saved_params = {
         name: param.detach().clone()
         for name, param in unwrapped.named_parameters()
@@ -619,14 +759,20 @@ def _run_accelerate_smoke(
     if is_main:
         print(f"[rank {rank}] ✓ Checkpoint saved to {acc_state_dir}")
 
-    # Train more steps to change state
+    # Train more steps to change state, still through the wrapped forward path.
     for _ in range(5):
         optimizer.zero_grad(set_to_none=True)
-        bb_losses = model.compute_backbone_losses(obs, actions)
+        bb_losses = model(obs, actions, phase="backbone")
         accelerator.backward(bb_losses["backbone_loss"])
-        ex_losses = model.compute_expert_loss(obs, actions)
+        ex_losses = model(obs, actions, phase="expert")
         accelerator.backward(ex_losses["expert_loss"])
         optimizer.step()
+
+    _assert_parameters_synchronized(
+        accelerator,
+        model,
+        label="parameters after additional training",
+    )
 
     # Verify state changed (params differ from saved state)
     unwrapped_after = accelerator.unwrap_model(model)
@@ -643,6 +789,12 @@ def _run_accelerate_smoke(
     accelerator.wait_for_everyone()
     if is_main:
         print(f"[rank {rank}] ✓ Checkpoint loaded")
+
+    _assert_parameters_synchronized(
+        accelerator,
+        model,
+        label="parameters after checkpoint restore",
+    )
 
     # Verify restored params match saved params (parameter-level verification)
     unwrapped_restored = accelerator.unwrap_model(model)
@@ -1335,8 +1487,44 @@ def test_compute_param_group_grad_norm_assertion_fallback():
 # ===========================================================================
 
 
+def _maybe_relaunch_accelerate_cpu_workers() -> int | None:
+    """Honor the documented two-rank ``accelerate --cpu`` command.
+
+    Accelerate 1.13 sets ``ACCELERATE_USE_CPU=True`` but launches only one
+    process for ``--num_processes=2 --cpu`` unless a distributed launcher is
+    selected separately.  This test is explicitly a two-rank smoke test, so
+    the single launcher process re-enters the same tracked file through
+    ``torch.distributed.run``.  Accelerate then detects ``MULTI_CPU`` from the
+    standard rank environment.  Versions that already launch two ranks skip
+    this compatibility path because ``WORLD_SIZE`` is greater than one.
+    """
+    use_cpu = os.environ.get("ACCELERATE_USE_CPU", "").lower() == "true"
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    already_relaunched = os.environ.get("OPENPI_CPU_SMOKE_RELAUNCHED") == "1"
+    if not use_cpu or world_size > 1 or already_relaunched:
+        return None
+
+    env = os.environ.copy()
+    env["OPENPI_CPU_SMOKE_RELAUNCHED"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=2",
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+    ]
+    return subprocess.run(command, env=env, check=False).returncode
+
+
 if __name__ == "__main__":
     import argparse
+
+    relaunch_code = _maybe_relaunch_accelerate_cpu_workers()
+    if relaunch_code is not None:
+        sys.exit(relaunch_code)
 
     parser = argparse.ArgumentParser(description="π0.5-KI joint query Accelerate smoke test")
     parser.add_argument("--ki", type=str, default="true", help="Knowledge insulation (true/false)")

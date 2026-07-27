@@ -596,6 +596,450 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
             "total_loss": total_loss,
         }
 
+    def compute_eval_metrics(
+        self,
+        observation,
+        actions,
+        *,
+        compute_flow_l1: bool = False,
+        num_denoise_steps: int = 10,
+        flow_l1_seed: int = 42,
+    ) -> dict[str, Tensor]:
+        """Compute evaluation/validation metrics (no backward pass).
+
+        Runs one backbone forward pass and one expert forward pass in eval
+        mode and returns a dictionary of scalar metrics.  The backbone pass
+        is reused for CE loss, subtask accuracy, query MSE, and query L1
+        to avoid redundant computation.
+
+        All tensors in the returned dict are detached scalars on the
+        same device as the inputs.
+
+        Args:
+            observation: observation batch
+            actions: ground truth action batch [B, horizon, dim]
+            compute_flow_l1: if True, also compute flow_l1 via Euler
+                integration (slow path, epoch-end only).  Uses fixed-seed
+                noise for determinism.
+            num_denoise_steps: number of Euler steps for flow_l1 (default 10)
+            flow_l1_seed: seed for fixed noise in flow_l1 computation
+
+        Returns dict with:
+            - ``total_loss``: scalar, backbone_loss + expert_loss
+            - ``backbone_loss``: scalar, weighted backbone loss
+            - ``expert_loss``: scalar, weighted expert loss
+            - ``ce_loss``: scalar, subtask CE loss
+            - ``query_mse_loss``: scalar, action query MSE loss
+            - ``flow_loss``: scalar, raw flow matching MSE
+            - ``subtask_accuracy``: scalar, teacher-forced subtask token accuracy
+              (argmax of CE logits vs GT, masked by loss_mask)
+            - ``query_l1``: scalar, query token action L1 (mean over valid positions)
+            - ``flow_mse``: scalar, same as flow_loss (velocity MSE, alias)
+            - ``flow_l1``: (only if compute_flow_l1=True) scalar, Euler-integrated
+              action L1 vs ground truth (fixed-seed noise, deterministic)
+        """
+        # ---- Shared backbone forward ----
+        # We do one backbone pass and extract all metrics from it.
+        # This duplicates some logic from compute_backbone_losses but
+        # avoids running the backbone 3x (CE + accuracy + query metrics).
+        (
+            backbone_loss,
+            ce_loss,
+            query_mse_loss,
+            subtask_accuracy,
+            query_l1,
+        ) = self._compute_backbone_eval_metrics(observation, actions)
+
+        # ---- Expert forward ----
+        ex_losses = self.compute_expert_loss(observation, actions)
+        ex_loss = ex_losses["expert_loss"]
+        flow_loss = ex_losses["flow_loss"]
+
+        total_loss = backbone_loss.detach() + ex_loss.detach()
+
+        result = {
+            "total_loss": total_loss,
+            "backbone_loss": backbone_loss.detach(),
+            "expert_loss": ex_loss.detach(),
+            "ce_loss": ce_loss.detach(),
+            "query_mse_loss": query_mse_loss.detach(),
+            "flow_loss": flow_loss.detach(),
+            "subtask_accuracy": subtask_accuracy.detach(),
+            "query_l1": query_l1.detach(),
+            "flow_mse": flow_loss.detach(),  # alias for clarity
+        }
+
+        # ---- Slow path: Euler integration flow L1 (epoch-end only) ----
+        if compute_flow_l1:
+            flow_l1 = self._compute_flow_l1_euler(
+                observation=observation,
+                actions=actions,
+                num_steps=num_denoise_steps,
+                seed=flow_l1_seed,
+            )
+            result["flow_l1"] = flow_l1.detach()
+
+        return result
+
+    def _compute_backbone_eval_metrics(self, observation, actions) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Single backbone forward for eval: returns (bb_loss, ce_loss, query_mse, subtask_acc, query_l1).
+
+        All return values are detached scalar tensors except bb_loss which
+        has the computation graph attached (for potential gradient use).
+        """
+        # ---- Preprocess observation ----
+        images, img_masks, lang_tokens, lang_masks, _state = self._preprocess_observation(
+            observation, train=False
+        )
+
+        # ---- Subtask info ----
+        subtask_tokens = getattr(observation, "subtask_tokens", None)
+        subtask_mask = getattr(observation, "subtask_mask", None)
+        subtask_loss_mask = getattr(observation, "subtask_loss_mask", None)
+
+        has_subtask = (
+            subtask_tokens is not None
+            and subtask_mask is not None
+            and subtask_loss_mask is not None
+            and subtask_loss_mask.any()
+        )
+
+        # ---- Build full prefix ----
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_base_len = prefix_embs.shape[1]
+
+        if has_subtask:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = (
+                self.action_expert._embed_conditioning_subtask(
+                    model=self,
+                    prefix_embs=prefix_embs,
+                    prefix_pad_masks=prefix_pad_masks,
+                    prefix_att_masks=prefix_att_masks,
+                    subtask_tokens=subtask_tokens,
+                    subtask_mask=subtask_mask,
+                    causal=True,
+                )
+            )
+        prefix_after_subtask_len = prefix_embs.shape[1]
+
+        # Add query tokens
+        query_embs, query_pad_masks, query_att_masks = self._embed_query_tokens(
+            batch_size=prefix_embs.shape[0],
+            device=prefix_embs.device,
+            target_dtype=prefix_embs.dtype,
+        )
+        full_prefix_embs = torch.cat([prefix_embs, query_embs], dim=1)
+        full_prefix_pad_masks = torch.cat([prefix_pad_masks, query_pad_masks], dim=1)
+        full_prefix_att_masks = torch.cat([prefix_att_masks, query_att_masks], dim=1)
+
+        full_prefix_att_2d_masks = self.make_att_2d_masks(full_prefix_pad_masks, full_prefix_att_masks)
+        full_prefix_position_ids = torch.cumsum(full_prefix_pad_masks, dim=1) - 1
+        full_prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(full_prefix_att_2d_masks)
+
+        # ---- Run backbone forward ----
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+        (prefix_out, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=full_prefix_att_2d_masks_4d,
+            position_ids=full_prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[full_prefix_embs, None],
+            use_cache=False,
+        )
+
+        # ---- CE loss + subtask accuracy ----
+        ce_loss = self._compute_ce_loss(
+            prefix_out=prefix_out,
+            prefix_base_len=prefix_base_len,
+            subtask_tokens=subtask_tokens,
+            subtask_loss_mask=subtask_loss_mask,
+            has_subtask=has_subtask,
+        )
+
+        subtask_accuracy = self._compute_subtask_accuracy_from_hidden(
+            prefix_out=prefix_out,
+            prefix_base_len=prefix_base_len,
+            subtask_tokens=subtask_tokens,
+            subtask_loss_mask=subtask_loss_mask,
+            has_subtask=has_subtask,
+        )
+
+        # ---- Query MSE + L1 ----
+        query_mse_loss = self._compute_query_mse_loss(
+            prefix_out=prefix_out,
+            prefix_after_subtask_len=prefix_after_subtask_len,
+            actions=actions,
+            observation=observation,
+        )
+
+        query_l1 = self._compute_query_l1_from_hidden(
+            prefix_out=prefix_out,
+            prefix_after_subtask_len=prefix_after_subtask_len,
+            actions=actions,
+            observation=observation,
+        )
+
+        # ---- Backbone total: weighted sum ----
+        backbone_loss = self.beta_text * ce_loss + self.beta_query * query_mse_loss
+
+        return backbone_loss, ce_loss, query_mse_loss, subtask_accuracy, query_l1
+
+    def _compute_subtask_accuracy_from_hidden(
+        self,
+        *,
+        prefix_out: Tensor,
+        prefix_base_len: int,
+        subtask_tokens: Tensor | None,
+        subtask_loss_mask: Tensor | None,
+        has_subtask: bool,
+    ) -> Tensor:
+        """Compute teacher-forced subtask accuracy from backbone hidden states.
+
+        Args:
+            prefix_out: [B, seq_len, hidden_dim] backbone output
+            prefix_base_len: length of prefix before subtask tokens
+            subtask_tokens: [B, subtask_len] ground truth subtask tokens
+            subtask_loss_mask: [B, subtask_len] loss mask (1=predict, 0=ignore)
+            has_subtask: whether subtask tokens are present
+
+        Returns:
+            Scalar accuracy tensor (0.0 if no subtask tokens).
+        """
+        if not has_subtask:
+            return torch.tensor(0.0, device=prefix_out.device)
+
+        subtask_len = subtask_tokens.shape[1]
+        subtask_hidden = prefix_out[:, prefix_base_len : prefix_base_len + subtask_len]
+
+        # Project to vocabulary
+        embed_weight = self.paligemma_with_expert.paligemma.language_model.embed_tokens.weight
+        subtask_hidden = subtask_hidden.to(dtype=embed_weight.dtype)
+        text_logits = torch.matmul(subtask_hidden, embed_weight.T)
+
+        # Shift: logits[t] predicts token[t+1]
+        shift_logits = text_logits[:, :-1].contiguous()
+        shift_targets = subtask_tokens[:, 1:].contiguous().to(dtype=torch.long)
+        shift_loss_mask = subtask_loss_mask[:, 1:].contiguous().float()
+
+        # Accuracy
+        preds = shift_logits.argmax(dim=-1)
+        correct = (preds == shift_targets).float()
+        masked_correct = correct * shift_loss_mask
+        total_valid = shift_loss_mask.sum().clamp(min=1)
+        accuracy = masked_correct.sum() / total_valid
+
+        return accuracy
+
+    def _compute_query_l1_from_hidden(
+        self,
+        *,
+        prefix_out: Tensor,
+        prefix_after_subtask_len: int,
+        actions: Tensor,
+        observation,
+    ) -> Tensor:
+        """Compute query action L1 from backbone hidden states.
+
+        Args:
+            prefix_out: [B, seq_len, hidden_dim] backbone output
+            prefix_after_subtask_len: length of prefix after subtask tokens
+            actions: [B, action_horizon, action_dim] ground truth actions
+            observation: observation with action_is_pad (optional)
+
+        Returns:
+            Scalar L1 tensor (mean over valid positions).
+        """
+        batch_size = prefix_out.shape[0]
+        device = prefix_out.device
+
+        query_hidden = prefix_out[:, prefix_after_subtask_len : prefix_after_subtask_len + self.num_query_tokens]
+        head_dtype = self.query_action_head.weight.dtype
+        query_hidden_aligned = query_hidden.to(dtype=head_dtype)
+        pred_actions = self.query_action_head(query_hidden_aligned).float()
+
+        # Target actions (with interpolation if needed)
+        action_horizon = actions.shape[1]
+        if action_horizon != self.num_query_tokens:
+            target_actions = F.interpolate(
+                actions.permute(0, 2, 1).float(),
+                size=self.num_query_tokens,
+                mode="linear",
+                align_corners=False,
+            ).permute(0, 2, 1)
+        else:
+            target_actions = actions.float()
+        target_actions = target_actions.to(device=device)
+
+        # Mask from action_is_pad
+        loss_mask = getattr(observation, "action_is_pad", None)
+        if loss_mask is not None:
+            valid_mask = (~loss_mask.bool()).float()
+            if action_horizon != self.num_query_tokens:
+                valid_mask = F.interpolate(
+                    valid_mask.unsqueeze(1),
+                    size=self.num_query_tokens,
+                    mode="nearest",
+                ).squeeze(1)
+            loss_mask_3d = valid_mask.unsqueeze(-1).expand(-1, -1, self._action_dim)
+        else:
+            loss_mask_3d = torch.ones(
+                batch_size, self.num_query_tokens, self._action_dim,
+                dtype=torch.float32, device=device,
+            )
+
+        # L1 (mean over valid positions, in fp32)
+        l1_per_pos = (pred_actions - target_actions).abs()
+        masked_l1 = l1_per_pos * loss_mask_3d
+        total_valid = loss_mask_3d.sum().clamp(min=1)
+        mean_l1 = masked_l1.sum() / total_valid
+
+        return mean_l1
+
+    def _compute_flow_l1_euler(
+        self,
+        *,
+        observation,
+        actions: Tensor,
+        num_steps: int = 10,
+        seed: int = 42,
+    ) -> Tensor:
+        """Compute flow L1 via Euler integration of predicted velocity field.
+
+        Starts from fixed-seed noise (for deterministic validation) and
+        integrates the predicted velocity field for ``num_steps`` Euler
+        steps to arrive at predicted actions, then computes L1 distance
+        to ground truth actions.
+
+        Args:
+            observation: observation batch
+            actions: ground truth actions [B, action_horizon, action_dim]
+            num_steps: number of Euler integration steps (default 10)
+            seed: random seed for fixed noise generation
+
+        Returns:
+            Scalar float tensor: mean L1 over batch and valid positions.
+        """
+        batch_size = actions.shape[0]
+        device = actions.device
+
+        # Fixed-seed noise for deterministic validation
+        rng_state = torch.get_rng_state()
+        try:
+            torch.manual_seed(seed)
+            noise = torch.randn_like(actions)
+        finally:
+            torch.set_rng_state(rng_state)
+
+        # Build prefix KV cache for expert (same as compute_expert_loss)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
+
+        subtask_tokens = getattr(observation, "subtask_tokens", None)
+        subtask_mask = getattr(observation, "subtask_mask", None)
+        has_subtask = (
+            subtask_tokens is not None
+            and subtask_mask is not None
+            and subtask_mask.any()
+        )
+
+        with torch.no_grad():
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
+
+            if has_subtask:
+                prefix_embs, prefix_pad_masks, prefix_att_masks = (
+                    self.action_expert._embed_conditioning_subtask(
+                        model=self,
+                        prefix_embs=prefix_embs,
+                        prefix_pad_masks=prefix_pad_masks,
+                        prefix_att_masks=prefix_att_masks,
+                        subtask_tokens=subtask_tokens,
+                        subtask_mask=subtask_mask,
+                        causal=True,
+                    )
+                )
+
+            if not self.truncate_expert_kv:
+                query_embs, query_pad_masks, query_att_masks = self._embed_query_tokens(
+                    batch_size=batch_size,
+                    device=device,
+                    target_dtype=prefix_embs.dtype,
+                )
+                prefix_embs = torch.cat([prefix_embs, query_embs], dim=1)
+                prefix_pad_masks = torch.cat([prefix_pad_masks, query_pad_masks], dim=1)
+                prefix_att_masks = torch.cat([prefix_att_masks, query_att_masks], dim=1)
+
+            prefix_att_2d_masks = self.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+            with self._no_gc_on_backbone():
+                _, past_key_values = self.paligemma_with_expert.forward(
+                    attention_mask=prefix_att_2d_masks_4d,
+                    position_ids=prefix_position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, None],
+                    use_cache=True,
+                )
+
+            if past_key_values is None:
+                raise RuntimeError("_compute_flow_l1_euler: past_key_values is None")
+
+            if self.knowledge_insulation:
+                past_key_values = _detach_kv_cache(past_key_values)
+
+            prefix_ctx = {
+                "prefix_pad_masks": prefix_pad_masks,
+                "past_key_values": past_key_values,
+            }
+
+            # Euler integration: start from noise (t=1), step to t=0
+            dt = -1.0 / num_steps
+            x_t = noise
+            t = 1.0
+            for _ in range(num_steps):
+                time_tensor = torch.full((batch_size,), t, device=device, dtype=torch.float32)
+                v_t = self.action_expert.compute_velocity_infer(
+                    model=self,
+                    prefix_ctx=prefix_ctx,
+                    state=state,
+                    x_t=x_t,
+                    time=time_tensor,
+                )
+                x_t = x_t + dt * v_t
+                t += dt
+
+            # x_t now holds predicted actions at t≈0
+            pred_actions = x_t.float()
+            target_actions = actions.float()
+
+            # Mask by action_is_pad if available
+            loss_mask = getattr(observation, "action_is_pad", None)
+            action_horizon = actions.shape[1]
+            if loss_mask is not None:
+                valid_mask = (~loss_mask.bool()).float()
+                # If action_horizon != num_query_tokens, we shouldn't interpolate
+                # for action L1 — action_horizon matches the GT action shape.
+                # But pred_actions from flow has same shape as actions, so no resize needed.
+                loss_mask_3d = valid_mask.unsqueeze(-1).expand(-1, -1, self._action_dim)
+            else:
+                loss_mask_3d = torch.ones(
+                    batch_size, action_horizon, self._action_dim,
+                    dtype=torch.float32, device=device,
+                )
+
+            # L1 (mean over valid positions)
+            l1_per_pos = (pred_actions - target_actions).abs()
+            masked_l1 = l1_per_pos * loss_mask_3d
+            total_valid = loss_mask_3d.sum().clamp(min=1)
+            mean_l1 = masked_l1.sum() / total_valid
+
+            return mean_l1
+
     # ------------------------------------------------------------------
     #  Loss computation helpers
     # ------------------------------------------------------------------

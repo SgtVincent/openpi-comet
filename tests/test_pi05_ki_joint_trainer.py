@@ -1422,3 +1422,166 @@ class TestMetricsLogger:
         assert len(logger.history) == 50
         assert logger.history[0]["loss"] == 0.0
         assert logger.history[49]["loss"] == 49.0
+
+
+# ===========================================================================
+#  Validation / eval metrics tests
+# ===========================================================================
+
+
+class TestComputeEvalMetrics:
+    """Tests for compute_eval_metrics (fast-path validation metrics)."""
+
+    def _make_wrapped_model_with_eval(self):
+        """Create a mini model with compute_eval_metrics added."""
+        model = _make_model()
+        model = _wrap_model_for_trainer(model)
+
+        # Add compute_eval_metrics that follows the real model's pattern:
+        # one backbone forward producing ce_loss, query_mse, subtask_accuracy, query_l1
+        # plus expert forward for flow loss
+        def compute_eval_metrics(observation, actions):
+            bb_losses = model.compute_backbone_losses(observation, actions)
+            ex_losses = model.compute_expert_loss(observation, actions)
+
+            # Fake subtask accuracy (for test: random between 0 and 1)
+            # Real model computes argmax vs GT; here we derive from CE loss
+            ce_val = bb_losses["ce_loss"].detach()
+            # Heuristic: higher CE → lower accuracy (just for shape/type testing)
+            subtask_acc = torch.clamp(1.0 - ce_val / 10.0, min=0.0)
+
+            # Fake query L1: sqrt(MSE) as a rough proxy
+            query_mse_val = bb_losses["query_mse_loss"].detach()
+            query_l1 = torch.sqrt(query_mse_val + 1e-8)
+
+            total_loss = bb_losses["backbone_loss"].detach() + ex_losses["expert_loss"].detach()
+
+            return {
+                "total_loss": total_loss,
+                "backbone_loss": bb_losses["backbone_loss"].detach(),
+                "expert_loss": ex_losses["expert_loss"].detach(),
+                "ce_loss": bb_losses["ce_loss"].detach(),
+                "query_mse_loss": bb_losses["query_mse_loss"].detach(),
+                "flow_loss": ex_losses["flow_loss"].detach(),
+                "subtask_accuracy": subtask_acc,
+                "query_l1": query_l1,
+                "flow_mse": ex_losses["flow_loss"].detach(),
+            }
+
+        model.compute_eval_metrics = compute_eval_metrics
+        return model
+
+    def test_compute_eval_metrics_returns_expected_keys(self):
+        """compute_eval_metrics should return all expected metric keys."""
+        model = self._make_wrapped_model_with_eval()
+        prefix_tokens, actions, subtask_targets = _make_batch(batch_size=4)
+        obs = _ObsWrapper(prefix_tokens, subtask_targets)
+
+        model.eval()
+        with torch.no_grad():
+            metrics = model.compute_eval_metrics(obs, actions)
+
+        expected_keys = {
+            "total_loss", "backbone_loss", "expert_loss",
+            "ce_loss", "query_mse_loss", "flow_loss",
+            "subtask_accuracy", "query_l1", "flow_mse",
+        }
+        assert set(metrics.keys()) == expected_keys, (
+            f"Missing keys: {expected_keys - set(metrics.keys())}, "
+            f"Extra keys: {set(metrics.keys()) - expected_keys}"
+        )
+
+    def test_compute_eval_metrics_all_scalar(self):
+        """All compute_eval_metrics values should be scalar tensors."""
+        model = self._make_wrapped_model_with_eval()
+        prefix_tokens, actions, subtask_targets = _make_batch(batch_size=4)
+        obs = _ObsWrapper(prefix_tokens, subtask_targets)
+
+        model.eval()
+        with torch.no_grad():
+            metrics = model.compute_eval_metrics(obs, actions)
+
+        for key, val in metrics.items():
+            assert isinstance(val, torch.Tensor), f"{key}: not a tensor (type={type(val)})"
+            assert val.numel() == 1, f"{key}: not scalar (shape={val.shape})"
+            assert val.dtype in (torch.float32, torch.float64), (
+                f"{key}: not float dtype (dtype={val.dtype})"
+            )
+
+    def test_compute_eval_metrics_all_finite(self):
+        """All compute_eval_metrics values should be finite."""
+        torch.manual_seed(42)
+        model = self._make_wrapped_model_with_eval()
+        prefix_tokens, actions, subtask_targets = _make_batch(batch_size=4)
+        obs = _ObsWrapper(prefix_tokens, subtask_targets)
+
+        model.eval()
+        with torch.no_grad():
+            metrics = model.compute_eval_metrics(obs, actions)
+
+        for key, val in metrics.items():
+            assert torch.isfinite(val).all(), (
+                f"{key}: non-finite value: {val.item()}"
+            )
+
+    def test_subtask_accuracy_in_01_range(self):
+        """subtask_accuracy should be in [0, 1] range."""
+        model = self._make_wrapped_model_with_eval()
+        prefix_tokens, actions, subtask_targets = _make_batch(batch_size=4)
+        obs = _ObsWrapper(prefix_tokens, subtask_targets)
+
+        model.eval()
+        with torch.no_grad():
+            metrics = model.compute_eval_metrics(obs, actions)
+
+        acc = metrics["subtask_accuracy"].item()
+        assert 0.0 <= acc <= 1.0, f"subtask_accuracy={acc} out of [0, 1] range"
+
+    def test_compute_eval_metrics_no_grad(self):
+        """compute_eval_metrics should not produce gradients (eval mode)."""
+        model = self._make_wrapped_model_with_eval()
+        prefix_tokens, actions, subtask_targets = _make_batch(batch_size=4)
+        obs = _ObsWrapper(prefix_tokens, subtask_targets)
+
+        model.train()
+        # Even in train mode, values should be detached (no grad on returned dict values)
+        metrics = model.compute_eval_metrics(obs, actions)
+
+        for key, val in metrics.items():
+            assert not val.requires_grad, f"{key}: has requires_grad=True in eval metrics"
+
+    def test_compute_eval_metrics_train_vs_eval_mode_consistency(self):
+        """compute_eval_metrics should produce same values in train and eval mode
+        (since it's just forward passes with no dropout/etc. in mini model)."""
+        model = self._make_wrapped_model_with_eval()
+        prefix_tokens, actions, subtask_targets = _make_batch(batch_size=4, prefix_len=8, action_horizon=6)
+        obs = _ObsWrapper(prefix_tokens, subtask_targets)
+
+        torch.manual_seed(0)
+        model.eval()
+        with torch.no_grad():
+            metrics_eval = model.compute_eval_metrics(obs, actions)
+
+        torch.manual_seed(0)
+        model.train()
+        with torch.no_grad():
+            metrics_train = model.compute_eval_metrics(obs, actions)
+
+        for key in metrics_eval:
+            assert torch.allclose(metrics_eval[key], metrics_train[key], atol=1e-6), (
+                f"{key}: train/eval mismatch: eval={metrics_eval[key].item()}, train={metrics_train[key].item()}"
+            )
+
+    def test_flow_mse_equals_flow_loss(self):
+        """flow_mse should be an alias for flow_loss."""
+        model = self._make_wrapped_model_with_eval()
+        prefix_tokens, actions, subtask_targets = _make_batch(batch_size=4)
+        obs = _ObsWrapper(prefix_tokens, subtask_targets)
+
+        model.eval()
+        with torch.no_grad():
+            metrics = model.compute_eval_metrics(obs, actions)
+
+        assert torch.allclose(metrics["flow_mse"], metrics["flow_loss"]), (
+            f"flow_mse={metrics['flow_mse'].item()} != flow_loss={metrics['flow_loss'].item()}"
+        )

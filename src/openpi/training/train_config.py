@@ -101,6 +101,15 @@ class TrainConfig:
 
     fsdp_devices: int = 1
 
+    # ---- Validation configuration ----
+    # val_data: list of DataConfigFactory for validation datasets.
+    # Empty list means validation is disabled.
+    # NOTE: the legacy val_repo_id / val_episodes_index fields below are
+    # vestigial and unused; use val_data for proper validation setup.
+    val_data: Sequence[DataConfigFactory] | DataConfigFactory = dataclasses.field(
+        default_factory=list
+    )
+
     val_log_interval: int = 100
     val_batch_size: int | None = None
     val_num_batches: int = 10
@@ -133,6 +142,10 @@ class TrainConfig:
         # Compatibility: Allow passing a single DataConfigFactory by wrapping it in a list.
         if not isinstance(self.data, (list, tuple)):
             object.__setattr__(self, "data", [self.data])
+
+        # Same wrapping for val_data (single DataConfigFactory → list).
+        if not isinstance(self.val_data, (list, tuple)):
+            object.__setattr__(self, "val_data", [self.val_data])
 
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("--gradient_accumulation_steps must be a positive integer.")

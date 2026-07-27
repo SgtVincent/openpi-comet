@@ -121,6 +121,39 @@ def _make_b1k_multitask_data_config(num_tasks: int = 5, episodes_per_task: int =
     )
 
 
+def _make_b1k_single_task_data_config(
+    task_name: str,
+    episodes_index: list[int],
+) -> LeRobotB1KDataConfig:
+    """Single-task B1K data config with specific episode indices.
+
+    Args:
+        task_name: single task name (e.g. "turning_on_radio")
+        episodes_index: list of episode indices for this task
+
+    Returns:
+        LeRobotB1KDataConfig with subtask_source="annotations_skill"
+    """
+    return LeRobotB1KDataConfig(
+        repo_id="behavior-1k/2025-challenge-demos",
+        assets=AssetsConfig(
+            assets_dir=f"{_PI05_BASE_CKPT}/assets",
+            asset_id="behavior-1k/2025-challenge-demos",
+        ),
+        base_config=DataConfig(
+            prompt_from_task=True,
+            tasks=[task_name],
+            episodes_index=episodes_index,
+            behavior_dataset_root=_B1K_DATA_ROOT,
+            fine_grained_level=0,
+            subtask_source="annotations_skill",
+            subtask_template_path=_B1K_SUBTASK_TEMPLATES,
+            subtask_object_name_mapping_path=_B1K_OBJECT_MAPPING,
+            subtask_joiner=" then ",
+        ),
+    )
+
+
 def _make_pi05_ki_joint_query_config(
     *,
     name: str,
@@ -285,6 +318,112 @@ def _make_pi05_ki_joint_query_long_baseline_config(
     )
 
 
+def _make_pi05_ki_joint_query_single_task_overfit_config(
+    *,
+    name: str,
+    knowledge_insulation: bool = True,
+    task_name: str = "turning_on_radio",
+    train_episodes: int = 180,
+    val_episodes_start: int = 180,
+    val_episodes_end: int = 200,
+    num_train_epochs: int = 1,
+    peak_lr: float = 1e-5,
+    warmup_steps: int = 100,
+    save_interval: int = 200,
+    val_log_interval: int = 50,
+    val_num_batches: int = 20,
+    precision: str = "float32",
+) -> TrainConfig:
+    """Factory for single-task overfit experiment with validation split.
+
+    Uses a single B1K task with disjoint train/val episode ranges:
+    - Train: episodes [0, train_episodes)
+    - Val: episodes [val_episodes_start, val_episodes_end)
+
+    Both train and val share the same norm stats (from train data assets).
+
+    Args:
+        name: config name (used for get_config lookup)
+        knowledge_insulation: whether to enable Knowledge Insulation
+        task_name: B1K task name
+        train_episodes: number of training episodes (0..train_episodes-1)
+        val_episodes_start: start of val episode range (inclusive)
+        val_episodes_end: end of val episode range (exclusive)
+        num_train_epochs: number of training epochs (sets num_train_steps via steps_per_epoch)
+        peak_lr: peak learning rate
+        warmup_steps: warmup steps
+        save_interval: checkpoint save interval in steps
+        val_log_interval: validation interval in steps
+        val_num_batches: number of val batches per validation run
+        precision: "float16" or "float32"
+
+    Returns:
+        TrainConfig for PI05KIJointQueryPytorch (query-MSE variant) single-task overfit
+    """
+    if precision == "float16":
+        pytorch_precision = "float16"
+        accel_mp = "fp16"
+    elif precision == "float32":
+        pytorch_precision = "float32"
+        accel_mp = "no"
+    else:
+        raise ValueError(f"Unsupported precision: {precision}")
+
+    train_episodes_index = list(range(train_episodes))
+    val_episodes_index = list(range(val_episodes_start, val_episodes_end))
+
+    output_root = f"./outputs/{name}"
+
+    # Decay steps = 1 epoch (estimated upper bound; exact steps_per_epoch
+    # will be computed at runtime from the actual dataloader length).
+    # Use a generous estimate that won't truncate early.
+    estimated_steps_per_epoch = 2000  # conservative upper bound
+    decay_steps = estimated_steps_per_epoch * num_train_epochs
+
+    return TrainConfig(
+        name=name,
+        exp_name=name,  # unique per config
+        project_name="pi05_ki",
+        pytorch_model_name="pi05_ki_joint_query",
+        model=pi05_ki_joint_query_config.Pi05KIJointQueryConfig(
+            alpha=10.0,
+            subtask_max_len=128,
+            action_horizon=32,
+            num_query_tokens=32,
+            knowledge_insulation=knowledge_insulation,
+            truncate_expert_kv=True,
+            beta_text=1.0,
+            beta_query=1.0,
+            flow_loss_weight=10.0,
+        ),
+        data=_make_b1k_single_task_data_config(task_name, train_episodes_index),
+        val_data=_make_b1k_single_task_data_config(task_name, val_episodes_index),
+        pytorch_weight_path=_PI05_BASE_CKPT,
+        num_train_steps=decay_steps,
+        num_train_epochs=num_train_epochs,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=warmup_steps,
+            peak_lr=peak_lr,
+            decay_steps=decay_steps,
+            decay_lr=0.0,
+        ),
+        pytorch_training_precision=pytorch_precision,
+        accelerate_mixed_precision=accel_mp,
+        ema_decay=None,
+        wandb_enabled=False,
+        assets_base_dir=f"{output_root}/assets",
+        checkpoint_base_dir=f"{output_root}/checkpoints",
+        log_base_dir=f"{output_root}/logs",
+        num_workers=2,
+        batch_size_per_gpu=1,
+        gradient_accumulation_steps=1,
+        save_interval=save_interval,
+        log_interval=10,
+        val_log_interval=val_log_interval,
+        val_num_batches=val_num_batches,
+    )
+
+
 _PI05_KI_JOINT_QUERY_CONFIGS = [
     # --- fp16 base configs (intended production; may be unstable on V100) ---
     _make_pi05_ki_joint_query_config(
@@ -334,5 +473,18 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         episodes_per_task=20,
         save_interval=50,
         precision="float32",
+    ),
+    # --- Single-task overfit: turning_on_radio, 180 train / 20 val, KI=ON ---
+    # FP32 variant (numerically stable, reference baseline)
+    _make_pi05_ki_joint_query_single_task_overfit_config(
+        name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp32",
+        knowledge_insulation=True,
+        precision="float32",
+    ),
+    # FP16 variant (production precision, V100-accelerated)
+    _make_pi05_ki_joint_query_single_task_overfit_config(
+        name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp16",
+        knowledge_insulation=True,
+        precision="float16",
     ),
 ]
