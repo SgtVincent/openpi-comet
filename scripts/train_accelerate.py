@@ -19,6 +19,7 @@ DeepSpeed ZeRO:
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import datetime
 import faulthandler
@@ -192,6 +193,22 @@ def install_excepthook() -> None:
     sys.excepthook = _hook
 
 
+def _default_hf_datasets_cache(config: _config.TrainConfig, *, accelerator: Accelerator) -> Path:
+    """Derive a rank-consistent Arrow cache root on node-local ``/tmp``."""
+    from behavior.learning.datas.hf_cache_sync import resolve_cache_run_id
+
+    distributed = accelerator.num_processes > 1
+    run_id = resolve_cache_run_id(distributed=distributed)
+    if run_id == "standalone":
+        checkpoint_identity = Path(
+            getattr(config, "checkpoint_dir", config.checkpoint_base_dir)
+        ).expanduser().resolve()
+        run_id = f"standalone:{checkpoint_identity}"
+    run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
+    user = os.environ.get("USER", "unknown").strip() or "unknown"
+    return Path("/tmp") / "openpi-comet" / user / "hf-datasets" / run_digest
+
+
 def configure_hf_cache(config: _config.TrainConfig, *, accelerator: Accelerator) -> None:
     offline = os.environ.get("OPENPI_OFFLINE", "1") == "1"
     if offline:
@@ -202,13 +219,16 @@ def configure_hf_cache(config: _config.TrainConfig, *, accelerator: Accelerator)
     if os.environ.get("OPENPI_TORCH_COMPILE_SAMPLE_ACTIONS", "0") != "1":
         os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
-    checkpoints_root = Path(config.checkpoint_base_dir).expanduser().resolve()
+    checkpoints_root = Path(os.path.abspath(Path(config.checkpoint_base_dir).expanduser()))
     hf_home = Path(os.environ.get("HF_HOME", str(checkpoints_root / "hf_home"))).expanduser()
     hub_cache = Path(os.environ.get("HUGGINGFACE_HUB_CACHE", str(hf_home / "hub"))).expanduser()
     transformers_cache = Path(os.environ.get("TRANSFORMERS_CACHE", str(hf_home / "transformers"))).expanduser()
-    datasets_cache = Path(
-        os.environ.get("HF_DATASETS_CACHE", str(checkpoints_root / "hf_datasets_cache"))
-    ).expanduser()
+    configured_datasets_cache = os.environ.get("HF_DATASETS_CACHE", "").strip()
+    datasets_cache = (
+        Path(configured_datasets_cache).expanduser()
+        if configured_datasets_cache
+        else _default_hf_datasets_cache(config, accelerator=accelerator)
+    )
 
     os.environ["HF_HOME"] = str(hf_home)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(hub_cache)
@@ -222,13 +242,9 @@ def configure_hf_cache(config: _config.TrainConfig, *, accelerator: Accelerator)
         os.environ.setdefault("OPENPI_HF_LOAD_DATASET_RETRIES", "5")
         os.environ.setdefault("OPENPI_HF_LOAD_DATASET_RETRY_SLEEP_S", "2")
 
-    if accelerator.is_main_process:
-        hf_home.mkdir(parents=True, exist_ok=True)
-        hub_cache.mkdir(parents=True, exist_ok=True)
-        transformers_cache.mkdir(parents=True, exist_ok=True)
-        datasets_cache.mkdir(parents=True, exist_ok=True)
-    accelerator.wait_for_everyone()
-
+    # Do not inspect or create HF_DATASETS_CACHE here. Strict validation and
+    # normal mkdir are deferred until load_hf_dataset has a generation-scoped
+    # c10d failure protocol, so no rank can fail before its peers can observe it.
     if accelerator.is_main_process:
         logging.info("HF_HOME=%s", os.environ.get("HF_HOME"))
         logging.info("HF_DATASETS_CACHE=%s", os.environ.get("HF_DATASETS_CACHE"))
@@ -282,19 +298,179 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         return
 
 
+_CHECKPOINT_POLICY_STEP = "step"
+_CHECKPOINT_POLICY_EPOCH_WITH_ROLLING = "epoch_with_rolling"
+_ROLLING_CHECKPOINT_LINK_NAME = "rolling_latest"
+_ROLLING_CHECKPOINT_DIR_PREFIX = ".rolling_step_"
+
+
+def _checkpoint_save_kind(
+    config,
+    *,
+    global_step: int,
+    steps_per_epoch: int | None,
+) -> str | None:
+    """Return the checkpoint kind due at ``global_step``.
+
+    The default ``step`` branch intentionally retains the historical trigger
+    expression. The opt-in epoch policy makes epoch boundaries durable and uses
+    a separate fixed-name rolling pointer for within-epoch recovery.
+    """
+    if global_step <= 0:
+        return None
+
+    policy = getattr(config, "checkpoint_policy", _CHECKPOINT_POLICY_STEP)
+    if policy == _CHECKPOINT_POLICY_STEP:
+        should_save = global_step % config.save_interval == 0 or global_step == config.num_train_steps
+        return "step" if should_save else None
+
+    if policy != _CHECKPOINT_POLICY_EPOCH_WITH_ROLLING:
+        raise ValueError(f"Unsupported checkpoint_policy: {policy}")
+    if steps_per_epoch is None or int(steps_per_epoch) <= 0:
+        raise ValueError("epoch_with_rolling checkpoint policy requires positive steps_per_epoch")
+
+    rolling_interval = int(getattr(config, "rolling_checkpoint_interval", 0))
+    if rolling_interval <= 0:
+        raise ValueError(
+            "epoch_with_rolling checkpoint policy requires --rolling-checkpoint-interval > 0"
+        )
+
+    steps_per_epoch = int(steps_per_epoch)
+    if global_step % steps_per_epoch == 0:
+        return "epoch"
+    if global_step % rolling_interval == 0 or global_step == int(config.num_train_steps):
+        return "rolling"
+    return None
+
+
+def _remove_checkpoint_path(path: Path) -> None:
+    """Remove a file, symlink, or directory without following symlinks."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _checkpoint_step_from_name(name: str) -> int | None:
+    if name.isdigit():
+        return int(name)
+    if name.startswith(_ROLLING_CHECKPOINT_DIR_PREFIX):
+        step_text = name.removeprefix(_ROLLING_CHECKPOINT_DIR_PREFIX)
+        if step_text.isdigit():
+            return int(step_text)
+    return None
+
+
+def _rolling_checkpoint_target(checkpoint_dir: Path) -> Path | None:
+    """Return the valid in-root target of ``rolling_latest``, if present."""
+    link_path = checkpoint_dir / _ROLLING_CHECKPOINT_LINK_NAME
+    if not link_path.is_symlink():
+        return None
+    try:
+        target = (checkpoint_dir / os.readlink(link_path)).resolve(strict=True)
+        checkpoint_root = checkpoint_dir.resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return None
+    if (
+        target.parent != checkpoint_root
+        or not target.is_dir()
+        or _checkpoint_step_from_name(target.name) is None
+    ):
+        return None
+    return target
+
+
+def _cleanup_rolling_checkpoint_artifacts(
+    checkpoint_dir: Path,
+    *,
+    keep_target: Path | None = None,
+) -> None:
+    """Remove stale rolling targets and interrupted rolling-save temporaries."""
+    if not checkpoint_dir.exists():
+        return
+    keep_resolved = keep_target.resolve(strict=False) if keep_target is not None else None
+    for candidate in checkpoint_dir.iterdir():
+        name = candidate.name
+        if name.startswith(("tmp_rolling_", f".{_ROLLING_CHECKPOINT_LINK_NAME}.tmp.")):
+            _remove_checkpoint_path(candidate)
+            continue
+        if name.startswith(_ROLLING_CHECKPOINT_DIR_PREFIX):
+            candidate_resolved = candidate.resolve(strict=False)
+            if keep_resolved is None or candidate_resolved != keep_resolved:
+                _remove_checkpoint_path(candidate)
+
+
+def _publish_rolling_checkpoint(checkpoint_dir: Path, target_dir: Path) -> None:
+    """Atomically point ``rolling_latest`` at target and remove older rolling data.
+
+    The checkpoint data is fully written before this function runs. Publishing a
+    temporary symlink with ``os.replace`` makes resume discovery switch from the
+    old complete checkpoint to the new complete checkpoint atomically.
+    """
+    checkpoint_root = checkpoint_dir.resolve(strict=True)
+    target_resolved = target_dir.resolve(strict=True)
+    if target_resolved.parent != checkpoint_root:
+        raise ValueError(f"Rolling checkpoint target must be inside {checkpoint_root}: {target_dir}")
+
+    link_path = checkpoint_dir / _ROLLING_CHECKPOINT_LINK_NAME
+    tmp_link = checkpoint_dir / f".{_ROLLING_CHECKPOINT_LINK_NAME}.tmp.{os.getpid()}"
+    _remove_checkpoint_path(tmp_link)
+    tmp_link.symlink_to(target_resolved.name, target_is_directory=True)
+
+    # A real directory at this reserved path can only come from an interrupted
+    # pre-policy experiment or manual intervention. Remove it once so subsequent
+    # symlink publications use atomic os.replace exclusively.
+    if os.path.lexists(link_path) and not link_path.is_symlink():
+        _remove_checkpoint_path(link_path)
+    os.replace(tmp_link, link_path)
+    _cleanup_rolling_checkpoint_artifacts(checkpoint_dir, keep_target=target_resolved)
+
+
+def _checkpoint_step_from_dir(checkpoint_dir: Path) -> int | None:
+    """Read a checkpoint step from a durable or rolling checkpoint directory."""
+    try:
+        resolved = checkpoint_dir.resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return None
+
+    named_step = _checkpoint_step_from_name(resolved.name)
+    if named_step is not None:
+        return named_step
+
+    manifest_path = resolved / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        return int(manifest["run_metadata"]["global_step"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _latest_step_dir(checkpoint_dir: Path) -> tuple[int, Path] | None:
-    steps = [
+    """Discover the newest durable or atomically published rolling checkpoint."""
+    if not checkpoint_dir.exists():
+        return None
+
+    durable_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
-        if d.is_dir() and d.name.isdigit() and not d.name.startswith("tmp_")
+        if d.is_dir() and not d.is_symlink() and d.name.isdigit()
     ]
-    if not steps:
-        return None
-    step = max(steps)
-    return step, checkpoint_dir / f"{step}"
+    latest = None
+    if durable_steps:
+        step = max(durable_steps)
+        latest = (step, checkpoint_dir / f"{step}")
+
+    rolling_link = checkpoint_dir / _ROLLING_CHECKPOINT_LINK_NAME
+    rolling_target = _rolling_checkpoint_target(checkpoint_dir)
+    rolling_step = _checkpoint_step_from_dir(rolling_target) if rolling_target is not None else None
+    if rolling_step is not None and (latest is None or rolling_step > latest[0]):
+        latest = (rolling_step, rolling_link)
+    return latest
 
 
 def build_datasets(config: _config.TrainConfig):
+    from behavior.learning.datas.hf_cache_sync import DistributedCacheError
+
     retries = max(1, int(os.environ.get("OPENPI_BUILD_DATASET_RETRIES", "3")))
     rank = int(os.environ.get("RANK", "0"))
     skip_norm_stats = os.environ.get("OPENPI_SKIP_NORM_STATS", "0") == "1"
@@ -307,6 +483,21 @@ def build_datasets(config: _config.TrainConfig):
                 skip_norm_stats=skip_norm_stats,
             )
             return data_loader, data_loader.data_config()
+        except DistributedCacheError as exc:
+            if (not exc.retryable) or attempt >= retries:
+                raise
+            delay_s = float(os.environ.get("OPENPI_BUILD_DATASET_RETRY_SLEEP_S", "2")) * attempt
+            logging.warning(
+                "Rank %s observed canonical retryable cache failure on attempt %s/%s; "
+                "all ranks acknowledged generation %s. Retrying in %.1fs: %s",
+                rank,
+                attempt,
+                retries,
+                exc.generation_id,
+                delay_s,
+                exc,
+            )
+            time.sleep(delay_s)
         except FileNotFoundError as exc:
             transient_lock_race = exc.filename is None and int(os.environ.get("WORLD_SIZE", "1")) > 1
             if (not transient_lock_race) or attempt >= retries:
@@ -328,6 +519,8 @@ def build_val_datasets(config: _config.TrainConfig):
     Returns (val_loader, val_data_config) or (None, None) if val_data is empty.
     Uses shuffle=False and reuses the same norm stats as the training data.
     """
+    from behavior.learning.datas.hf_cache_sync import DistributedCacheError
+
     if not config.val_data:
         return None, None
 
@@ -358,6 +551,21 @@ def build_val_datasets(config: _config.TrainConfig):
                 )
                 val_data_config = val_loader.data_config()
                 break
+            except DistributedCacheError as exc:
+                if (not exc.retryable) or attempt >= retries:
+                    raise
+                delay_s = float(os.environ.get("OPENPI_BUILD_DATASET_RETRY_SLEEP_S", "2")) * attempt
+                logging.warning(
+                    "Rank %s observed canonical retryable val-cache failure on attempt %s/%s; "
+                    "all ranks acknowledged generation %s. Retrying in %.1fs: %s",
+                    rank,
+                    attempt,
+                    retries,
+                    exc.generation_id,
+                    delay_s,
+                    exc,
+                )
+                time.sleep(delay_s)
             except FileNotFoundError as exc:
                 transient_lock_race = exc.filename is None and int(os.environ.get("WORLD_SIZE", "1")) > 1
                 if (not transient_lock_race) or attempt >= retries:
@@ -939,6 +1147,147 @@ def _loss_tensor_debug_metrics(losses: object, actions: torch.Tensor) -> dict[st
     return metrics
 
 
+# =====================================================================
+# Buffered metrics.jsonl writer: reduce I/O overhead on the hot path by
+# batching metrics.jsonl writes and flushing only at boundaries.
+# =====================================================================
+
+_metrics_buffer: list[str] = []
+_metrics_file_handle: object = None  # file or None
+_metrics_atexit_registered: bool = False
+
+
+def _metrics_buffer_init(file_handle) -> None:
+    """Initialize the metrics buffer with the given file handle.
+
+    Registers an atexit flush hook on first call.
+    """
+    global _metrics_file_handle, _metrics_atexit_registered
+    _metrics_file_handle = file_handle
+    if not _metrics_atexit_registered:
+        atexit.register(_metrics_buffer_flush)
+        _metrics_atexit_registered = True
+
+
+def _metrics_buffer_append(record: dict) -> None:
+    """Append a record dict to the metrics buffer (rank 0 only).
+
+    The record is serialized to a JSON line and buffered.  Does NOT flush.
+    """
+    if _metrics_file_handle is None:
+        return
+    _metrics_buffer.append(json.dumps(record, default=str) + "\n")
+
+
+def _safe_log_warning(message: str, *args, exc_info=None) -> None:
+    """Best-effort warning that cannot turn diagnostics into control flow."""
+    try:
+        logging.warning(message, *args, exc_info=exc_info)
+    except Exception:
+        return
+
+
+def _metrics_buffer_disable(message: str) -> None:
+    """Detach all metrics state before best-effort close and warning."""
+    global _metrics_atexit_registered, _metrics_buffer, _metrics_file_handle  # noqa: PLW0603
+    failure_exc_info = sys.exc_info()
+    failed_handle = _metrics_file_handle
+    _metrics_file_handle = None
+    _metrics_buffer = []
+    _metrics_atexit_registered = False
+
+    close_error = None
+    if failed_handle is not None:
+        try:
+            failed_handle.close()
+        except Exception as exc:
+            close_error = exc
+
+    _safe_log_warning(message, exc_info=failure_exc_info)
+    if close_error is not None:
+        _safe_log_warning("metrics.jsonl close after failure also failed: %s", close_error)
+
+
+def _metrics_buffer_flush() -> None:
+    """Flush buffered metrics, disabling the writer after any I/O failure."""
+    global _metrics_buffer
+    if _metrics_file_handle is None or not _metrics_buffer:
+        return
+    try:
+        _metrics_file_handle.write("".join(_metrics_buffer))
+        _metrics_file_handle.flush()
+    except Exception:
+        _metrics_buffer_disable("metrics.jsonl flush failed; disabling metrics output")
+        return
+    _metrics_buffer = []
+
+
+def _metrics_buffer_write_boundary(record: dict) -> None:
+    """Append and flush one boundary record without propagating metrics errors."""
+    try:
+        _metrics_buffer_append(record)
+    except Exception:
+        _metrics_buffer_disable("metrics.jsonl record serialization failed; disabling metrics output")
+        return
+    _metrics_buffer_flush()
+
+
+def _metrics_buffer_close() -> None:
+    """Flush, detach, and close metrics output without propagating diagnostics."""
+    global _metrics_atexit_registered, _metrics_file_handle  # noqa: PLW0603
+    _metrics_buffer_flush()
+    file_handle = _metrics_file_handle
+    _metrics_file_handle = None
+    _metrics_atexit_registered = False
+    if file_handle is None:
+        return
+    try:
+        file_handle.close()
+    except Exception as exc:
+        _safe_log_warning("metrics.jsonl close failed: %s", exc)
+
+
+def _gather_finite_consensus(
+    accelerator: Accelerator, *scalars: torch.Tensor
+) -> tuple[bool, list[float]]:
+    """Cheap cross-rank finiteness consensus for multiple scalar tensors.
+
+    Uses only **one** all-reduce (SUM) to determine whether every scalar on
+    every rank is finite.  Unlike :func:`_gather_scalar_stats`, no min / max /
+    mean / std are computed — this is intended for the common fast path where
+    we only need a boolean "is everything OK?" answer.
+
+    All ranks get the same answer, so skip / abort decisions are consistent.
+
+    Args:
+        accelerator: Accelerator instance.
+        *scalars: One or more scalar (or 1-element) tensors to check.
+
+    Returns:
+        ``(all_finite, local_values)`` where ``all_finite`` is True only if
+        every scalar on every rank is finite, and ``local_values`` is a list
+        of the local scalar values converted to Python floats.
+    """
+    import torch.distributed as dist
+
+    local_values: list[float] = []
+    local_bad = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+
+    for s in scalars:
+        val = s.detach().float().reshape(1)
+        local_values.append(float(val.item()))
+        if not torch.isfinite(val).all():
+            local_bad.fill_(1.0)
+
+    # Single all-reduce: sum of "bad rank" flags across all ranks.
+    # If the sum is > 0, at least one rank has at least one non-finite scalar.
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(local_bad, op=dist.ReduceOp.SUM)
+
+    all_finite = bool(local_bad.item() == 0.0)
+    return all_finite, local_values
+
+
 def _gather_scalar_stats(accelerator: Accelerator, scalar: torch.Tensor) -> dict[str, float]:
     """Gather cross-rank scalar statistics using torch.distributed all_reduce.
 
@@ -1234,12 +1583,14 @@ def _compute_data_manifest(
     seed: int,
     train_shuffle: bool = True,
     val_shuffle: bool = False,
-    num_probe_batches: int = 5,
+    num_probe_batches: int = 0,
 ) -> dict:
     """Compute a comprehensive data manifest describing training and validation data.
 
-    Samples ``num_probe_batches`` batches from each loader to inspect tensor shapes,
-    image keys, padding stats, episode diversity, and subtask token presence.
+    If ``num_probe_batches <= 0``, probing is skipped entirely (metadata-only manifest);
+    this avoids spawning chunk-streaming video readers and speeds up model init.
+    Otherwise, samples ``num_probe_batches`` batches from each loader to inspect
+    tensor shapes, image keys, padding stats, episode diversity, and subtask token presence.
     Results are honest about streaming dataset semantics (no false "1 epoch" claims).
 
     Args:
@@ -1255,6 +1606,7 @@ def _compute_data_manifest(
         train_shuffle: Whether the training loader uses shuffle.
         val_shuffle: Whether the validation loader uses shuffle.
         num_probe_batches: Number of batches to sample for stats inspection.
+            If <= 0, probing is skipped (metadata-only manifest with probe_skipped=True).
 
     Returns:
         dict with data_manifest fields (see docstring in code for schema).
@@ -1363,36 +1715,78 @@ def _compute_data_manifest(
     # -- Data fingerprint (SHA256 of data selection params) --
     manifest["data_sha"] = _build_data_fingerprint(config, data_config)
 
+    # -- Probe control flag --
+    manifest["probe_skipped"] = num_probe_batches <= 0
+
     # -- Streaming dataset validation: probe actual batches --
-    probe_stats = _probe_data_loader(
-        train_loader,
-        num_batches=num_probe_batches,
-        label="train",
-    )
-    manifest["train_probe"] = probe_stats
+    if num_probe_batches > 0:
+        probe_stats = _probe_data_loader(
+            train_loader,
+            num_batches=num_probe_batches,
+            label="train",
+        )
+        manifest["train_probe"] = probe_stats
 
-    # Action dim and state dim from probe
-    manifest["action_dim"] = probe_stats.get("action_dim")
-    manifest["state_dim"] = probe_stats.get("state_dim")
-    manifest["image_keys"] = probe_stats.get("image_keys", [])
-    manifest["has_subtask_tokens"] = probe_stats.get("has_subtask_tokens", False)
-    manifest["subtask_max_len"] = probe_stats.get("subtask_max_len")
-    manifest["padding_stats"] = probe_stats.get("padding_stats", {})
+        # Action dim and state dim from probe
+        manifest["action_dim"] = probe_stats.get("action_dim")
+        manifest["state_dim"] = probe_stats.get("state_dim")
+        manifest["image_keys"] = probe_stats.get("image_keys", [])
+        manifest["has_subtask_tokens"] = probe_stats.get("has_subtask_tokens", False)
+        manifest["subtask_max_len"] = probe_stats.get("subtask_max_len")
+        manifest["padding_stats"] = probe_stats.get("padding_stats", {})
 
-    # Sample count estimates (microbatches * batch_size per rank * world_size)
-    train_bs = probe_stats.get("batch_size")
-    if train_len_micro is not None and train_bs is not None and world_size > 0:
-        manifest["n_train_samples_per_rank_estimate"] = train_len_micro * train_bs
-        manifest["n_train_samples_total_estimate"] = train_len_micro * train_bs * world_size
-        # n_train_frames = total samples across all ranks (spec naming)
-        manifest["n_train_frames"] = train_len_micro * train_bs * world_size
+        # Sample count estimates (microbatches * batch_size per rank * world_size)
+        train_bs = probe_stats.get("batch_size")
+        if train_len_micro is not None and train_bs is not None and world_size > 0:
+            manifest["n_train_samples_per_rank_estimate"] = train_len_micro * train_bs
+            manifest["n_train_samples_total_estimate"] = train_len_micro * train_bs * world_size
+            # n_train_frames = total samples across all ranks (spec naming)
+            manifest["n_train_frames"] = train_len_micro * train_bs * world_size
+        else:
+            manifest["n_train_samples_per_rank_estimate"] = None
+            manifest["n_train_samples_total_estimate"] = None
+            manifest["n_train_frames"] = None
     else:
+        # Metadata-only mode: skip data loader probing entirely.
+        # This avoids spawning chunk-streaming video readers, which is the
+        # dominant cost of manifest computation for B1K-scale datasets.
+        manifest["train_probe"] = {
+            "num_batches_requested": 0,
+            "num_batches_sampled": 0,
+            "action_dim": None,
+            "state_dim": None,
+            "image_keys": [],
+            "has_subtask_tokens": False,
+            "subtask_max_len": None,
+            "padding_stats": {
+                "action_is_pad_available": False,
+                "pad_ratio_mean": None,
+                "pad_ratio_min": None,
+                "pad_ratio_max": None,
+            },
+            "episode_ids_sample": [],
+            "task_ids_sample": [],
+            "batch_size": None,
+            "error": None,
+            "probe_skipped": True,
+        }
+        manifest["action_dim"] = None
+        manifest["state_dim"] = None
+        manifest["image_keys"] = []
+        manifest["has_subtask_tokens"] = False
+        manifest["subtask_max_len"] = None
+        manifest["padding_stats"] = {
+            "action_is_pad_available": False,
+            "pad_ratio_mean": None,
+            "pad_ratio_min": None,
+            "pad_ratio_max": None,
+        }
         manifest["n_train_samples_per_rank_estimate"] = None
         manifest["n_train_samples_total_estimate"] = None
         manifest["n_train_frames"] = None
 
-    # Val sample count estimates
-    if val_loader is not None:
+    # Val probe
+    if val_loader is not None and num_probe_batches > 0:
         val_probe_stats = _probe_data_loader(
             val_loader,
             num_batches=min(num_probe_batches, manifest.get("n_val_microbatches_per_rank") or num_probe_batches),
@@ -1411,6 +1805,31 @@ def _compute_data_manifest(
             manifest["n_val_samples_per_rank_estimate"] = None
             manifest["n_val_samples_total_estimate"] = None
             manifest["n_val_frames"] = None
+    elif val_loader is not None and num_probe_batches <= 0:
+        # Metadata-only mode: no val probing
+        manifest["val_probe"] = {
+            "num_batches_requested": 0,
+            "num_batches_sampled": 0,
+            "action_dim": None,
+            "state_dim": None,
+            "image_keys": [],
+            "has_subtask_tokens": False,
+            "subtask_max_len": None,
+            "padding_stats": {
+                "action_is_pad_available": False,
+                "pad_ratio_mean": None,
+                "pad_ratio_min": None,
+                "pad_ratio_max": None,
+            },
+            "episode_ids_sample": [],
+            "task_ids_sample": [],
+            "batch_size": None,
+            "error": None,
+            "probe_skipped": True,
+        }
+        manifest["n_val_samples_per_rank_estimate"] = None
+        manifest["n_val_samples_total_estimate"] = None
+        manifest["n_val_frames"] = None
     else:
         manifest["val_probe"] = None
         manifest["n_val_samples_per_rank_estimate"] = None
@@ -1583,6 +2002,8 @@ def _build_checkpoint_manifest(
     accelerator: Accelerator,
     precision: str,
     data_manifest: dict | None = None,
+    checkpoint_kind: str | None = None,
+    checkpoint_epoch: int | None = None,
 ) -> dict:
     """Build the checkpoint manifest.json dict with metadata."""
     git_info = _get_git_info()
@@ -1614,6 +2035,10 @@ def _build_checkpoint_manifest(
             "strategy": str(accelerator.distributed_type),
         },
     }
+    if checkpoint_kind is not None:
+        manifest["run_metadata"]["checkpoint_kind"] = checkpoint_kind
+    if checkpoint_epoch is not None:
+        manifest["run_metadata"]["epoch"] = checkpoint_epoch
     if data_manifest is not None:
         manifest["data_manifest"] = data_manifest
     return manifest
@@ -1807,8 +2232,7 @@ def run_validation(
             }
             for key in sorted(global_means.keys()):
                 val_record[f"val_{key}"] = global_means[key]
-            metrics_file.write(json.dumps(val_record, default=str) + "\n")
-            metrics_file.flush()
+            _metrics_buffer_write_boundary(val_record)
 
         # Log to W&B
         if config.wandb_enabled:
@@ -1848,17 +2272,46 @@ def save_checkpoint(
     config: _config.TrainConfig,
     data_config: _config.DataConfig,
     data_manifest: dict | None = None,
+    steps_per_epoch: int | None = None,
 ) -> None:
     if os.environ.get("OPENPI_DISABLE_CHECKPOINT", "0") in {"1", "true", "TRUE", "True"}:
         return
     # `global_step` is 1-based here: pass the post-update optimizer step so checkpoint directories
     # line up with the visible training step count.
-    should_save = (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps
-    if not should_save:
+    checkpoint_kind = _checkpoint_save_kind(
+        config,
+        global_step=global_step,
+        steps_per_epoch=steps_per_epoch,
+    )
+    if checkpoint_kind is None:
         return
 
-    final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-    tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+    epoch_checkpointing = checkpoint_kind in {"epoch", "rolling"}
+    checkpoint_epoch = None
+    if epoch_checkpointing:
+        assert steps_per_epoch is not None  # Validated by _checkpoint_save_kind.
+        checkpoint_epoch = (
+            global_step // steps_per_epoch
+            if checkpoint_kind == "epoch"
+            else ((global_step - 1) // steps_per_epoch) + 1
+        )
+
+    if checkpoint_kind == "rolling":
+        final_ckpt_dir = config.checkpoint_dir / (
+            f"{_ROLLING_CHECKPOINT_DIR_PREFIX}{global_step:012d}"
+        )
+        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_rolling_{global_step:012d}"
+    elif checkpoint_kind == "epoch":
+        # Keep numeric step directory compatibility for model loading while
+        # recording explicit epoch metadata in metadata.pt and manifest.json.
+        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+        tmp_ckpt_dir = config.checkpoint_dir / (
+            f"tmp_epoch_{checkpoint_epoch:04d}_{global_step}"
+        )
+    else:
+        # Historical step-policy paths are intentionally unchanged.
+        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
 
     # Rank 0 owns directory cleanup/creation to avoid races on shared filesystems.
     if accelerator.is_main_process:
@@ -1918,6 +2371,9 @@ def save_checkpoint(
                 "num_processes": accelerator.num_processes,
             },
         }
+        if epoch_checkpointing:
+            metadata["checkpoint_kind"] = checkpoint_kind
+            metadata["epoch"] = checkpoint_epoch
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
         # Save manifest.json (human-readable checkpoint metadata fingerprint).
@@ -1929,6 +2385,8 @@ def save_checkpoint(
                 accelerator=accelerator,
                 precision=config.pytorch_training_precision,
                 data_manifest=data_manifest,
+                checkpoint_kind=checkpoint_kind if epoch_checkpointing else None,
+                checkpoint_epoch=checkpoint_epoch,
             )
             manifest_path = tmp_ckpt_dir / "manifest.json"
             with open(manifest_path, "w") as f:
@@ -1942,7 +2400,21 @@ def save_checkpoint(
             _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
 
         _atomic_write_checkpoint_dir(tmp_ckpt_dir, final_ckpt_dir)
-        logging.info("Saved checkpoint at step %s -> %s", global_step, final_ckpt_dir)
+        if epoch_checkpointing:
+            # Publish only after the complete directory is visible. At an epoch
+            # boundary the rolling pointer targets the durable directory and old
+            # hidden rolling data is removed without duplicating the checkpoint.
+            _publish_rolling_checkpoint(config.checkpoint_dir, final_ckpt_dir)
+        if epoch_checkpointing:
+            logging.info(
+                "Saved %s checkpoint for epoch %s at step %s -> %s",
+                checkpoint_kind,
+                checkpoint_epoch,
+                global_step,
+                final_ckpt_dir,
+            )
+        else:
+            logging.info("Saved checkpoint at step %s -> %s", global_step, final_ckpt_dir)
 
         if accelerator.is_main_process and config.wandb_enabled:
             try:
@@ -1958,7 +2430,23 @@ def save_checkpoint(
     accelerator.wait_for_everyone()
 
 
+def _validate_runtime_config(config: _config.TrainConfig) -> None:
+    """Fail fast on runtime options that would otherwise fail mid-training."""
+    if config.prepare_hf_cache_only and config.force_load_cache:
+        raise ValueError(
+            "prepare_hf_cache_only and force_load_cache are mutually exclusive. "
+            "prepare_hf_cache_only builds the cache from scratch; "
+            "force_load_cache requires an already-built cache and fails if missing."
+        )
+    if int(config.log_interval) <= 0:
+        raise ValueError("--log-interval must be a positive integer.")
+    if int(config.val_log_interval) <= 0:
+        raise ValueError("--val-log-interval must be a positive integer.")
+
+
 def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> None:
+    _validate_runtime_config(config)
+
     kwargs_handlers = []
     if config.pytorch_model_name == "pi05_ki_joint_query":
         # Each KI optimizer step uses two distinct wrapped forwards.  DDP must
@@ -2005,6 +2493,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     if is_main:
         config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         config.log_dir.mkdir(parents=True, exist_ok=True)
+        if (
+            getattr(config, "checkpoint_policy", _CHECKPOINT_POLICY_STEP)
+            == _CHECKPOINT_POLICY_EPOCH_WITH_ROLLING
+        ):
+            _cleanup_rolling_checkpoint_artifacts(
+                config.checkpoint_dir,
+                keep_target=_rolling_checkpoint_target(config.checkpoint_dir),
+            )
     accelerator.wait_for_everyone()
     if not is_main:
         _wait_for_path(config.log_dir, what="log_dir")
@@ -2013,11 +2509,13 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     install_excepthook()
 
     # Rank-0 metrics.jsonl writer: one JSON line per optimizer step.
-    # Opened in append mode for resume safety; flushed after every write.
+    # Opened in append mode for resume safety; writes are buffered and
+    # flushed only at log_interval / validation / checkpoint boundaries.
     _metrics_file = None
     if is_main:
         _metrics_path = config.log_dir / "metrics.jsonl"
-        _metrics_file = open(_metrics_path, "a", buffering=1)  # line-buffered
+        _metrics_file = open(_metrics_path, "a")
+        _metrics_buffer_init(_metrics_file)
         logging.info("Writing per-step metrics to %s", _metrics_path)
 
     configure_hf_cache(config, accelerator=accelerator)
@@ -2100,10 +2598,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             )
 
     loader, data_config = build_datasets(config)
-    if config.prepare_hf_cache_only:
-        if is_main:
-            logging.info("Offline HF cache preparation completed; exiting as requested.")
-        return
 
     # Build validation data loader (if val_data is configured)
     val_loader = None
@@ -2120,6 +2614,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 config.val_num_batches,
                 config.val_log_interval,
             )
+
+    if config.prepare_hf_cache_only:
+        if is_main:
+            logging.info("PREPARE_HF_CACHE_ONLY mode: cache build complete for train+val; exiting.")
+        _metrics_buffer_close()
+        return
 
     # Epoch accounting: len(loader) is per-rank micro-batch count.
     steps_per_epoch_micro = len(loader)
@@ -2143,10 +2643,31 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 steps_per_epoch_micro,
                 accelerator.gradient_accumulation_steps,
             )
-        if config.save_at_epoch_end_only:
+        if (
+            config.save_at_epoch_end_only
+            and getattr(config, "checkpoint_policy", _CHECKPOINT_POLICY_STEP) == _CHECKPOINT_POLICY_STEP
+        ):
             object.__setattr__(config, "save_interval", target_steps)
             if is_main:
                 logging.info("save_at_epoch_end_only enabled: save_interval=%s", target_steps)
+
+    checkpoint_policy = getattr(config, "checkpoint_policy", _CHECKPOINT_POLICY_STEP)
+    if checkpoint_policy == _CHECKPOINT_POLICY_EPOCH_WITH_ROLLING:
+        rolling_interval = int(getattr(config, "rolling_checkpoint_interval", 0))
+        if rolling_interval <= 0:
+            raise ValueError(
+                "epoch_with_rolling checkpoint policy requires --rolling-checkpoint-interval > 0"
+            )
+        if is_main:
+            logging.info(
+                "Checkpoint policy: durable at every %s-step epoch boundary; "
+                "rolling recovery every %s optimizer steps via %s",
+                steps_per_epoch,
+                rolling_interval,
+                config.checkpoint_dir / _ROLLING_CHECKPOINT_LINK_NAME,
+            )
+    elif checkpoint_policy != _CHECKPOINT_POLICY_STEP:
+        raise ValueError(f"Unsupported checkpoint_policy: {checkpoint_policy}")
 
     # ---- Data manifest: compute after data loaders are built, before training starts ----
     # Computed on all ranks for symmetry, but only logged/saved on rank 0.
@@ -2164,7 +2685,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             seed=int(config.seed),
             train_shuffle=True,
             val_shuffle=False,
-            num_probe_batches=int(os.environ.get("OPENPI_DATA_MANIFEST_PROBE_BATCHES", "5")),
+            num_probe_batches=int(os.environ.get("OPENPI_DATA_MANIFEST_PROBE_BATCHES", "0")),
         )
         if is_main:
             # Write data_manifest.json to log dir
@@ -2191,8 +2712,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     "train_sha256": (_data_manifest.get("data_sha") or {}).get("sha256"),
                     "is_streaming": (_data_manifest.get("streaming_dataset") or {}).get("is_streaming"),
                 }
-                _metrics_file.write(json.dumps(manifest_record, default=str) + "\n")
-                _metrics_file.flush()
+                _metrics_buffer_append(manifest_record)
 
             train_probe = _data_manifest.get("train_probe", {}) or {}
             val_probe = _data_manifest.get("val_probe", {}) or {}
@@ -2696,6 +3216,16 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     # KI: structural (detached KV in expert forward); when KI=ON,
                     #   phase-2 backward produces zero backbone grads.
                     # ================================================================
+                    # -- Diagnostic optimization: cheap per-step finite check,
+                    #    detailed _gather_scalar_stats only at log_interval or on error.
+                    bb_loss_stats = None
+                    ex_loss_stats = None
+                    # Whether we need detailed scalar stats (min/max/mean/std) this step.
+                    need_detailed_stats = (
+                        (accelerator.sync_gradients and global_step % int(config.log_interval) == 0)
+                        or _debug_overflow_enabled(config)
+                    )
+
                     if profile_memory:
                         _reset_peak_memory_stats(accelerator)
 
@@ -2710,21 +3240,31 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         bb_losses = model(observation, actions, phase="backbone")
                         bb_loss = bb_losses["backbone_loss"]
 
-                    # Cross-rank finiteness check for backbone loss
-                    bb_loss_stats = _gather_scalar_stats(accelerator, bb_loss)
-                    bb_nonfinite = not bool(bb_loss_stats["all_finite"])
-                    if bb_nonfinite and is_main:
-                        logging.error(
-                            "Non-finite backbone loss at step=%s: "
-                            "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s",
-                            global_step,
-                            int(bb_loss_stats["finite_count"]),
-                            int(bb_loss_stats["total_count"]),
-                            int(bb_loss_stats["bad_rank"]),
-                            bb_loss_stats["min"],
-                            bb_loss_stats["max"],
-                            bb_loss_stats["mean"],
-                        )
+                    # Cheap cross-rank finiteness check for backbone loss
+                    # (1 all-reduce instead of 5 from _gather_scalar_stats).
+                    bb_all_finite, bb_local_vals = _gather_finite_consensus(accelerator, bb_loss)
+                    bb_nonfinite = not bb_all_finite
+                    bb_loss_val = bb_local_vals[0]
+
+                    if bb_nonfinite:
+                        # Non-finite detected: compute detailed stats for error diagnostics.
+                        bb_loss_stats = _gather_scalar_stats(accelerator, bb_loss)
+                        if is_main:
+                            logging.error(
+                                "Non-finite backbone loss at step=%s: "
+                                "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s",
+                                global_step,
+                                int(bb_loss_stats["finite_count"]),
+                                int(bb_loss_stats["total_count"]),
+                                int(bb_loss_stats["bad_rank"]),
+                                bb_loss_stats["min"],
+                                bb_loss_stats["max"],
+                                bb_loss_stats["mean"],
+                            )
+                    elif need_detailed_stats:
+                        # Log interval or debug mode: compute detailed stats.
+                        bb_loss_stats = _gather_scalar_stats(accelerator, bb_loss)
+
                     if bb_nonfinite:
                         if not torch.isfinite(bb_loss.detach()):
                             _log_nonfinite_batch_state(loss=bb_loss, actions=actions, observation=observation)
@@ -2740,6 +3280,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         total_nonfinite_loss_batches += 1
                         optimizer.zero_grad(set_to_none=True)
                         accelerator.wait_for_everyone()
+                        # Flush metrics before raising / skipping on error.
+                        _metrics_buffer_flush()
                         if consecutive_nonfinite_losses >= max_consecutive_nonfinite_losses:
                             raise FloatingPointError(
                                 "Too many consecutive non-finite backbone losses. "
@@ -2788,21 +3330,31 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         ex_losses = model(observation, actions, phase="expert")
                         ex_loss = ex_losses["expert_loss"]
 
-                    # Cross-rank finiteness check for expert loss
-                    ex_loss_stats = _gather_scalar_stats(accelerator, ex_loss)
-                    ex_nonfinite = not bool(ex_loss_stats["all_finite"])
-                    if ex_nonfinite and is_main:
-                        logging.error(
-                            "Non-finite expert loss at step=%s: "
-                            "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s",
-                            global_step,
-                            int(ex_loss_stats["finite_count"]),
-                            int(ex_loss_stats["total_count"]),
-                            int(ex_loss_stats["bad_rank"]),
-                            ex_loss_stats["min"],
-                            ex_loss_stats["max"],
-                            ex_loss_stats["mean"],
-                        )
+                    # Cheap cross-rank finiteness check for expert loss
+                    # (1 all-reduce instead of 5 from _gather_scalar_stats).
+                    ex_all_finite, ex_local_vals = _gather_finite_consensus(accelerator, ex_loss)
+                    ex_nonfinite = not ex_all_finite
+                    ex_loss_val = ex_local_vals[0]
+
+                    if ex_nonfinite:
+                        # Non-finite detected: compute detailed stats for error diagnostics.
+                        ex_loss_stats = _gather_scalar_stats(accelerator, ex_loss)
+                        if is_main:
+                            logging.error(
+                                "Non-finite expert loss at step=%s: "
+                                "finite=%d/%d bad_rank=%d min=%s max=%s mean=%s",
+                                global_step,
+                                int(ex_loss_stats["finite_count"]),
+                                int(ex_loss_stats["total_count"]),
+                                int(ex_loss_stats["bad_rank"]),
+                                ex_loss_stats["min"],
+                                ex_loss_stats["max"],
+                                ex_loss_stats["mean"],
+                            )
+                    elif need_detailed_stats:
+                        # Log interval or debug mode: compute detailed stats.
+                        ex_loss_stats = _gather_scalar_stats(accelerator, ex_loss)
+
                     if ex_nonfinite:
                         if not torch.isfinite(ex_loss.detach()):
                             _log_nonfinite_batch_state(loss=ex_loss, actions=actions, observation=observation)
@@ -2818,6 +3370,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         total_nonfinite_loss_batches += 1
                         optimizer.zero_grad(set_to_none=True)
                         accelerator.wait_for_everyone()
+                        # Flush metrics before raising / skipping on error.
+                        _metrics_buffer_flush()
                         if consecutive_nonfinite_losses >= max_consecutive_nonfinite_losses:
                             raise FloatingPointError(
                                 "Too many consecutive non-finite expert losses. "
@@ -2838,7 +3392,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     accelerator.backward(ex_loss)
 
                     # Capture scalar metrics, free expert graph
-                    ex_loss_val = float(ex_loss.detach().float().item())
                     for k, v in ex_losses.items():
                         if k != "expert_loss" and isinstance(v, torch.Tensor) and v.numel() == 1:
                             extra_metrics[k] = v.item()
@@ -2857,6 +3410,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     # and the ``_available`` flag is False.
                     # The total grad_norm from accelerator.clip_grad_norm_ is always
                     # the authoritative total.
+                    #
+                    # DIAGNOSTIC OPTIMIZATION: per-group grad norms are computed
+                    # only at log_interval cadence or when debug overflow mode is
+                    # enabled, since they require 2 additional all-reduces per step.
+                    # The total gradient clipping math (clip_grad_norm_) is unaffected.
                     unwrapped_model = accelerator.unwrap_model(model)
                     bb_params_group = list(unwrapped_model.get_backbone_params())
                     ex_params_group = list(unwrapped_model.get_expert_params())
@@ -2871,28 +3429,49 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     else:
                         extra_metrics["expert_loss_fraction"] = 0.0
 
-                    # Only compute per-group grad norms on sync steps
-                    if accelerator.sync_gradients:
+                    # Per-group grad norms: only compute on sync steps AND at log
+                    # cadence (or debug overflow mode).  Pure diagnostics.
+                    _compute_group_norms = (
+                        accelerator.sync_gradients
+                        and (
+                            global_step % int(config.log_interval) == 0
+                            or _debug_overflow_enabled(config)
+                        )
+                    )
+                    if _compute_group_norms:
                         gn_backbone, bb_gn_available = _compute_param_group_grad_norm(bb_params_group, accelerator)
                         gn_expert, ex_gn_available = _compute_param_group_grad_norm(ex_params_group, accelerator)
                         extra_metrics["grad_norm_backbone"] = gn_backbone
                         extra_metrics["grad_norm_expert"] = gn_expert
                         extra_metrics["grad_norm_backbone_available"] = bb_gn_available
                         extra_metrics["grad_norm_expert_available"] = ex_gn_available
+                    elif accelerator.sync_gradients:
+                        # Sync step but not at log cadence: mark as not computed this step.
+                        extra_metrics["grad_norm_backbone"] = float("nan")
+                        extra_metrics["grad_norm_expert"] = float("nan")
+                        extra_metrics["grad_norm_backbone_available"] = False
+                        extra_metrics["grad_norm_expert_available"] = False
+                    else:
+                        # Non-sync steps: no meaningful grad norm across ranks
+                        extra_metrics["grad_norm_backbone"] = float("nan")
+                        extra_metrics["grad_norm_expert"] = float("nan")
+                        extra_metrics["grad_norm_backbone_available"] = False
+                        extra_metrics["grad_norm_expert_available"] = False
 
-                        # ---- KI heuristic diagnostic (loss-based, always available when losses > 0) ----
-                        # This is a *heuristic*, not a proof of KI correctness.
-                        #
-                        # Idea: the ratio of expert loss magnitude vs total loss
-                        # serves as a proxy for how much gradient contribution
-                        # the expert phase could potentially make to backbone params.
-                        # When KI=ON, flow gradients should not leak to backbone,
-                        # so the actual expert→backbone contribution should be near zero
-                        # even when this loss ratio is high.
-                        #
-                        # This is a loss-magnitude proxy for KI, not a direct measurement.
-                        # A proper KI verification requires unit tests with
-                        # controlled single-phase backwards (see test_ki_integration_*.py).
+                    # ---- KI heuristic diagnostic (loss-based, always available when losses > 0) ----
+                    # This is a *heuristic*, not a proof of KI correctness.
+                    #
+                    # Idea: the ratio of expert loss magnitude vs total loss
+                    # serves as a proxy for how much gradient contribution
+                    # the expert phase could potentially make to backbone params.
+                    # When KI=ON, flow gradients should not leak to backbone,
+                    # so the actual expert→backbone contribution should be near zero
+                    # even when this loss ratio is high.
+                    #
+                    # This is a loss-magnitude proxy for KI, not a direct measurement.
+                    # A proper KI verification requires unit tests with
+                    # controlled single-phase backwards (see test_ki_integration_*.py).
+                    if accelerator.sync_gradients:
                         total_loss_for_ratio = bb_loss_val + ex_loss_val
                         if total_loss_for_ratio > 0:
                             # Heuristic: expert_loss / (backbone_loss + expert_loss)
@@ -2902,11 +3481,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         else:
                             extra_metrics["ki_heuristic_loss_ratio"] = 0.0
                     else:
-                        # Non-sync steps: no meaningful grad norm across ranks
-                        extra_metrics["grad_norm_backbone"] = float("nan")
-                        extra_metrics["grad_norm_expert"] = float("nan")
-                        extra_metrics["grad_norm_backbone_available"] = False
-                        extra_metrics["grad_norm_expert_available"] = False
                         extra_metrics["ki_heuristic_loss_ratio"] = float("nan")
 
                     # Both phases passed — reset counter
@@ -2919,8 +3493,22 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     loss_for_log = bb_loss_val + ex_loss_val
                     # loss_total alias for consistency with structured keys
                     extra_metrics["loss_total"] = loss_for_log
-                    # Use expert loss stats as the primary loss_rank_stats for downstream code
-                    loss_rank_stats = ex_loss_stats
+                    # Use expert loss stats as the primary loss_rank_stats for downstream code.
+                    # On non-log-interval steps without errors, ex_loss_stats may be None;
+                    # supply a stub with all_finite=True (we already passed the cheap check).
+                    if ex_loss_stats is not None:
+                        loss_rank_stats = ex_loss_stats
+                    else:
+                        loss_rank_stats = {
+                            "all_finite": 1.0,
+                            "finite_count": float(accelerator.num_processes),
+                            "total_count": float(accelerator.num_processes),
+                            "bad_rank": -1.0,
+                            "min": float("nan"),
+                            "max": float("nan"),
+                            "mean": float("nan"),
+                            "std": float("nan"),
+                        }
 
                 else:
                     # ---- Standard single-forward path (PI0, PI05, VLM2, etc.) ----
@@ -2985,8 +3573,32 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     if _debug_overflow_enabled(config):
                         extra_metrics.update(_loss_tensor_debug_metrics(losses, actions))
 
-                    loss_rank_stats = _gather_scalar_stats(accelerator, loss)
-                    any_rank_has_nonfinite_loss = not bool(loss_rank_stats["all_finite"])
+                    # Cheap cross-rank finiteness check (1 all-reduce).
+                    # Detailed _gather_scalar_stats only at log_interval, on error,
+                    # or when debug overflow mode is enabled.
+                    _need_detailed_stats = (
+                        (accelerator.sync_gradients and global_step % int(config.log_interval) == 0)
+                        or _debug_overflow_enabled(config)
+                    )
+                    loss_all_finite, _ = _gather_finite_consensus(accelerator, loss)
+                    any_rank_has_nonfinite_loss = not loss_all_finite
+
+                    if any_rank_has_nonfinite_loss or _need_detailed_stats:
+                        # Compute detailed stats for error diagnostics or log cadence.
+                        loss_rank_stats = _gather_scalar_stats(accelerator, loss)
+                    else:
+                        # Lightweight stub: all ranks agreed finite, no stats needed.
+                        loss_rank_stats = {
+                            "all_finite": 1.0,
+                            "finite_count": float(accelerator.num_processes),
+                            "total_count": float(accelerator.num_processes),
+                            "bad_rank": -1.0,
+                            "min": float("nan"),
+                            "max": float("nan"),
+                            "mean": float("nan"),
+                            "std": float("nan"),
+                        }
+
                     if any_rank_has_nonfinite_loss and is_main:
                         logging.error(
                             "Non-finite loss detected on at least one rank at step=%s: "
@@ -3016,6 +3628,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         total_nonfinite_loss_batches += 1
                         optimizer.zero_grad(set_to_none=True)
                         accelerator.wait_for_everyone()
+                        # Flush metrics before raising on error.
+                        _metrics_buffer_flush()
                         if consecutive_nonfinite_losses >= max_consecutive_nonfinite_losses:
                             raise FloatingPointError(
                                 "Too many consecutive non-finite losses before backward. "
@@ -3218,8 +3832,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 "epoch": int(_epoch),
                                 **info_dict,
                             }
-                            _metrics_file.write(json.dumps(_record, default=str) + "\n")
-                            _metrics_file.flush()
+                            # Buffered: flushed at log_interval / val / checkpoint boundaries.
+                            _metrics_buffer_append(_record)
 
                     if is_main and (global_step % int(config.log_interval) == 0):
                         elapsed = time.time() - start_time
@@ -3364,6 +3978,20 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     current_step = global_step + 1
 
+                    # Flush buffered metrics.jsonl at log_interval boundaries.
+                    if accelerator.sync_gradients and global_step % int(config.log_interval) == 0:
+                        _metrics_buffer_flush()
+
+                    # Flush only when a checkpoint is actually due. ``save_checkpoint``
+                    # is invoked every optimizer step but internally uses the same
+                    # policy helper to no-op on non-checkpoint steps.
+                    if _checkpoint_save_kind(
+                        config,
+                        global_step=current_step,
+                        steps_per_epoch=steps_per_epoch,
+                    ) is not None:
+                        _metrics_buffer_flush()
+
                     # checkpoint/save + progress bar update
                     save_checkpoint(
                         accelerator=accelerator,
@@ -3373,6 +4001,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         config=config,
                         data_config=data_config,
                         data_manifest=_data_manifest,
+                        steps_per_epoch=steps_per_epoch,
                     )
 
                     if pbar is not None:
@@ -3389,6 +4018,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     # ---- Validation (at val_log_interval, after optimizer step) ----
                     if val_loader is not None and global_step % int(config.val_log_interval) == 0 and global_step > 0:
+                        # Flush training metrics so file is consistent before validation writes.
+                        _metrics_buffer_flush()
                         run_validation(
                             accelerator=accelerator,
                             model=model,
@@ -3405,6 +4036,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     # ---- Epoch-end validation with slow metrics (flow_l1) ----
                     if val_loader is not None and steps_per_epoch > 0 and global_step % steps_per_epoch == 0 and global_step > 0:
+                        # Flush training metrics before epoch-end validation writes.
+                        _metrics_buffer_flush()
                         run_validation(
                             accelerator=accelerator,
                             model=model,
@@ -3424,6 +4057,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     # Final validation at end of training (if val data configured)
     # Includes slow metrics (flow_l1) for final evaluation.
     if val_loader is not None:
+        # Flush training metrics before final validation writes.
+        _metrics_buffer_flush()
         run_validation(
             accelerator=accelerator,
             model=model,
@@ -3443,9 +4078,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     if pbar is not None:
         pbar.close()
     # Close metrics.jsonl file (rank 0 only).
+    # Flushes pending buffer before closing.
     if _metrics_file is not None:
-        _metrics_file.close()
-        logging.info("metrics.jsonl closed")
+        _metrics_buffer_close()
     if is_main and config.wandb_enabled:
         try:
             wandb = _get_wandb()

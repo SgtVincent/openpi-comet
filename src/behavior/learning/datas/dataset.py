@@ -47,6 +47,22 @@ from torch.utils.data import Dataset
 from torch.utils.data import get_worker_info
 
 from behavior.learning.datas.dataset_utils import SubtaskPhraseConverter, _duration_to_segments
+from behavior.learning.datas.hf_cache_sync import DistributedCacheError
+from behavior.learning.datas.hf_cache_sync import HfCacheSyncSettings
+from behavior.learning.datas.hf_cache_sync import build_prepared_cache_manifest
+from behavior.learning.datas.hf_cache_sync import coordinate_cache_attempt
+from behavior.learning.datas.hf_cache_sync import coordinate_global_cache_setup
+from behavior.learning.datas.hf_cache_sync import load_with_local_cache_sync
+from behavior.learning.datas.hf_cache_sync import make_cache_request_id
+from behavior.learning.datas.hf_cache_sync import make_cache_selection_id
+from behavior.learning.datas.hf_cache_sync import next_cache_invocation_index
+from behavior.learning.datas.hf_cache_sync import observe_global_cache_failure
+from behavior.learning.datas.hf_cache_sync import prepared_arrow_paths
+from behavior.learning.datas.hf_cache_sync import publish_global_cache_failure
+from behavior.learning.datas.hf_cache_sync import resolve_cache_run_id
+from behavior.learning.datas.hf_cache_sync import setup_node_cache_paths
+from behavior.learning.datas.hf_cache_sync import snapshot_cache_tree
+from behavior.learning.datas.hf_cache_sync import wait_for_global_cache_readiness
 
 ANNOTATIONS_PATH = "annotations"
 ORCHESTRATORS_PATH = "orchestrators"
@@ -534,25 +550,110 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if num_proc_cap > 0:
             num_proc = min(num_proc, num_proc_cap)
 
-        cache_dir = None
-        hf_datasets_cache = os.environ.get("HF_DATASETS_CACHE")
-        if hf_datasets_cache:
-            cache_root = Path(hf_datasets_cache).expanduser()
-            per_rank_cache = world_size > 1 and os.environ.get("OPENPI_HF_DATASETS_CACHE_PER_RANK", "1") == "1"
-            if per_rank_cache:
-                # Per-node cache dir: all LOCAL_RANKs on the same node share one Arrow cache copy.
-                # Different nodes get independent dirs (node0/, node1/, ...) to avoid cross-node
-                # filelock races and reduce duplicate Arrow cache copies on NAS.
-                local_world_size = max(
-                    1,
-                    int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("NPROC_PER_NODE", "1"))),
+        # Node-local Arrow cache construction must never hold an NCCL collective
+        # open. The c10d store coordinates one fresh generation per invocation;
+        # generation-scoped local markers and store keys cannot be satisfied by a
+        # previous load of the same request. Persistent prepared identity remains
+        # request-scoped so rank 0 can deliberately validate and reuse it.
+        is_distributed = th.distributed.is_available() and th.distributed.is_initialized()
+        force_load_cache = os.environ.get("OPENPI_FORCE_LOAD_CACHE", "0") == "1"
+        if world_size > 1 and not is_distributed:
+            raise RuntimeError(
+                f"WORLD_SIZE={world_size} requests distributed HF cache loading, but the torch "
+                "process group is not initialized; refusing concurrent unsynchronized load_dataset calls."
+            )
+        if is_distributed:
+            actual_world_size = th.distributed.get_world_size()
+            actual_rank = th.distributed.get_rank()
+            if (world_size, rank) != (actual_world_size, actual_rank):
+                raise RuntimeError(
+                    "Distributed environment/process-group mismatch during HF cache setup: "
+                    f"env world/rank={world_size}/{rank}, process-group={actual_world_size}/{actual_rank}"
                 )
-                node_rank = rank // local_world_size
-                cache_dir_path = cache_root / f"node{node_rank}"
-            else:
-                cache_dir_path = cache_root
-            cache_dir_path.mkdir(parents=True, exist_ok=True)
-            cache_dir = str(cache_dir_path)
+
+        local_world_size = max(
+            1,
+            int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("NPROC_PER_NODE", "1"))),
+        )
+        per_node_cache = os.environ.get("OPENPI_HF_DATASETS_CACHE_PER_RANK", "1") == "1"
+        run_id = resolve_cache_run_id(distributed=is_distributed)
+
+        data_dir: str | None = None
+        data_files: list[str] | None = None
+        if self.episodes is None:
+            data_dir = str(self.root / "data")
+            request_sources = [data_dir]
+            source_mode = "data_dir"
+        else:
+            data_files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
+            request_sources = data_files
+            source_mode = "data_files"
+        load_identity_options = {
+            "builder": "parquet",
+            "split": "train",
+            "datasets_version": datasets.__version__,
+            "source_mode": source_mode,
+            "episodes_count": None if self.episodes is None else len(self.episodes),
+            "cache_layout": "node_local" if world_size > 1 else "single_process",
+        }
+        selection_id = make_cache_selection_id(
+            dataset_root=self.root,
+            source_mode=source_mode,
+            source_paths=request_sources,
+            load_options=load_identity_options,
+        )
+        invocation_index = next_cache_invocation_index(selection_id)
+        sync_settings = HfCacheSyncSettings.from_env()
+
+        store = None
+        if is_distributed:
+            try:
+                store = th.distributed.distributed_c10d._get_default_store()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Unable to access the c10d control-plane store required for HF cache readiness; "
+                    "refusing to fall back to an NCCL barrier."
+                ) from exc
+
+        attempt = coordinate_cache_attempt(
+            store,
+            rank=rank,
+            selection_id=selection_id,
+            invocation_index=invocation_index,
+            run_id=run_id,
+            request_id_factory=lambda: make_cache_request_id(
+                dataset_root=self.root,
+                source_mode=source_mode,
+                source_paths=request_sources,
+                load_options=load_identity_options,
+            ),
+            timeout_s=sync_settings.timeout_s,
+            poll_s=sync_settings.poll_s,
+        )
+
+        def _setup_cache_paths():
+            return setup_node_cache_paths(
+                os.environ.get("HF_DATASETS_CACHE"),
+                world_size=world_size,
+                rank=rank,
+                local_world_size=local_world_size,
+                per_node_cache=per_node_cache,
+                run_id=run_id,
+                request_id=attempt.request_id,
+                generation_id=attempt.generation_id,
+                force_load_cache=force_load_cache,
+            )
+
+        cache_dir, sync_paths = coordinate_global_cache_setup(
+            _setup_cache_paths,
+            store=store,
+            request_id=attempt.request_id,
+            generation_id=attempt.generation_id,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            settings=sync_settings,
+        )
 
         logger.info(
             "Loading dataset with %s processes (world_size=%s, rank=%s, local_rank=%s, cache_dir=%s)",
@@ -566,67 +667,144 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         load_kwargs: dict[str, object] = {"split": "train", "num_proc": num_proc}
         if cache_dir is not None:
             load_kwargs["cache_dir"] = cache_dir
+        logger.info(
+            "HF cache sync selection_id=%s request_id=%s generation_id=%s invocation=%s "
+            "timeout_s=%s poll_s=%s force_load=%s distributed=%s run_id=%s",
+            selection_id,
+            attempt.request_id,
+            attempt.generation_id,
+            attempt.invocation_index,
+            sync_settings.timeout_s,
+            sync_settings.poll_s,
+            force_load_cache,
+            is_distributed,
+            run_id,
+        )
 
         def _do_load() -> datasets.Dataset:
             max_retries = max(1, int(os.environ.get("OPENPI_HF_LOAD_DATASET_RETRIES", "5")))
             retry_sleep_s = float(os.environ.get("OPENPI_HF_LOAD_DATASET_RETRY_SLEEP_S", "2"))
-            for attempt in range(1, max_retries + 1):
+            for load_attempt in range(1, max_retries + 1):
                 try:
-                    if self.episodes is None:
-                        path = str(self.root / "data")
-                        return load_dataset("parquet", data_dir=path, **load_kwargs)
-                    files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-                    return load_dataset("parquet", data_files=files, **load_kwargs)
+                    if data_dir is not None:
+                        return load_dataset("parquet", data_dir=data_dir, **load_kwargs)
+                    assert data_files is not None
+                    return load_dataset("parquet", data_files=data_files, **load_kwargs)
                 except FileNotFoundError as exc:
                     # filelock can sporadically raise ENOENT on shared filesystems under contention.
                     lock_race = exc.filename is None and world_size > 1
-                    if (not lock_race) or attempt >= max_retries:
+                    if (not lock_race) or load_attempt >= max_retries:
                         raise
-                    delay = retry_sleep_s * attempt
+                    delay = retry_sleep_s * load_attempt
                     logger.warning(
                         "Transient filelock ENOENT while loading dataset (attempt %s/%s). Retrying in %.1fs.",
-                        attempt,
+                        load_attempt,
                         max_retries,
                         delay,
                     )
                     time.sleep(delay)
 
-        # Two-phase loading strategy with global barrier in multi-node DDP:
-        # 1) LOCAL_RANK=0 on each node builds/validates the node-local Arrow cache and writes
-        #    a ready marker file.
-        # 2) Global barrier synchronizes all ranks.
-        # 3) LOCAL_RANK!=0 loads from the prepared cache.
-        #
-        # When OPENPI_FORCE_LOAD_CACHE=1 is set, cache building is disallowed. In this mode,
-        # an existing ready marker is required; otherwise we fail fast immediately.
-        is_distributed = th.distributed.is_available() and th.distributed.is_initialized()
-        force_load_cache = os.environ.get("OPENPI_FORCE_LOAD_CACHE", "0") == "1"
-        ready_file: Path | None = None
-        if cache_dir is not None:
-            ready_file = Path(cache_dir) / ".hf_cache_ready"
+        def _prepared_manifest(hf_dataset: datasets.Dataset) -> dict[str, object]:
+            if cache_dir is None:
+                raise RuntimeError("Cannot publish prepared-cache manifest without cache_dir")
+            arrow_files = [cache_file["filename"] for cache_file in hf_dataset.cache_files]
+            return build_prepared_cache_manifest(
+                cache_dir,
+                arrow_files,
+                dataset_fingerprint=getattr(hf_dataset, "_fingerprint", None),
+            )
 
-        if force_load_cache:
-            if ready_file is None or not ready_file.exists():
-                raise FileNotFoundError(
-                    "--force_load_cache is enabled, but no prepared cache marker was found at "
-                    f"{ready_file}. Please run an offline cache-prep pass first."
+        def _strict_force_load(manifest: dict[str, object]) -> datasets.Dataset:
+            assert sync_paths is not None
+            before = snapshot_cache_tree(sync_paths.cache_dir)
+            arrow_paths = prepared_arrow_paths(sync_paths, manifest)
+            parts = [datasets.Dataset.from_file(str(arrow_path)) for arrow_path in arrow_paths]
+            hf_dataset = parts[0] if len(parts) == 1 else datasets.concatenate_datasets(parts)
+            after = snapshot_cache_tree(sync_paths.cache_dir)
+            if after != before:
+                raise RuntimeError(
+                    "Strict force-load detected cache-tree writes while opening prepared Arrow artifacts; "
+                    "refusing to continue."
                 )
-            hf_dataset = _do_load()
-        else:
-            if local_rank == 0:
-                if ready_file is not None and ready_file.exists():
-                    ready_file.unlink()
-                hf_dataset = _do_load()
-                if ready_file is not None:
-                    tmp_ready_file = ready_file.with_name(f"{ready_file.name}.{os.getpid()}.tmp")
-                    tmp_ready_file.write_text("ready\n")
-                    os.replace(tmp_ready_file, ready_file)
+            return hf_dataset
 
-            if is_distributed:
-                th.distributed.barrier()
+        def _publish_store_failure(error: BaseException) -> None:
+            assert store is not None
+            publish_global_cache_failure(
+                store,
+                request_id=attempt.request_id,
+                generation_id=attempt.generation_id,
+                rank=rank,
+                local_rank=local_rank,
+                error=error,
+            )
 
-            if local_rank != 0:
+        def _check_store_failure() -> None:
+            assert store is not None
+            observe_global_cache_failure(
+                store,
+                request_id=attempt.request_id,
+                generation_id=attempt.generation_id,
+                rank=rank,
+                world_size=world_size,
+                timeout_s=sync_settings.timeout_s,
+                poll_s=sync_settings.poll_s,
+            )
+
+        try:
+            if sync_paths is None:
+                if force_load_cache:
+                    raise RuntimeError(
+                        "--force_load_cache is enabled in a single-process run, but HF_DATASETS_CACHE "
+                        f"is unset, so request_id={attempt.request_id} cannot be verified. "
+                        "Strict force-load will not create or rebuild a cache."
+                    )
                 hf_dataset = _do_load()
+            else:
+                hf_dataset = load_with_local_cache_sync(
+                    _do_load,
+                    paths=sync_paths,
+                    is_builder=local_rank == 0 or not is_distributed,
+                    force_load_cache=force_load_cache,
+                    rank=rank,
+                    local_rank=local_rank,
+                    settings=sync_settings,
+                    prepared_manifest_factory=_prepared_manifest,
+                    force_load_fn=_strict_force_load,
+                    external_failure_publisher=_publish_store_failure if store is not None else None,
+                    external_failure_check=_check_store_failure if store is not None else None,
+                )
+        except DistributedCacheError:
+            raise
+        except Exception as exc:
+            if store is not None:
+                _publish_store_failure(exc)
+                _check_store_failure()
+            raise DistributedCacheError.from_exception(
+                exc,
+                request_id=attempt.request_id,
+                generation_id=attempt.generation_id,
+                rank=rank,
+                local_rank=local_rank,
+            ) from exc
+
+        if store is not None:
+            try:
+                wait_for_global_cache_readiness(
+                    store,
+                    request_id=attempt.request_id,
+                    generation_id=attempt.generation_id,
+                    rank=rank,
+                    world_size=world_size,
+                    timeout_s=sync_settings.timeout_s,
+                    poll_s=sync_settings.poll_s,
+                )
+            except DistributedCacheError:
+                raise
+            except Exception as exc:
+                _publish_store_failure(exc)
+                _check_store_failure()
+                raise AssertionError("unreachable after cache failure consensus")
 
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset

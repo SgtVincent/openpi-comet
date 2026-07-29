@@ -87,6 +87,13 @@ class TrainConfig:
     save_interval: int = 5000
     keep_period: int | None = 5000
     save_at_epoch_end_only: bool = False
+    # ``step`` preserves the historical permanent fixed-step checkpoint behavior.
+    # ``epoch_with_rolling`` keeps durable epoch-boundary checkpoints and one
+    # atomically published rolling recovery checkpoint between epoch boundaries.
+    checkpoint_policy: Literal["step", "epoch_with_rolling"] = "step"
+    # Optimizer-step cadence for the rolling recovery checkpoint. Ignored by the
+    # legacy ``step`` policy; must be positive for ``epoch_with_rolling``.
+    rolling_checkpoint_interval: int = 1000
 
     overwrite: bool = False
     resume: bool = False

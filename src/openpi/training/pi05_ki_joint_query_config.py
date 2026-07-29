@@ -1,15 +1,17 @@
-"""π0.5-KI joint query Training experimental configs.
+"""π0.5-KI joint-query training configs.
 
-Experimental TrainConfig entries for π0.5-KI joint query query-MSE variant joint training with
-Knowledge Insulation (KI) ON/OFF smoke tests.
+TrainConfig entries for π0.5-KI joint-query MSE training, spanning legacy
+Knowledge Insulation (KI) ON/OFF smoke tests and formal training runs.
 
-These are **experimental / smoke-test** configs — not production training configs.
-They use real B1K data and real pi05_base checkpoint but with tiny batch sizes
-and few steps for quick validation.
+This module contains both legacy experimental/smoke-test entries and formal
+single-task/full-task-set training entries. The ``*_smoke*`` configs retain tiny
+batches and step counts for quick validation; formal configs preserve their
+training budgets and disjoint data splits.
 
 Precision variants:
-- ``*_smoke``: fp16 (intended production config, unstable on V100)
+- ``*_smoke``: fp16 (intended production precision, unstable on V100)
 - ``*_smoke_fp32``: float32 (V100 smoke test, numerically stable but slower)
+- ``*_bf16``: bfloat16 (formal HL/Arnold training precision)
 """
 
 from pathlib import Path
@@ -22,6 +24,7 @@ from openpi.training.train_config import TrainConfig
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _B1K_DATA_ROOT = "/mnt/bn/saiwenresearch/mlx/users/chenjunting/data/2025-challenge-demos/"
+_HL_B1K_DATA_ROOT = "/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/"
 _B1K_SUBTASK_TEMPLATES = str(
     _REPO_ROOT / "src/behavior/learning/datas/b1k_subtask_phrase_templates.json"
 )
@@ -124,12 +127,15 @@ def _make_b1k_multitask_data_config(num_tasks: int = 5, episodes_per_task: int =
 def _make_b1k_single_task_data_config(
     task_name: str,
     episodes_index: list[int],
+    *,
+    behavior_dataset_root: str = _B1K_DATA_ROOT,
 ) -> LeRobotB1KDataConfig:
     """Single-task B1K data config with specific episode indices.
 
     Args:
         task_name: single task name (e.g. "turning_on_radio")
         episodes_index: list of episode indices for this task
+        behavior_dataset_root: persistent B1K dataset location for this config
 
     Returns:
         LeRobotB1KDataConfig with subtask_source="annotations_skill"
@@ -144,7 +150,43 @@ def _make_b1k_single_task_data_config(
             prompt_from_task=True,
             tasks=[task_name],
             episodes_index=episodes_index,
-            behavior_dataset_root=_B1K_DATA_ROOT,
+            behavior_dataset_root=behavior_dataset_root,
+            fine_grained_level=0,
+            subtask_source="annotations_skill",
+            subtask_template_path=_B1K_SUBTASK_TEMPLATES,
+            subtask_object_name_mapping_path=_B1K_OBJECT_MAPPING,
+            subtask_joiner=" then ",
+        ),
+    )
+
+
+def _make_b1k_full_task_set_data_config(
+    episodes_index: list[int],
+    *,
+    behavior_dataset_root: str = _B1K_DATA_ROOT,
+) -> LeRobotB1KDataConfig:
+    """Full B1K challenge task-set data config with per-task episode indices.
+
+    ``tasks`` is intentionally left unset so the dataset loader covers every B1K
+    challenge task. ``episodes_index`` is applied independently to each task.
+
+    Args:
+        episodes_index: episode indices to use for every B1K challenge task
+        behavior_dataset_root: persistent B1K dataset location for this config
+
+    Returns:
+        LeRobotB1KDataConfig with no task filter and annotations_skill subtasks
+    """
+    return LeRobotB1KDataConfig(
+        repo_id="behavior-1k/2025-challenge-demos",
+        assets=AssetsConfig(
+            assets_dir=f"{_PI05_BASE_CKPT}/assets",
+            asset_id="behavior-1k/2025-challenge-demos",
+        ),
+        base_config=DataConfig(
+            prompt_from_task=True,
+            episodes_index=episodes_index,
+            behavior_dataset_root=behavior_dataset_root,
             fine_grained_level=0,
             subtask_source="annotations_skill",
             subtask_template_path=_B1K_SUBTASK_TEMPLATES,
@@ -333,6 +375,7 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
     val_log_interval: int = 50,
     val_num_batches: int = 20,
     precision: str = "float32",
+    behavior_dataset_root: str = _B1K_DATA_ROOT,
 ) -> TrainConfig:
     """Factory for single-task overfit experiment with validation split.
 
@@ -355,12 +398,16 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
         save_interval: checkpoint save interval in steps
         val_log_interval: validation interval in steps
         val_num_batches: number of val batches per validation run
-        precision: "float16" or "float32"
+        precision: "bfloat16", "float16", or "float32"
+        behavior_dataset_root: persistent B1K dataset location for this config
 
     Returns:
         TrainConfig for PI05KIJointQueryPytorch (query-MSE variant) single-task overfit
     """
-    if precision == "float16":
+    if precision == "bfloat16":
+        pytorch_precision = "bfloat16"
+        accel_mp = "bf16"
+    elif precision == "float16":
         pytorch_precision = "float16"
         accel_mp = "fp16"
     elif precision == "float32":
@@ -396,8 +443,16 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
             beta_query=1.0,
             flow_loss_weight=10.0,
         ),
-        data=_make_b1k_single_task_data_config(task_name, train_episodes_index),
-        val_data=_make_b1k_single_task_data_config(task_name, val_episodes_index),
+        data=_make_b1k_single_task_data_config(
+            task_name,
+            train_episodes_index,
+            behavior_dataset_root=behavior_dataset_root,
+        ),
+        val_data=_make_b1k_single_task_data_config(
+            task_name,
+            val_episodes_index,
+            behavior_dataset_root=behavior_dataset_root,
+        ),
         pytorch_weight_path=_PI05_BASE_CKPT,
         num_train_steps=decay_steps,
         num_train_epochs=num_train_epochs,
@@ -418,6 +473,99 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
         batch_size_per_gpu=1,
         gradient_accumulation_steps=1,
         save_interval=save_interval,
+        log_interval=10,
+        val_log_interval=val_log_interval,
+        val_num_batches=val_num_batches,
+    )
+
+
+def _make_pi05_ki_joint_query_full_task_set_bf16_config(
+    *,
+    name: str,
+    train_episodes: int = 180,
+    val_episodes_start: int = 180,
+    val_episodes_end: int = 200,
+    num_train_steps: int = 0,
+    num_train_epochs: int = 5,
+    peak_lr: float = 1e-5,
+    warmup_steps: int = 25,
+    rolling_checkpoint_interval: int = 10000,
+    val_log_interval: int = 1000,
+    val_num_batches: int = 20,
+    batch_size_per_gpu: int = 4,
+    gradient_accumulation_steps: int = 1,
+    behavior_dataset_root: str = _HL_B1K_DATA_ROOT,
+) -> TrainConfig:
+    """Formal BF16 π0.5-KI joint-query config over the full B1K task set.
+
+    No task filter is applied. Episode indices are interpreted per task, with
+    train episodes ``[0, 180)`` and validation episodes ``[180, 200)`` by
+    default. The default budget is exactly five complete epochs: a non-positive
+    ``num_train_steps`` disables the step cap in ``train_accelerate.py`` while
+    ``num_train_epochs=5`` supplies the stopping criterion.
+
+    Default batch size is 4 per GPU (global 128 on 32 GPUs) with 25 warmup
+    steps — sample-aligned with the previous batch_size=1/warmup=100 baseline
+    (3200 warmup samples in both cases).
+
+    Validation defaults to every 1000 optimizer steps with 20 batches per pass.
+    Checkpointing opts into the epoch-oriented policy: each completed epoch gets
+    one durable checkpoint, while ``rolling_checkpoint_interval`` controls one
+    atomically replaced recovery checkpoint during the current epoch (default
+    10000 steps).
+    """
+    train_episodes_index = list(range(train_episodes))
+    val_episodes_index = list(range(val_episodes_start, val_episodes_end))
+    output_root = f"./outputs/{name}"
+
+    return TrainConfig(
+        name=name,
+        exp_name=name,
+        project_name="pi05_ki",
+        pytorch_model_name="pi05_ki_joint_query",
+        model=pi05_ki_joint_query_config.Pi05KIJointQueryConfig(
+            alpha=10.0,
+            subtask_max_len=128,
+            action_horizon=32,
+            num_query_tokens=32,
+            knowledge_insulation=True,
+            truncate_expert_kv=True,
+            beta_text=1.0,
+            beta_query=1.0,
+            flow_loss_weight=10.0,
+        ),
+        data=_make_b1k_full_task_set_data_config(
+            train_episodes_index,
+            behavior_dataset_root=behavior_dataset_root,
+        ),
+        val_data=_make_b1k_full_task_set_data_config(
+            val_episodes_index,
+            behavior_dataset_root=behavior_dataset_root,
+        ),
+        pytorch_weight_path=_PI05_BASE_CKPT,
+        num_train_steps=num_train_steps,
+        num_train_epochs=num_train_epochs,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=warmup_steps,
+            peak_lr=peak_lr,
+            # train_accelerate.py replaces non-positive decay_steps with the
+            # runtime one-epoch target after the dataloader length is known.
+            decay_steps=num_train_steps,
+            decay_lr=0.0,
+        ),
+        pytorch_training_precision="bfloat16",
+        accelerate_mixed_precision="bf16",
+        ema_decay=None,
+        wandb_enabled=False,
+        assets_base_dir=f"{output_root}/assets",
+        checkpoint_base_dir=f"{output_root}/checkpoints",
+        log_base_dir=f"{output_root}/logs",
+        num_workers=2,
+        batch_size_per_gpu=batch_size_per_gpu,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        save_interval=0,
+        checkpoint_policy="epoch_with_rolling",
+        rolling_checkpoint_interval=rolling_checkpoint_interval,
         log_interval=10,
         val_log_interval=val_log_interval,
         val_num_batches=val_num_batches,
@@ -486,5 +634,21 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp16",
         knowledge_insulation=True,
         precision="float16",
+    ),
+    # BF16 HL/Arnold variant. Keep the formal 2000-step cap and one-epoch
+    # budget; train_accelerate.py uses whichever limit is reached first.
+    _make_pi05_ki_joint_query_single_task_overfit_config(
+        name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_bf16",
+        knowledge_insulation=True,
+        precision="bfloat16",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        save_interval=200,
+        val_log_interval=100,
+    ),
+    # Formal full B1K challenge task-set BF16 run. ``tasks=None`` selects all
+    # tasks; episode ranges are applied per task. Step cap 0 lets the runtime
+    # dataloader length determine five complete epochs.
+    _make_pi05_ki_joint_query_full_task_set_bf16_config(
+        name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
     ),
 ]
