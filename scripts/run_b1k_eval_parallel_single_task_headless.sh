@@ -500,9 +500,10 @@ launch_eval() {
   if is_true_like "$SKIP_INTERMEDIATE_OBS_IN_CHUNK"; then
     feature_args="$feature_args skip_intermediate_obs_in_chunk=true"
   fi
-  feature_args="$feature_args render_viewer_camera=$RENDER_VIEWER_CAMERA gui_viewport_only=$GUI_VIEWPORT_ONLY viewer_width=$VIEWER_WIDTH viewer_height=$VIEWER_HEIGHT"
+  feature_args="$feature_args render_viewer_camera=$RENDER_VIEWER_CAMERA gui_viewport_only=$GUI_VIEWPORT_ONLY"
 
   if [[ "$EVAL_ENTRYPOINT" == "eval_custom.py" ]]; then
+    feature_args="$feature_args viewer_width=$VIEWER_WIDTH viewer_height=$VIEWER_HEIGHT"
     eval_custom_args="use_parallel_evaluator=false save_rollout=$SAVE_ROLLOUT save_subtask_predictions=$SAVE_SUBTASK_PREDICTIONS perturb_pose=$PERTURB_POSE perturb_pose_seed=$PERTURB_POSE_SEED parallel_evaluator_start_idx=$PARALLEL_EVALUATOR_START_IDX parallel_evaluator_end_idx=$PARALLEL_EVALUATOR_END_IDX max_steps_human_multiplier=$MAX_STEPS_HUMAN_MULTIPLIER video_on_replan_only=$VIDEO_ON_REPLAN_ONLY stuck_motion_window=$STUCK_MOTION_WINDOW stuck_min_steps=$STUCK_MIN_STEPS stuck_motion_threshold=$STUCK_MOTION_THRESHOLD"
   fi
 
