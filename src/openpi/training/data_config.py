@@ -21,6 +21,7 @@ import openpi.policies.b1k_policy as b1k_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.transforms as _transforms
+from openpi.training.skill_bridge_config import SkillBridgeConfig
 
 ModelType: TypeAlias = _model.ModelType
 
@@ -143,6 +144,11 @@ class DataConfig:
     subtask_template_path: str | None = None
     subtask_object_name_mapping_path: str | None = None
     subtask_joiner: str = " then "
+
+    # Skill bridge baseline config (default-off, zero behavioral change)
+    skill_bridge: "SkillBridgeConfig" = dataclasses.field(
+        default_factory=lambda: SkillBridgeConfig()
+    )
 
 
 class GroupFactory(Protocol):

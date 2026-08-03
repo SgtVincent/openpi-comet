@@ -19,6 +19,7 @@ from pathlib import Path
 import openpi.models.pi05_ki_joint_query_config as pi05_ki_joint_query_config
 import openpi.training.optimizer as _optimizer
 from openpi.training.data_config import AssetsConfig, DataConfig, LeRobotB1KDataConfig
+from openpi.training.skill_bridge_config import SkillBridgeConfig
 from openpi.training.train_config import TrainConfig
 
 
@@ -129,6 +130,9 @@ def _make_b1k_single_task_data_config(
     episodes_index: list[int],
     *,
     behavior_dataset_root: str = _B1K_DATA_ROOT,
+    skill_bridge_enabled: bool = False,
+    skill_bridge_min_pre: int = 1,
+    skill_bridge_min_post: int = 1,
 ) -> LeRobotB1KDataConfig:
     """Single-task B1K data config with specific episode indices.
 
@@ -136,6 +140,10 @@ def _make_b1k_single_task_data_config(
         task_name: single task name (e.g. "turning_on_radio")
         episodes_index: list of episode indices for this task
         behavior_dataset_root: persistent B1K dataset location for this config
+        skill_bridge_enabled: if True, enable skill bridge baseline
+            (combined subtask_text for valid single-boundary crossings).
+        skill_bridge_min_pre: minimum steps before boundary for valid bridge.
+        skill_bridge_min_post: minimum steps after boundary for valid bridge.
 
     Returns:
         LeRobotB1KDataConfig with subtask_source="annotations_skill"
@@ -156,6 +164,11 @@ def _make_b1k_single_task_data_config(
             subtask_template_path=_B1K_SUBTASK_TEMPLATES,
             subtask_object_name_mapping_path=_B1K_OBJECT_MAPPING,
             subtask_joiner=" then ",
+            skill_bridge=SkillBridgeConfig(
+                enabled=skill_bridge_enabled,
+                min_pre_boundary_steps=skill_bridge_min_pre,
+                min_post_boundary_steps=skill_bridge_min_post,
+            ),
         ),
     )
 
@@ -376,6 +389,9 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
     val_num_batches: int = 20,
     precision: str = "float32",
     behavior_dataset_root: str = _B1K_DATA_ROOT,
+    skill_bridge_enabled: bool = False,
+    skill_bridge_min_pre: int = 1,
+    skill_bridge_min_post: int = 1,
 ) -> TrainConfig:
     """Factory for single-task overfit experiment with validation split.
 
@@ -447,11 +463,17 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
             task_name,
             train_episodes_index,
             behavior_dataset_root=behavior_dataset_root,
+            skill_bridge_enabled=skill_bridge_enabled,
+            skill_bridge_min_pre=skill_bridge_min_pre,
+            skill_bridge_min_post=skill_bridge_min_post,
         ),
         val_data=_make_b1k_single_task_data_config(
             task_name,
             val_episodes_index,
             behavior_dataset_root=behavior_dataset_root,
+            skill_bridge_enabled=skill_bridge_enabled,
+            skill_bridge_min_pre=skill_bridge_min_pre,
+            skill_bridge_min_post=skill_bridge_min_post,
         ),
         pytorch_weight_path=_PI05_BASE_CKPT,
         num_train_steps=decay_steps,
@@ -631,6 +653,15 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         behavior_dataset_root=_HL_B1K_DATA_ROOT,
         save_interval=200,
         val_log_interval=100,
+    ),
+    # --- Skill bridge baseline: single-task radio FP32, KI=ON, bridge enabled ---
+    # Matches pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp32 but with
+    # skill bridge enabled for combined subtask_text on valid boundary crossings.
+    _make_pi05_ki_joint_query_single_task_overfit_config(
+        name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_fp32",
+        knowledge_insulation=True,
+        precision="float32",
+        skill_bridge_enabled=True,
     ),
     # Formal lean B8/W32 run: three stride-12 offsets provide approximate
     # quarter exposure; the exact fixed optimizer-step budget is 104,912.

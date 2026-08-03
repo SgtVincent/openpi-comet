@@ -28,6 +28,10 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         args["subtask_object_name_mapping_path"] = data_config.subtask_object_name_mapping_path
         args["subtask_joiner"] = data_config.subtask_joiner
 
+    # Skill bridge config (default = None / disabled)
+    if getattr(data_config, "skill_bridge", None) is not None:
+        args["skill_bridge_config"] = data_config.skill_bridge
+
     dataset_cls = (
         BehaviorLeRobotSkillDataset
         if getattr(data_config, "prompt_from_skill_description", False)
