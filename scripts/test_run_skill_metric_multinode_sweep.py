@@ -1336,3 +1336,579 @@ def test_effective_persistent_viewer_flags_respect_opt_out(monkeypatch) -> None:
 
     assert render_viewer_camera is True
     assert gui_viewport_only is False
+
+
+def _component_invalid_row(result_type: str, *, runtime_ok: bool = True) -> dict:
+    return {
+        "runtime_ok": runtime_ok,
+        "success": None,
+        "result_type": result_type,
+        "aggregation_eligible": False,
+        "boundary_evaluation_eligible": False,
+        "rollout_evaluation_eligible": False,
+        "model_evaluated": False,
+        "model_failure_eligible": False,
+        "rollout_attempted": False,
+    }
+
+
+def test_load_metrics_row_preserves_component_validity_semantics(tmp_path) -> None:
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "success": None,
+                "result_type": "state_invalid_restore_components",
+                "aggregation_eligible": False,
+                "boundary_evaluation_eligible": False,
+                "rollout_evaluation_eligible": False,
+                "model_evaluated": False,
+                "model_failure_eligible": False,
+                "component_evaluability": {
+                    "evaluable": False,
+                    "result_type": "state_invalid_restore_components",
+                    "aggregation_eligible": False,
+                    "model_failure_eligible": False,
+                    "boundary_evaluable": False,
+                    "boundary_aggregation_eligible": False,
+                    "boundary_result_type": "state_invalid_restore_components",
+                    "boundary_required_components": ["rigid_state", "contact_state"],
+                    "boundary_missing_components": ["rigid_state"],
+                    "rollout_evaluable": True,
+                    "rollout_result_type": "rollout_evaluable",
+                    "rollout_required_components": ["assisted_grasp"],
+                    "rollout_missing_components": [],
+                    "required_components": ["rigid_state", "contact_state"],
+                    "missing_components": ["rigid_state"],
+                    "dependency_ambiguities": [],
+                    "dependency_rows": [
+                        {
+                            "metric_type": "predicate",
+                            "name": "touching",
+                            "metric_family": "contact",
+                            "required_components": ["contact_state", "rigid_state"],
+                            "dependency_ambiguity": False,
+                            "debug_payload": {"large": "x" * 4096},
+                        }
+                    ],
+                    "restore_stages": [
+                        {
+                            "stage": "start",
+                            "validity_present": True,
+                            "boundary_missing_components": ["rigid_state"],
+                            "rollout_missing_components": [],
+                            "historical_world_state_exact": False,
+                            "debug_payload": {"large": "y" * 4096},
+                        }
+                    ],
+                    "unbounded_debug": {"large": "z" * 4096},
+                },
+                "rollout": {"rollout_attempted": False, "termination_reason": "restore_invalid"},
+            }
+        )
+    )
+
+    row = mod.load_metrics_row(
+        metrics_path,
+        sample={
+            "job_key": "grasp|task|00000001|005",
+            "skill": "grasp",
+            "task_name": "task",
+            "demo_id": "00000001",
+            "skill_idx": 5,
+            "frame_duration": [0, 5],
+        },
+        runtime_ok=True,
+        returncode=0,
+        segment_log=tmp_path / "segment_eval.log",
+    )
+
+    assert row["success"] is None
+    assert row["result_type"] == "state_invalid_restore_components"
+    assert row["aggregation_eligible"] is False
+    assert row["boundary_evaluation_eligible"] is False
+    assert row["rollout_evaluation_eligible"] is False
+    assert row["model_evaluated"] is False
+    assert row["model_failure_eligible"] is False
+    assert row["rollout_attempted"] is False
+    assert row["component_evaluability"] == {
+        "evaluable": False,
+        "result_type": "state_invalid_restore_components",
+        "aggregation_eligible": False,
+        "model_failure_eligible": False,
+        "boundary_evaluable": False,
+        "boundary_aggregation_eligible": False,
+        "boundary_result_type": "state_invalid_restore_components",
+        "boundary_required_components": ["contact_state", "rigid_state"],
+        "boundary_missing_components": ["rigid_state"],
+        "rollout_evaluable": True,
+        "rollout_result_type": "rollout_evaluable",
+        "rollout_required_components": ["assisted_grasp"],
+        "rollout_missing_components": [],
+        "required_components": ["contact_state", "rigid_state"],
+        "missing_components": ["rigid_state"],
+        "dependency_ambiguities": [],
+        "dependency_rows": [
+            {
+                "metric_type": "predicate",
+                "name": "touching",
+                "metric_family": "contact",
+                "required_components": ["contact_state", "rigid_state"],
+                "dependency_ambiguity": False,
+            }
+        ],
+        "restore_stages": [
+            {
+                "stage": "start",
+                "validity_present": True,
+                "boundary_missing_components": ["rigid_state"],
+                "rollout_missing_components": [],
+                "historical_world_state_exact": False,
+            }
+        ],
+    }
+    assert json.loads(row["component_evaluability_json"]) == row["component_evaluability"]
+
+
+def test_state_invalid_restore_components_is_not_a_runtime_or_policy_failure() -> None:
+    classes = mod.classify_result_row(
+        _component_invalid_row("state_invalid_restore_components", runtime_ok=False)
+    )
+
+    assert classes["state_invalid_restore_components"] is True
+    assert classes["state_invalid_rollout_components"] is False
+    assert classes["spec_invalid_component_dependency"] is False
+    assert classes["component_invalid"] is True
+    assert classes["runtime_pass"] is False
+    assert classes["runtime_fail"] is False
+    for key in (
+        "policy_attempted",
+        "attemptable",
+        "policy_success_attemptable",
+        "policy_failure_attemptable",
+        "metric_unsatisfied_attemptable",
+        "timeout",
+        "truncated",
+        "other_metric_unsatisfied",
+    ):
+        assert classes[key] is False
+
+
+def test_state_invalid_rollout_components_is_not_a_policy_result() -> None:
+    classes = mod.classify_result_row(_component_invalid_row("state_invalid_rollout_components"))
+
+    assert classes["state_invalid_restore_components"] is False
+    assert classes["state_invalid_rollout_components"] is True
+    assert classes["spec_invalid_component_dependency"] is False
+    assert classes["component_invalid"] is True
+    assert classes["runtime_pass"] is False
+    assert classes["runtime_fail"] is False
+    for key in (
+        "policy_attempted",
+        "attemptable",
+        "policy_success_attemptable",
+        "policy_failure_attemptable",
+        "metric_unsatisfied_attemptable",
+        "timeout",
+        "other_metric_unsatisfied",
+    ):
+        assert classes[key] is False
+
+
+def test_spec_invalid_component_dependency_is_not_a_policy_result() -> None:
+    classes = mod.classify_result_row(_component_invalid_row("spec_invalid_component_dependency"))
+
+    assert classes["state_invalid_restore_components"] is False
+    assert classes["state_invalid_rollout_components"] is False
+    assert classes["spec_invalid_component_dependency"] is True
+    assert classes["component_invalid"] is True
+    assert classes["runtime_pass"] is False
+    assert classes["runtime_fail"] is False
+    for key in (
+        "policy_attempted",
+        "attemptable",
+        "policy_success_attemptable",
+        "policy_failure_attemptable",
+        "metric_unsatisfied_attemptable",
+        "timeout",
+        "other_metric_unsatisfied",
+    ):
+        assert classes[key] is False
+
+
+def test_mixed_valid_and_component_invalid_rows_have_exact_policy_denominators() -> None:
+    rows = [
+        {
+            "runtime_ok": True,
+            "success": True,
+            "result_type": "predicate_satisfied",
+            "rollout_attempted": True,
+            "final_step": 188,
+        },
+        {
+            "runtime_ok": True,
+            "success": False,
+            "result_type": "timeout",
+            "rollout_attempted": True,
+        },
+        _component_invalid_row("state_invalid_restore_components"),
+        _component_invalid_row("state_invalid_rollout_components"),
+        _component_invalid_row("spec_invalid_component_dependency"),
+    ]
+
+    summary = mod.summarize_result_rows(rows)
+
+    assert summary["segment_count"] == 5
+    assert summary["runtime_pass_count"] == 2
+    assert summary["runtime_fail_count"] == 0
+    assert summary["runtime_pass_rate"] == 1.0
+    assert summary["runtime_pass_rate_denominator"] == 2
+    assert summary["runtime_pass_rate_excluded_component_invalid_count"] == 3
+    assert summary["state_invalid_restore_components_count"] == 1
+    assert summary["state_invalid_rollout_components_count"] == 1
+    assert summary["spec_invalid_component_dependency_count"] == 1
+    assert summary["component_invalid_count"] == 3
+    assert summary["attemptable_segment_count"] == 2
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_failure_attemptable_count"] == 1
+    assert summary["policy_success_attemptable_rate"] == 0.5
+    assert summary["policy_failure_attemptable_rate"] == 0.5
+    assert summary["metric_unsatisfied_attemptable_count"] == 1
+    assert summary["timeout_count"] == 1
+    assert summary["other_metric_unsatisfied_count"] == 0
+    assert summary["success_count_raw"] == 1
+    assert summary["success_rate_raw_completed"] == 0.5
+    assert summary["success_rate_raw_completed_denominator"] == 2
+    assert summary["success_rate_raw_completed_excluded_component_invalid_count"] == 3
+    assert summary["success_rate"] == 0.5
+    assert summary["success_rate_denominator"] == 2
+
+
+def test_explicit_aggregation_and_model_eligibility_fields_take_precedence() -> None:
+    rows = [
+        {
+            "runtime_ok": True,
+            "success": True,
+            "result_type": "predicate_satisfied",
+            "rollout_attempted": True,
+            "aggregation_eligible": False,
+        },
+        {
+            "runtime_ok": True,
+            "success": False,
+            "result_type": "timeout",
+            "rollout_attempted": True,
+            "model_evaluated": False,
+        },
+        {
+            "runtime_ok": True,
+            "success": False,
+            "result_type": "timeout",
+            "rollout_attempted": True,
+            "model_evaluated": True,
+            "model_failure_eligible": False,
+        },
+        {
+            "runtime_ok": True,
+            "success": False,
+            "result_type": "timeout",
+            "rollout_attempted": True,
+            "boundary_evaluation_eligible": False,
+        },
+        {
+            "runtime_ok": True,
+            "success": False,
+            "result_type": "timeout",
+            "rollout_attempted": True,
+            "rollout_evaluation_eligible": False,
+        },
+    ]
+
+    classes = [mod.classify_result_row(row) for row in rows]
+    summary = mod.summarize_result_rows(rows)
+
+    assert all(classification["policy_attempted"] is False for classification in classes)
+    assert all(classification["policy_failure_attemptable"] is False for classification in classes)
+    assert summary["attemptable_segment_count"] == 0
+    assert summary["policy_success_attemptable_count"] == 0
+    assert summary["policy_failure_attemptable_count"] == 0
+    assert summary["timeout_count"] == 0
+
+
+def test_rollout_attempted_false_is_preserved_and_component_invalid_never_becomes_attemptable(tmp_path) -> None:
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "success": None,
+                "result_type": "spec_invalid_component_dependency",
+                "aggregation_eligible": False,
+                "model_evaluated": False,
+                "model_failure_eligible": False,
+                "rollout": {"rollout_attempted": False},
+            }
+        )
+    )
+    row = mod.load_metrics_row(
+        metrics_path,
+        sample={
+            "job_key": "place|task|00000002|006",
+            "skill": "place",
+            "task_name": "task",
+            "demo_id": "00000002",
+            "skill_idx": 6,
+            "frame_duration": [0, 5],
+        },
+        runtime_ok=True,
+        returncode=0,
+        segment_log=tmp_path / "segment_eval.log",
+    )
+
+    classes = mod.classify_result_row(row)
+
+    assert row["rollout_attempted"] is False
+    assert classes["component_invalid"] is True
+    assert classes["policy_attempted"] is False
+    assert classes["attemptable"] is False
+
+
+def test_legacy_rows_without_eligibility_fields_retain_prior_classification() -> None:
+    rows = [
+        {"runtime_ok": True, "success": True, "result_type": "predicate_satisfied", "final_step": 188},
+        {"runtime_ok": True, "success": False, "result_type": "timeout"},
+    ]
+
+    classes = [mod.classify_result_row(row) for row in rows]
+    summary = mod.summarize_result_rows(rows)
+
+    assert classes[0]["attemptable"] is True
+    assert classes[0]["policy_success_attemptable"] is True
+    assert classes[1]["attemptable"] is True
+    assert classes[1]["policy_failure_attemptable"] is True
+    assert classes[1]["timeout"] is True
+    assert summary["runtime_pass_count"] == 2
+    assert summary["runtime_pass_rate"] == 1.0
+    assert summary["runtime_pass_rate_denominator"] == 2
+    assert summary["runtime_pass_rate_excluded_component_invalid_count"] == 0
+    assert summary["attemptable_segment_count"] == 2
+    assert summary["policy_success_attemptable_count"] == 1
+    assert summary["policy_failure_attemptable_count"] == 1
+    assert summary["success_rate_raw_completed_denominator"] == 2
+    assert summary["success_rate_raw_completed"] == 0.5
+
+
+def test_unknown_result_type_remains_excluded_without_becoming_component_invalid() -> None:
+    row = {
+        "runtime_ok": True,
+        "success": None,
+        "result_type": "future_invalid_dependency_variant",
+        "rollout_attempted": True,
+    }
+
+    classes = mod.classify_result_row(row)
+    summary = mod.summarize_result_rows([row])
+
+    assert classes["component_invalid"] is False
+    assert classes["state_invalid_restore_components"] is False
+    assert classes["state_invalid_rollout_components"] is False
+    assert classes["spec_invalid_component_dependency"] is False
+    assert classes["attemptable"] is False
+    assert classes["policy_failure_attemptable"] is False
+    assert classes["other_metric_unsatisfied"] is False
+    assert summary["component_invalid_count"] == 0
+    assert summary["attemptable_segment_count"] == 0
+    assert summary["success_rate_raw_completed_denominator"] == 1
+    assert summary["success_rate_raw_completed_excluded_component_invalid_count"] == 0
+
+
+def test_component_evaluability_normalization_is_bounded_and_malformed_safe() -> None:
+    oversized_count = mod.COMPONENT_EVALUABILITY_MAX_LIST_ITEMS + 20
+    payload = {
+        "evaluable": False,
+        "result_type": "r" * 2048,
+        "boundary_evaluable": {"malformed": True},
+        "required_components": [f"component_{index}" for index in range(oversized_count)],
+        "dependency_ambiguities": [f"ambiguity_{index}" for index in range(oversized_count)],
+        "dependency_rows": [
+            {
+                "metric_type": "predicate",
+                "name": "n" * 512,
+                "metric_family": "relation",
+                "required_components": ["particle", "rigid"],
+                "dependency_ambiguity": f"ambiguity_{index}",
+                "unbounded_debug": {"blob": "x" * 4096},
+            }
+            for index in range(mod.COMPONENT_EVALUABILITY_MAX_DEPENDENCY_ROWS + 20)
+        ],
+        "restore_stages": [
+            {
+                "stage": f"stage_{index}",
+                "validity_present": index % 2 == 0,
+                "boundary_missing_components": ["rigid"],
+                "rollout_missing_components": ["assisted_grasp"],
+                "unbounded_debug": {"blob": "y" * 4096},
+            }
+            for index in range(mod.COMPONENT_EVALUABILITY_MAX_RESTORE_STAGES + 2)
+        ],
+        "unbounded_top_level_debug": {"blob": "z" * 4096},
+    }
+
+    normalized = mod.normalize_component_evaluability(payload)
+
+    assert normalized is not None
+    assert normalized["evaluable"] is False
+    assert len(normalized["result_type"]) == mod.COMPONENT_EVALUABILITY_MAX_REASON_CHARS
+    assert len(normalized["required_components"]) == mod.COMPONENT_EVALUABILITY_MAX_LIST_ITEMS
+    assert len(normalized["dependency_ambiguities"]) == mod.COMPONENT_EVALUABILITY_MAX_LIST_ITEMS
+    assert len(normalized["dependency_rows"]) == mod.COMPONENT_EVALUABILITY_MAX_DEPENDENCY_ROWS
+    assert len(normalized["restore_stages"]) == mod.COMPONENT_EVALUABILITY_MAX_RESTORE_STAGES
+    assert normalized["malformed_fields"] == ["boundary_evaluable"]
+    assert normalized["truncated"] is True
+    dependency_row_keys = {
+        "metric_type",
+        "name",
+        "metric_family",
+        "required_components",
+        "dependency_ambiguity",
+    }
+    assert all(set(row) <= dependency_row_keys for row in normalized["dependency_rows"])
+    assert all(
+        len(row["name"]) == mod.COMPONENT_EVALUABILITY_MAX_NAME_CHARS
+        for row in normalized["dependency_rows"]
+    )
+    assert all("unbounded_debug" not in stage for stage in normalized["restore_stages"])
+    assert "unbounded_top_level_debug" not in normalized
+    assert mod.normalize_component_evaluability(["malformed"]) == {
+        "malformed": True,
+        "input_type": "list",
+    }
+
+
+def test_merge_results_exposes_component_invalid_counts_at_all_aggregate_levels(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    worker_results = run_dir / "worker_results"
+    worker_results.mkdir(parents=True)
+    rows = [
+        {
+            "job_key": "skill_a|task_a|demo001|001",
+            "skill": "skill_a",
+            "task_name": "task_a",
+            "demo_id": "demo001",
+            "runtime_ok": True,
+            "success": True,
+            "result_type": "predicate_satisfied",
+            "metric_family": "rigid",
+            "rollout_attempted": True,
+            "final_step": 188,
+        },
+        {
+            "job_key": "skill_a|task_a|demo002|002",
+            "skill": "skill_a",
+            "task_name": "task_a",
+            "demo_id": "demo002",
+            "runtime_ok": True,
+            "success": None,
+            "result_type": "state_invalid_restore_components",
+            "metric_family": "rigid",
+            "aggregation_eligible": False,
+            "model_evaluated": False,
+            "model_failure_eligible": False,
+            "rollout_attempted": False,
+        },
+        {
+            "job_key": "skill_b|task_b|demo003|003",
+            "skill": "skill_b",
+            "task_name": "task_b",
+            "demo_id": "demo003",
+            "runtime_ok": True,
+            "success": None,
+            "result_type": "spec_invalid_component_dependency",
+            "metric_family": "particle",
+            "aggregation_eligible": False,
+            "model_evaluated": False,
+            "model_failure_eligible": False,
+            "rollout_attempted": False,
+        },
+        {
+            "job_key": "skill_b|task_b|demo004|004",
+            "skill": "skill_b",
+            "task_name": "task_b",
+            "demo_id": "demo004",
+            "runtime_ok": True,
+            "success": None,
+            "result_type": "state_invalid_rollout_components",
+            "metric_family": "particle",
+            "aggregation_eligible": False,
+            "boundary_evaluation_eligible": True,
+            "rollout_evaluation_eligible": False,
+            "model_evaluated": False,
+            "model_failure_eligible": False,
+            "rollout_attempted": False,
+        },
+    ]
+    (run_dir / "manifest.json").write_text(json.dumps({"jobs": rows}))
+    (worker_results / "worker_000.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    assert mod.merge_results(SimpleNamespace(out_dir=run_dir)) == 0
+
+    summary = json.loads((run_dir / "multinode_skill_summary.json").read_text())
+    assert summary["state_invalid_restore_components"] == 1
+    assert summary["state_invalid_rollout_components"] == 1
+    assert summary["spec_invalid_component_dependency"] == 1
+    assert summary["component_invalid"] == 3
+    assert summary["runtime_pass"] == 1
+    assert summary["runtime_fail"] == 0
+    assert summary["runtime_pass_rate_completed"] == 1.0
+    assert summary["runtime_pass_rate_completed_denominator"] == 1
+    assert summary["runtime_pass_rate_completed_excluded_component_invalid_count"] == 3
+    assert summary["runtime_pass_rate_planned"] == 1.0
+    assert summary["runtime_pass_rate_planned_denominator"] == 1
+    assert summary["runtime_pass_rate_planned_excluded_component_invalid_count"] == 3
+    assert summary["attemptable_segments"] == 1
+    assert summary["policy_success_attemptable"] == 1
+    assert summary["policy_failure_attemptable"] == 0
+    assert summary["policy_success_raw_completed_denominator"] == 1
+    assert summary["policy_success_raw_completed_excluded_component_invalid"] == 3
+
+    skill_a = next(row for row in summary["skill_summary"] if row["skill"] == "skill_a")
+    skill_b = next(row for row in summary["skill_summary"] if row["skill"] == "skill_b")
+    task_a = next(row for row in summary["skill_task_summary"] if row["task_name"] == "task_a")
+    task_b = next(row for row in summary["skill_task_summary"] if row["task_name"] == "task_b")
+    rigid = next(row for row in summary["metric_family_summary"] if row["metric_family"] == "rigid")
+    particle = next(row for row in summary["metric_family_summary"] if row["metric_family"] == "particle")
+    assert skill_a["state_invalid_restore_components_count"] == 1
+    assert skill_a["component_invalid_count"] == 1
+    assert skill_b["state_invalid_rollout_components_count"] == 1
+    assert skill_b["component_invalid_count"] == 2
+    assert task_a["state_invalid_restore_components_count"] == 1
+    assert task_a["component_invalid_count"] == 1
+    assert task_b["state_invalid_rollout_components_count"] == 1
+    assert task_b["component_invalid_count"] == 2
+    assert rigid["state_invalid_restore_components_count"] == 1
+    assert rigid["component_invalid_count"] == 1
+    assert particle["state_invalid_rollout_components_count"] == 1
+    assert particle["spec_invalid_component_dependency_count"] == 1
+    assert particle["component_invalid_count"] == 2
+    for eligible_group in (skill_a, task_a, rigid):
+        assert eligible_group["runtime_pass_count"] == 1
+        assert eligible_group["runtime_pass_rate"] == 1.0
+        assert eligible_group["runtime_pass_rate_denominator"] == 1
+        assert eligible_group["runtime_pass_rate_excluded_component_invalid_count"] == 1
+    for invalid_only_group in (skill_b, task_b, particle):
+        assert invalid_only_group["runtime_pass_count"] == 0
+        assert invalid_only_group["runtime_pass_rate"] == 0.0
+        assert invalid_only_group["runtime_pass_rate_denominator"] == 0
+        assert invalid_only_group["runtime_pass_rate_excluded_component_invalid_count"] == 2
+
+    for csv_name in (
+        "multinode_skill_summary.csv",
+        "multinode_skill_task_summary.csv",
+        "metric_family_summary.csv",
+    ):
+        header = set((run_dir / csv_name).read_text().splitlines()[0].split(","))
+        assert "runtime_pass_rate" in header
+        assert "runtime_pass_rate_denominator" in header
+        assert "runtime_pass_rate_excluded_component_invalid_count" in header
+    markdown = (run_dir / "multinode_skill_summary.md").read_text()
+    assert "runtime_pass_rate_completed" in markdown
+    assert "Runtime Pass / Eligible" in markdown

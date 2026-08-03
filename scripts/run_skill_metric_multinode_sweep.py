@@ -49,6 +49,19 @@ RESULT_PRE_SATISFIED_START = "pre_satisfied_start"
 RESULT_SHORT_PROXY_SUCCESS = "short_proxy_success"
 RESULT_LIKELY_PROXY_FALSE_POSITIVE = "likely_proxy_false_positive"
 RESULT_SHORT_VIDEO_PROBLEM = "short_video_problem"
+RESULT_STATE_INVALID_RESTORE_COMPONENTS = "state_invalid_restore_components"
+RESULT_STATE_INVALID_ROLLOUT_COMPONENTS = "state_invalid_rollout_components"
+RESULT_SPEC_INVALID_COMPONENT_DEPENDENCY = "spec_invalid_component_dependency"
+COMPONENT_INVALID_RESULT_TYPES = {
+    RESULT_STATE_INVALID_RESTORE_COMPONENTS,
+    RESULT_STATE_INVALID_ROLLOUT_COMPONENTS,
+    RESULT_SPEC_INVALID_COMPONENT_DEPENDENCY,
+}
+COMPONENT_EVALUABILITY_MAX_LIST_ITEMS = 64
+COMPONENT_EVALUABILITY_MAX_DEPENDENCY_ROWS = 64
+COMPONENT_EVALUABILITY_MAX_RESTORE_STAGES = 3
+COMPONENT_EVALUABILITY_MAX_REASON_CHARS = 512
+COMPONENT_EVALUABILITY_MAX_NAME_CHARS = 128
 SHORT_VIDEO_PROBLEM_STEP_THRESHOLD = 150
 TRANSFER_POSE_PROXY_FAMILY = "transfer_pose_proxy"
 CONTACT_EFFECT_PROXY_FAMILY = "contact_effect_proxy"
@@ -218,6 +231,239 @@ def _safe_int(value: Any) -> Optional[int]:
         return None if value is None else int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_optional_bool(value: Any) -> Optional[bool]:
+    """Normalize producer booleans without conflating a missing value with false."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1"}:
+            return True
+        if normalized in {"false", "0"}:
+            return False
+    return None
+
+
+def _compact_component_text(value: Any, *, max_chars: int) -> Optional[str]:
+    if not isinstance(value, (str, int, float, bool)):
+        return None
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
+def _normalize_component_list(value: Any) -> Tuple[Optional[List[str]], bool]:
+    if not isinstance(value, (list, tuple)):
+        return None, False
+    normalized = {
+        text
+        for item in value[:COMPONENT_EVALUABILITY_MAX_LIST_ITEMS]
+        if (text := _compact_component_text(item, max_chars=COMPONENT_EVALUABILITY_MAX_NAME_CHARS)) is not None
+    }
+    return sorted(normalized), len(value) > COMPONENT_EVALUABILITY_MAX_LIST_ITEMS
+
+
+def _normalize_dependency_ambiguity(value: Any, *, depth: int = 0) -> Any:
+    if isinstance(value, bool):
+        return value
+    scalar = _compact_component_text(value, max_chars=COMPONENT_EVALUABILITY_MAX_REASON_CHARS)
+    if scalar is not None:
+        return scalar
+    if depth >= 2:
+        return None
+    if isinstance(value, (list, tuple)):
+        normalized_list = []
+        for item in value[:COMPONENT_EVALUABILITY_MAX_LIST_ITEMS]:
+            normalized_item = _normalize_dependency_ambiguity(item, depth=depth + 1)
+            if normalized_item is not None:
+                normalized_list.append(normalized_item)
+        return normalized_list
+    if isinstance(value, dict):
+        normalized_dict: Dict[str, Any] = {}
+        for index, (raw_key, raw_value) in enumerate(value.items()):
+            if index >= COMPONENT_EVALUABILITY_MAX_LIST_ITEMS:
+                break
+            key = _compact_component_text(raw_key, max_chars=COMPONENT_EVALUABILITY_MAX_NAME_CHARS)
+            if key is None:
+                continue
+            normalized_value = _normalize_dependency_ambiguity(raw_value, depth=depth + 1)
+            if normalized_value is not None:
+                normalized_dict[key] = normalized_value
+        return dict(sorted(normalized_dict.items()))
+    return None
+
+
+def _normalize_dependency_rows(value: Any) -> Tuple[Optional[List[Dict[str, Any]]], bool]:
+    if not isinstance(value, (list, tuple)):
+        return None, False
+    rows: List[Dict[str, Any]] = []
+    truncated = len(value) > COMPONENT_EVALUABILITY_MAX_DEPENDENCY_ROWS
+    for raw_row in value[:COMPONENT_EVALUABILITY_MAX_DEPENDENCY_ROWS]:
+        if not isinstance(raw_row, dict):
+            continue
+        row: Dict[str, Any] = {}
+        for key in ("metric_type", "name", "metric_family"):
+            text = _compact_component_text(raw_row.get(key), max_chars=COMPONENT_EVALUABILITY_MAX_NAME_CHARS)
+            if text is not None:
+                row[key] = text
+        if "required_components" in raw_row:
+            components, components_truncated = _normalize_component_list(raw_row.get("required_components"))
+            if components is not None:
+                row["required_components"] = components
+            truncated = truncated or components_truncated
+        if "dependency_ambiguity" in raw_row:
+            raw_ambiguity = raw_row.get("dependency_ambiguity")
+            ambiguity = _normalize_dependency_ambiguity(raw_ambiguity)
+            if ambiguity is not None:
+                row["dependency_ambiguity"] = ambiguity
+            if isinstance(raw_ambiguity, (list, tuple, dict)):
+                truncated = truncated or len(raw_ambiguity) > COMPONENT_EVALUABILITY_MAX_LIST_ITEMS
+        if row:
+            rows.append(row)
+    return rows, truncated
+
+
+def _normalize_restore_stages(value: Any) -> Tuple[Optional[List[Dict[str, Any]]], bool]:
+    if isinstance(value, dict):
+        source_truncated = len(value) > COMPONENT_EVALUABILITY_MAX_RESTORE_STAGES
+        raw_stages = []
+        for index, (stage, entry) in enumerate(value.items()):
+            if index >= COMPONENT_EVALUABILITY_MAX_RESTORE_STAGES * 2:
+                break
+            if isinstance(entry, dict):
+                raw_stages.append({"stage": stage, **entry})
+            if len(raw_stages) > COMPONENT_EVALUABILITY_MAX_RESTORE_STAGES:
+                break
+    elif isinstance(value, (list, tuple)):
+        source_truncated = len(value) > COMPONENT_EVALUABILITY_MAX_RESTORE_STAGES
+        raw_stages = value
+    else:
+        return None, False
+
+    stages: List[Dict[str, Any]] = []
+    truncated = source_truncated
+    for raw_stage in raw_stages[:COMPONENT_EVALUABILITY_MAX_RESTORE_STAGES]:
+        if not isinstance(raw_stage, dict):
+            continue
+        stage: Dict[str, Any] = {}
+        stage_name = _compact_component_text(
+            raw_stage.get("stage"), max_chars=COMPONENT_EVALUABILITY_MAX_NAME_CHARS
+        )
+        if stage_name is not None:
+            stage["stage"] = stage_name
+        for key in ("validity_present", "historical_world_state_exact"):
+            if key in raw_stage:
+                optional_bool = _normalize_optional_bool(raw_stage.get(key))
+                if optional_bool is not None:
+                    stage[key] = optional_bool
+        for key in ("boundary_missing_components", "rollout_missing_components"):
+            if key in raw_stage:
+                components, components_truncated = _normalize_component_list(raw_stage.get(key))
+                if components is not None:
+                    stage[key] = components
+                truncated = truncated or components_truncated
+        if stage:
+            stages.append(stage)
+    return stages, truncated
+
+
+def normalize_component_evaluability(value: Any) -> Optional[Dict[str, Any]]:
+    """Preserve the producer's component-validity schema without large debug payloads."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return {"malformed": True, "input_type": type(value).__name__}
+
+    normalized: Dict[str, Any] = {}
+    malformed_fields: List[str] = []
+    truncated = False
+
+    bool_keys = (
+        "evaluable",
+        "aggregation_eligible",
+        "model_failure_eligible",
+        "boundary_evaluable",
+        "boundary_aggregation_eligible",
+        "rollout_evaluable",
+    )
+    for key in bool_keys:
+        if key not in value:
+            continue
+        optional_bool = _normalize_optional_bool(value.get(key))
+        if optional_bool is None:
+            malformed_fields.append(key)
+        else:
+            normalized[key] = optional_bool
+
+    for key in ("result_type", "boundary_result_type", "rollout_result_type"):
+        if key not in value:
+            continue
+        text = _compact_component_text(value.get(key), max_chars=COMPONENT_EVALUABILITY_MAX_REASON_CHARS)
+        if text is None:
+            malformed_fields.append(key)
+        else:
+            normalized[key] = text
+
+    component_list_keys = (
+        "boundary_required_components",
+        "boundary_missing_components",
+        "rollout_required_components",
+        "rollout_missing_components",
+        "required_components",
+        "missing_components",
+    )
+    for key in component_list_keys:
+        if key not in value:
+            continue
+        components, list_truncated = _normalize_component_list(value.get(key))
+        if components is None:
+            malformed_fields.append(key)
+        else:
+            normalized[key] = components
+        truncated = truncated or list_truncated
+
+    if "dependency_ambiguities" in value:
+        dependency_ambiguities = _normalize_dependency_ambiguity(value.get("dependency_ambiguities"))
+        if dependency_ambiguities is None:
+            malformed_fields.append("dependency_ambiguities")
+        else:
+            normalized["dependency_ambiguities"] = dependency_ambiguities
+        raw_ambiguities = value.get("dependency_ambiguities")
+        if isinstance(raw_ambiguities, (list, tuple)):
+            truncated = truncated or len(raw_ambiguities) > COMPONENT_EVALUABILITY_MAX_LIST_ITEMS
+        elif isinstance(raw_ambiguities, dict):
+            truncated = truncated or len(raw_ambiguities) > COMPONENT_EVALUABILITY_MAX_LIST_ITEMS
+
+    if "dependency_rows" in value:
+        dependency_rows, rows_truncated = _normalize_dependency_rows(value.get("dependency_rows"))
+        if dependency_rows is None:
+            malformed_fields.append("dependency_rows")
+        else:
+            normalized["dependency_rows"] = dependency_rows
+        truncated = truncated or rows_truncated
+
+    if "restore_stages" in value:
+        restore_stages, stages_truncated = _normalize_restore_stages(value.get("restore_stages"))
+        if restore_stages is None:
+            malformed_fields.append("restore_stages")
+        else:
+            normalized["restore_stages"] = restore_stages
+        truncated = truncated or stages_truncated
+
+    if malformed_fields:
+        normalized["malformed_fields"] = sorted(set(malformed_fields))
+    if truncated:
+        normalized["truncated"] = True
+    if not normalized:
+        normalized["malformed"] = True
+    return normalized
 
 
 def is_early_metric_activation_review_needed(row: Dict[str, Any]) -> bool:
@@ -977,9 +1223,12 @@ python scripts/serve_b1k.py --task_name={q(task_name)} --control_mode=receeding_
 def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: bool, returncode: int, segment_log: Path) -> Dict[str, Any]:
     with metrics_path.open() as f:
         metrics = json.load(f)
-    rollout = metrics.get("rollout", {})
-    predicate_debug = metrics.get("predicate_debug", {})
+    if not isinstance(metrics, dict):
+        raise ValueError(f"metrics payload must be an object: {metrics_path}")
+    rollout = metrics.get("rollout", {}) if isinstance(metrics.get("rollout"), dict) else {}
+    predicate_debug = metrics.get("predicate_debug", {}) if isinstance(metrics.get("predicate_debug"), dict) else {}
     restore = metrics.get("restore", {}) if isinstance(metrics.get("restore"), dict) else {}
+    component_evaluability = normalize_component_evaluability(metrics.get("component_evaluability"))
     restore_start = restore.get("start") if isinstance(restore.get("start"), dict) else {}
     restore_end = restore.get("end") if isinstance(restore.get("end"), dict) else {}
     restore_rollout_start = restore.get("rollout_start") if isinstance(restore.get("rollout_start"), dict) else {}
@@ -1000,6 +1249,15 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
         "returncode": returncode,
         "success": metrics.get("success"),
         "result_type": metrics.get("result_type"),
+        "aggregation_eligible": _normalize_optional_bool(metrics.get("aggregation_eligible")),
+        "boundary_evaluation_eligible": _normalize_optional_bool(metrics.get("boundary_evaluation_eligible")),
+        "rollout_evaluation_eligible": _normalize_optional_bool(metrics.get("rollout_evaluation_eligible")),
+        "model_evaluated": _normalize_optional_bool(metrics.get("model_evaluated")),
+        "model_failure_eligible": _normalize_optional_bool(metrics.get("model_failure_eligible")),
+        "component_evaluability": component_evaluability,
+        "component_evaluability_json": json.dumps(component_evaluability, ensure_ascii=False, sort_keys=True)
+        if component_evaluability is not None
+        else None,
         "metric_family": predicate_debug.get("metric_family"),
         "start_all_satisfied": predicate_debug.get("start_all_satisfied"),
         "short_proxy_success": predicate_debug.get("short_proxy_success"),
@@ -1038,7 +1296,7 @@ def load_metrics_row(metrics_path: Path, sample: Dict[str, Any], runtime_ok: boo
         "first_predicate_satisfied_step": predicate_debug.get("first_predicate_satisfied_step"),
         "early_predicate_satisfied_steps": predicate_debug.get("early_predicate_satisfied_steps"),
         "final_step": rollout.get("final_step"),
-        "rollout_attempted": rollout.get("rollout_attempted"),
+        "rollout_attempted": _normalize_optional_bool(rollout.get("rollout_attempted")),
         "termination_reason": rollout.get("termination_reason"),
         "env_termination_reason": env_termination_reason,
         "env_done_success": rollout.get("env_done_success"),
@@ -1361,8 +1619,13 @@ def run_worker(args: argparse.Namespace) -> int:
 
 
 def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
-    runtime_pass = bool(row.get("runtime_ok"))
+    runtime_ok = bool(row.get("runtime_ok"))
     result_type = row.get("result_type")
+    state_invalid_restore_components = result_type == RESULT_STATE_INVALID_RESTORE_COMPONENTS
+    state_invalid_rollout_components = result_type == RESULT_STATE_INVALID_ROLLOUT_COMPONENTS
+    spec_invalid_component_dependency = result_type == RESULT_SPEC_INVALID_COMPONENT_DEPENDENCY
+    component_invalid = result_type in COMPONENT_INVALID_RESULT_TYPES
+    runtime_pass = runtime_ok and not component_invalid
     pre_satisfied_start = result_type == RESULT_PRE_SATISFIED_START
     short_proxy_success = result_type in {RESULT_SHORT_PROXY_SUCCESS, RESULT_LIKELY_PROXY_FALSE_POSITIVE} or bool(
         row.get("short_proxy_success")
@@ -1413,12 +1676,35 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
     metric_invalid = str(result_type or "").startswith(METRIC_INVALID_PREFIX)
     rawdata_restore_failed = bool(row.get("rawdata_restore_failed"))
     rawdata_restore_fallback = bool(row.get("rawdata_restore_fallback"))
-    rollout_attempted = row.get("rollout_attempted")
+    aggregation_eligible = _normalize_optional_bool(row.get("aggregation_eligible"))
+    boundary_evaluation_eligible = _normalize_optional_bool(row.get("boundary_evaluation_eligible"))
+    rollout_evaluation_eligible = _normalize_optional_bool(row.get("rollout_evaluation_eligible"))
+    model_evaluated = _normalize_optional_bool(row.get("model_evaluated"))
+    model_failure_eligible = _normalize_optional_bool(row.get("model_failure_eligible"))
+    rollout_attempted = _normalize_optional_bool(row.get("rollout_attempted"))
     if rollout_attempted is None:
         policy_attempted = result_type in ATTEMPTABLE_RESULT_TYPES
     else:
-        policy_attempted = bool(rollout_attempted) and result_type in ATTEMPTABLE_RESULT_TYPES
-    attemptable = runtime_pass and policy_attempted and not pre_satisfied_start and not metric_invalid
+        policy_attempted = rollout_attempted and result_type in ATTEMPTABLE_RESULT_TYPES
+    if model_evaluated is False:
+        policy_attempted = False
+    producer_eligible = all(
+        field is not False
+        for field in (
+            aggregation_eligible,
+            boundary_evaluation_eligible,
+            rollout_evaluation_eligible,
+            model_failure_eligible,
+        )
+    )
+    attemptable = (
+        runtime_pass
+        and policy_attempted
+        and producer_eligible
+        and not component_invalid
+        and not pre_satisfied_start
+        and not metric_invalid
+    )
     policy_success_attemptable = attemptable and bool(row.get("success")) and result_type == "predicate_satisfied"
     policy_success_clean_attemptable = (
         policy_success_attemptable
@@ -1450,7 +1736,8 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         {**row, "attemptable": attemptable}
     )
     rawdata_restore_review_needed = runtime_pass and (rawdata_restore_failed or rawdata_restore_fallback)
-    metric_unsatisfied_attemptable = attemptable and not policy_success_attemptable
+    policy_failure_attemptable = attemptable and not policy_success_attemptable
+    metric_unsatisfied_attemptable = policy_failure_attemptable
     other_metric_unsatisfied = (
         metric_unsatisfied_attemptable
         and not timeout
@@ -1459,9 +1746,14 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         and not env_task_success_before_segment_success
         and not likely_proxy_false_positive
     )
+    classified_model_result = runtime_pass and not component_invalid
     return {
         "runtime_pass": runtime_pass,
-        "runtime_fail": not runtime_pass,
+        "runtime_fail": not runtime_pass and not component_invalid,
+        "state_invalid_restore_components": state_invalid_restore_components,
+        "state_invalid_rollout_components": state_invalid_rollout_components,
+        "spec_invalid_component_dependency": spec_invalid_component_dependency,
+        "component_invalid": component_invalid,
         "pre_satisfied_start": runtime_pass and pre_satisfied_start,
         "metric_invalid": runtime_pass and metric_invalid,
         "metric_invalid_missing_object": runtime_pass and metric_invalid_missing_object,
@@ -1469,30 +1761,36 @@ def classify_result_row(row: Dict[str, Any]) -> Dict[str, bool]:
         "rawdata_restore_fallback": runtime_pass and rawdata_restore_fallback,
         "rawdata_restore_review_needed": rawdata_restore_review_needed,
         "attemptable": attemptable,
+        "policy_attempted": attemptable,
         "policy_success_attemptable": policy_success_attemptable,
+        "policy_failure_attemptable": policy_failure_attemptable,
         "policy_success_clean_attemptable": policy_success_clean_attemptable,
-        "short_video_problem": runtime_pass and short_video_problem,
-        "early_metric_activation_review_needed": runtime_pass and early_metric_activation_review_needed,
-        "short_proxy_success": runtime_pass and short_proxy_success,
-        "likely_proxy_false_positive": runtime_pass and likely_proxy_false_positive,
-        "transfer_pose_proxy_success_unconfirmed": runtime_pass
+        "short_video_problem": classified_model_result and short_video_problem,
+        "early_metric_activation_review_needed": classified_model_result
+        and early_metric_activation_review_needed,
+        "short_proxy_success": classified_model_result and short_proxy_success,
+        "likely_proxy_false_positive": classified_model_result and likely_proxy_false_positive,
+        "transfer_pose_proxy_success_unconfirmed": classified_model_result
         and transfer_pose_proxy_success_unconfirmed,
-        "contact_effect_proxy_success_unconfirmed": runtime_pass
+        "contact_effect_proxy_success_unconfirmed": classified_model_result
         and contact_effect_proxy_success_unconfirmed,
-        "articulation_close_success_unconfirmed": runtime_pass
+        "articulation_close_success_unconfirmed": classified_model_result
         and articulation_close_success_unconfirmed,
-        "articulation_close_proxy_success_unconfirmed": runtime_pass
+        "articulation_close_proxy_success_unconfirmed": classified_model_result
         and articulation_close_proxy_success_unconfirmed,
-        "geometry_base_facing_success_unconfirmed": runtime_pass
+        "geometry_base_facing_success_unconfirmed": classified_model_result
         and geometry_base_facing_success_unconfirmed,
-        "relation_transfer_proxy_success_unconfirmed": runtime_pass
+        "relation_transfer_proxy_success_unconfirmed": classified_model_result
         and relation_transfer_proxy_success_unconfirmed,
-        "orientation_proxy_success_unconfirmed": runtime_pass and orientation_proxy_success_unconfirmed,
-        "articulation_open_proxy_success_unconfirmed": runtime_pass
+        "orientation_proxy_success_unconfirmed": classified_model_result
+        and orientation_proxy_success_unconfirmed,
+        "articulation_open_proxy_success_unconfirmed": classified_model_result
         and articulation_open_proxy_success_unconfirmed,
-        "articulation_open_success_unconfirmed": runtime_pass and articulation_open_success_unconfirmed,
-        "can_meat_lid_success_unconfirmed": runtime_pass and can_meat_lid_success_unconfirmed,
-        "meaningful_policy_caused_transition": runtime_pass and meaningful_policy_caused_transition,
+        "articulation_open_success_unconfirmed": classified_model_result
+        and articulation_open_success_unconfirmed,
+        "can_meat_lid_success_unconfirmed": classified_model_result and can_meat_lid_success_unconfirmed,
+        "meaningful_policy_caused_transition": classified_model_result
+        and meaningful_policy_caused_transition,
         "timeout": timeout,
         "truncated": truncated,
         "env_terminated_metric_unsatisfied": env_terminated_metric_unsatisfied,
@@ -1508,6 +1806,11 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     classes = [classify_result_row(row) for row in rows]
     runtime_pass = sum(int(c["runtime_pass"]) for c in classes)
     runtime_fail = sum(int(c["runtime_fail"]) for c in classes)
+    state_invalid_restore_components = sum(int(c["state_invalid_restore_components"]) for c in classes)
+    state_invalid_rollout_components = sum(int(c["state_invalid_rollout_components"]) for c in classes)
+    spec_invalid_component_dependency = sum(int(c["spec_invalid_component_dependency"]) for c in classes)
+    component_invalid = sum(int(c["component_invalid"]) for c in classes)
+    runtime_pass_rate_denominator = total - component_invalid
     pre_satisfied_start = sum(int(c["pre_satisfied_start"]) for c in classes)
     metric_invalid = sum(int(c["metric_invalid"]) for c in classes)
     metric_invalid_missing_object = sum(int(c["metric_invalid_missing_object"]) for c in classes)
@@ -1516,6 +1819,7 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     rawdata_restore_review_needed = sum(int(c["rawdata_restore_review_needed"]) for c in classes)
     attemptable = sum(int(c["attemptable"]) for c in classes)
     policy_success_attemptable = sum(int(c["policy_success_attemptable"]) for c in classes)
+    policy_failure_attemptable = sum(int(c["policy_failure_attemptable"]) for c in classes)
     policy_success_clean_attemptable = sum(int(c["policy_success_clean_attemptable"]) for c in classes)
     short_video_problem = sum(int(c["short_video_problem"]) for c in classes)
     early_metric_activation_review_needed = sum(int(c["early_metric_activation_review_needed"]) for c in classes)
@@ -1563,7 +1867,12 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         int(c["env_task_success_grasp_release_review_needed"]) for c in classes
     )
     other_unsat = sum(int(c["other_metric_unsatisfied"]) for c in classes)
-    success_raw = sum(int(bool(row.get("success"))) for row in rows)
+    raw_completed_denominator = runtime_pass_rate_denominator
+    success_raw = sum(
+        int(bool(row.get("success")))
+        for row, classification in zip(rows, classes)
+        if not classification["component_invalid"]
+    )
     env_done_success_count = sum(int(row.get("env_done_success") is True) for row in rows)
     rollout_terminated_count = sum(int(row.get("rollout_terminated") is True) for row in rows)
     rollout_truncated_flag_count = sum(int(row.get("rollout_truncated") is True) for row in rows)
@@ -1587,7 +1896,13 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "segment_count": total,
         "runtime_pass_count": runtime_pass,
         "runtime_fail_count": runtime_fail,
-        "runtime_pass_rate": runtime_pass / total if total else 0.0,
+        "runtime_pass_rate": runtime_pass / runtime_pass_rate_denominator if runtime_pass_rate_denominator else 0.0,
+        "runtime_pass_rate_denominator": runtime_pass_rate_denominator,
+        "runtime_pass_rate_excluded_component_invalid_count": component_invalid,
+        "state_invalid_restore_components_count": state_invalid_restore_components,
+        "state_invalid_rollout_components_count": state_invalid_rollout_components,
+        "spec_invalid_component_dependency_count": spec_invalid_component_dependency,
+        "component_invalid_count": component_invalid,
         "pre_satisfied_start_count": pre_satisfied_start,
         "metric_invalid_count": metric_invalid,
         "metric_invalid_missing_object_count": metric_invalid_missing_object,
@@ -1597,6 +1912,8 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "attemptable_segment_count": attemptable,
         "policy_success_attemptable_count": policy_success_attemptable,
         "policy_success_attemptable_rate": policy_success_attemptable / attemptable if attemptable else 0.0,
+        "policy_failure_attemptable_count": policy_failure_attemptable,
+        "policy_failure_attemptable_rate": policy_failure_attemptable / attemptable if attemptable else 0.0,
         "policy_success_clean_attemptable_count": policy_success_clean_attemptable,
         "policy_success_clean_attemptable_rate": policy_success_clean_attemptable / attemptable if attemptable else 0.0,
         "short_video_problem_count": short_video_problem,
@@ -1622,7 +1939,9 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "env_task_success_grasp_release_review_needed_count": env_task_success_grasp_release_review_needed,
         "other_metric_unsatisfied_count": other_unsat,
         "success_count_raw": success_raw,
-        "success_rate_raw_completed": success_raw / total if total else 0.0,
+        "success_rate_raw_completed": success_raw / raw_completed_denominator if raw_completed_denominator else 0.0,
+        "success_rate_raw_completed_denominator": raw_completed_denominator,
+        "success_rate_raw_completed_excluded_component_invalid_count": component_invalid,
         "predicate_satisfied_count": sum(1 for row in rows if row.get("result_type") == "predicate_satisfied"),
         "env_done_success_count": env_done_success_count,
         "rollout_terminated_count": rollout_terminated_count,
@@ -1631,9 +1950,11 @@ def summarize_result_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "termination_reason_counts_json": json.dumps(termination_reason_counts, ensure_ascii=False, sort_keys=True),
         "env_termination_reason_counts": env_termination_reason_counts,
         "env_termination_reason_counts_json": json.dumps(env_termination_reason_counts, ensure_ascii=False, sort_keys=True),
-        # Backwards-compatible legacy fields. Prefer the *_attemptable fields for policy rates.
+        # Backwards-compatible aliases. For old rows the denominator is unchanged;
+        # known component-invalid rows are explicitly excluded rather than shown as failures.
         "success_count": success_raw,
-        "success_rate": success_raw / total if total else 0.0,
+        "success_rate": success_raw / raw_completed_denominator if raw_completed_denominator else 0.0,
+        "success_rate_denominator": raw_completed_denominator,
     }
 
 
@@ -1666,6 +1987,22 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
     lines.append(f"- completed_jobs: `{summary['completed_jobs']}`")
     lines.append(f"- runtime_pass: `{summary['runtime_pass']}`")
     lines.append(f"- runtime_fail: `{summary['runtime_fail']}`")
+    lines.append(
+        f"- runtime_pass_rate_completed: `{summary.get('runtime_pass_rate_completed', 0.0):.4f}` "
+        f"/ denominator `{summary.get('runtime_pass_rate_completed_denominator', 0)}` "
+        f"(component-invalid excluded: "
+        f"`{summary.get('runtime_pass_rate_completed_excluded_component_invalid_count', 0)}`)"
+    )
+    lines.append(
+        f"- runtime_pass_rate_planned: `{summary.get('runtime_pass_rate_planned', 0.0):.4f}` "
+        f"/ denominator `{summary.get('runtime_pass_rate_planned_denominator', 0)}` "
+        f"(component-invalid excluded: "
+        f"`{summary.get('runtime_pass_rate_planned_excluded_component_invalid_count', 0)}`)"
+    )
+    lines.append(f"- state_invalid_restore_components: `{summary.get('state_invalid_restore_components', 0)}`")
+    lines.append(f"- state_invalid_rollout_components: `{summary.get('state_invalid_rollout_components', 0)}`")
+    lines.append(f"- spec_invalid_component_dependency: `{summary.get('spec_invalid_component_dependency', 0)}`")
+    lines.append(f"- component_invalid: `{summary.get('component_invalid', 0)}`")
     lines.append(f"- pre_satisfied_start: `{summary['pre_satisfied_start']}`")
     lines.append(f"- metric_invalid: `{summary.get('metric_invalid', 0)}`")
     lines.append(f"- metric_invalid_missing_object: `{summary.get('metric_invalid_missing_object', 0)}`")
@@ -1675,6 +2012,8 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
     lines.append(f"- attemptable_segments: `{summary['attemptable_segments']}`")
     lines.append(f"- policy_success_attemptable: `{summary['policy_success_attemptable']}`")
     lines.append(f"- policy_success_attemptable_rate: `{summary['policy_success_attemptable_rate']:.4f}`")
+    lines.append(f"- policy_failure_attemptable: `{summary.get('policy_failure_attemptable', 0)}`")
+    lines.append(f"- policy_failure_attemptable_rate: `{summary.get('policy_failure_attemptable_rate', 0.0):.4f}`")
     lines.append(f"- policy_success_clean_attemptable: `{summary.get('policy_success_clean_attemptable', 0)}`")
     lines.append(
         f"- policy_success_clean_attemptable_rate: "
@@ -1733,34 +2072,46 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
     lines.append(f"- rollout_terminated_count: `{summary.get('rollout_terminated_count', 0)}`")
     lines.append(f"- rollout_truncated_flag_count: `{summary.get('rollout_truncated_flag_count', 0)}`")
     lines.append(f"- policy_success_raw: `{summary['policy_success_raw']}`")
+    lines.append(
+        f"- policy_success_raw_completed_rate: `{summary.get('policy_success_raw_completed_rate', 0.0):.4f}` "
+        f"/ denominator `{summary.get('policy_success_raw_completed_denominator', 0)}` "
+        f"(component-invalid excluded: "
+        f"`{summary.get('policy_success_raw_completed_excluded_component_invalid', 0)}`)"
+    )
     lines.append(f"- missing_jobs: `{summary['missing_jobs']}`")
     lines.append("")
     lines.append(
-        "| Skill | Tasks | Demos | Segments | Runtime Pass Rate | Attemptable | "
-        "Policy Success / Attemptable | Pre-satisfied | Timeout | Truncated | Env-terminated Unsat |"
+        "| Skill | Tasks | Demos | Segments | Runtime Pass / Eligible | Attemptable | "
+        "Policy Success / Attemptable | Pre-satisfied | Component-invalid | Timeout | Truncated | "
+        "Env-terminated Unsat |"
     )
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     lines.extend(
         (
             f"| {row['skill']} | {row['task_count']} | {row['demo_count']} | {row['segment_count']} | "
-            f"{row['runtime_pass_rate']:.4f} | {row['attemptable_segment_count']} | "
+            f"{row['runtime_pass_count']} / {row['runtime_pass_rate_denominator']} "
+            f"({row['runtime_pass_rate']:.4f}) | {row['attemptable_segment_count']} | "
             f"{row['policy_success_attemptable_count']} / {row['attemptable_segment_count']} "
             f"({row['policy_success_attemptable_rate']:.4f}) | {row['pre_satisfied_start_count']} | "
-            f"{row['timeout_count']} | {row['truncated_count']} | {row['env_terminated_metric_unsatisfied_count']} |"
+            f"{row['component_invalid_count']} | {row['timeout_count']} | {row['truncated_count']} | "
+            f"{row['env_terminated_metric_unsatisfied_count']} |"
         )
         for row in summary["skill_summary"]
     )
     lines.append("")
     if summary.get("metric_family_summary"):
         lines.append(
-            "| Metric Family | Segments | Attemptable | Raw Success | Clean Success | Review-needed Success | "
-            "Timeout | Truncated |"
+            "| Metric Family | Segments | Runtime Pass / Eligible | Component-invalid | Attemptable | "
+            "Raw Success | Clean Success | Review-needed Success | Timeout | Truncated |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         lines.extend(
             (
-                f"| {row['metric_family']} | {row['segment_count']} | {row['attemptable_segment_count']} | "
-                f"{row['policy_success_attemptable_count']} | {row['policy_success_clean_attemptable_count']} | "
+                f"| {row['metric_family']} | {row['segment_count']} | "
+                f"{row['runtime_pass_count']} / {row['runtime_pass_rate_denominator']} "
+                f"({row['runtime_pass_rate']:.4f}) | {row['component_invalid_count']} | "
+                f"{row['attemptable_segment_count']} | {row['policy_success_attemptable_count']} | "
+                f"{row['policy_success_clean_attemptable_count']} | "
                 f"{row['review_needed_success_count']} | {row['timeout_count']} | {row['truncated_count']} |"
             )
             for row in summary["metric_family_summary"]
@@ -1822,6 +2173,7 @@ def merge_results(args: argparse.Namespace) -> int:
     metric_family_summary = build_metric_family_summary(rows)
 
     top_summary = summarize_result_rows(rows)
+    runtime_pass_rate_planned_denominator = max(0, len(planned_jobs) - top_summary["component_invalid_count"])
     result_type_counts = dict(sorted(Counter(str(row.get("result_type")) for row in rows).items()))
     summary = {
         "schema_version": 2,
@@ -1834,7 +2186,21 @@ def merge_results(args: argparse.Namespace) -> int:
         "runtime_pass": top_summary["runtime_pass_count"],
         "runtime_fail": top_summary["runtime_fail_count"],
         "runtime_pass_rate_completed": top_summary["runtime_pass_rate"],
-        "runtime_pass_rate_planned": top_summary["runtime_pass_count"] / len(planned_jobs) if planned_jobs else 0.0,
+        "runtime_pass_rate_completed_denominator": top_summary["runtime_pass_rate_denominator"],
+        "runtime_pass_rate_completed_excluded_component_invalid_count": top_summary[
+            "runtime_pass_rate_excluded_component_invalid_count"
+        ],
+        "runtime_pass_rate_planned": (
+            top_summary["runtime_pass_count"] / runtime_pass_rate_planned_denominator
+            if runtime_pass_rate_planned_denominator
+            else 0.0
+        ),
+        "runtime_pass_rate_planned_denominator": runtime_pass_rate_planned_denominator,
+        "runtime_pass_rate_planned_excluded_component_invalid_count": top_summary["component_invalid_count"],
+        "state_invalid_restore_components": top_summary["state_invalid_restore_components_count"],
+        "state_invalid_rollout_components": top_summary["state_invalid_rollout_components_count"],
+        "spec_invalid_component_dependency": top_summary["spec_invalid_component_dependency_count"],
+        "component_invalid": top_summary["component_invalid_count"],
         "pre_satisfied_start": top_summary["pre_satisfied_start_count"],
         "metric_invalid": top_summary["metric_invalid_count"],
         "metric_invalid_missing_object": top_summary["metric_invalid_missing_object_count"],
@@ -1844,6 +2210,8 @@ def merge_results(args: argparse.Namespace) -> int:
         "attemptable_segments": top_summary["attemptable_segment_count"],
         "policy_success_attemptable": top_summary["policy_success_attemptable_count"],
         "policy_success_attemptable_rate": top_summary["policy_success_attemptable_rate"],
+        "policy_failure_attemptable": top_summary["policy_failure_attemptable_count"],
+        "policy_failure_attemptable_rate": top_summary["policy_failure_attemptable_rate"],
         "policy_success_clean_attemptable": top_summary["policy_success_clean_attemptable_count"],
         "policy_success_clean_attemptable_rate": top_summary["policy_success_clean_attemptable_rate"],
         "short_video_problem": top_summary["short_video_problem_count"],
@@ -1894,6 +2262,11 @@ def merge_results(args: argparse.Namespace) -> int:
         "termination_reason_counts": top_summary["termination_reason_counts"],
         "env_termination_reason_counts": top_summary["env_termination_reason_counts"],
         "policy_success_raw": top_summary["success_count_raw"],
+        "policy_success_raw_completed_rate": top_summary["success_rate_raw_completed"],
+        "policy_success_raw_completed_denominator": top_summary["success_rate_raw_completed_denominator"],
+        "policy_success_raw_completed_excluded_component_invalid": top_summary[
+            "success_rate_raw_completed_excluded_component_invalid_count"
+        ],
         "policy_success": top_summary["success_count_raw"],
         "result_type_counts": result_type_counts,
         "missing_job_keys": missing_keys,
@@ -1918,8 +2291,20 @@ def merge_results(args: argparse.Namespace) -> int:
             "runtime_ok",
             "success",
             "result_type",
+            "aggregation_eligible",
+            "boundary_evaluation_eligible",
+            "rollout_evaluation_eligible",
+            "model_evaluated",
+            "model_failure_eligible",
+            "component_evaluability_json",
+            "state_invalid_restore_components",
+            "state_invalid_rollout_components",
+            "spec_invalid_component_dependency",
+            "component_invalid",
             "attemptable",
+            "policy_attempted",
             "policy_success_attemptable",
+            "policy_failure_attemptable",
             "policy_success_clean_attemptable",
             "metric_family",
             "start_all_satisfied",
@@ -1994,6 +2379,12 @@ def merge_results(args: argparse.Namespace) -> int:
             "runtime_pass_count",
             "runtime_fail_count",
             "runtime_pass_rate",
+            "runtime_pass_rate_denominator",
+            "runtime_pass_rate_excluded_component_invalid_count",
+            "state_invalid_restore_components_count",
+            "state_invalid_rollout_components_count",
+            "spec_invalid_component_dependency_count",
+            "component_invalid_count",
             "pre_satisfied_start_count",
             "metric_invalid_count",
             "metric_invalid_missing_object_count",
@@ -2003,6 +2394,8 @@ def merge_results(args: argparse.Namespace) -> int:
             "attemptable_segment_count",
             "policy_success_attemptable_count",
             "policy_success_attemptable_rate",
+            "policy_failure_attemptable_count",
+            "policy_failure_attemptable_rate",
             "policy_success_clean_attemptable_count",
             "policy_success_clean_attemptable_rate",
             "short_video_problem_count",
@@ -2029,8 +2422,11 @@ def merge_results(args: argparse.Namespace) -> int:
             "other_metric_unsatisfied_count",
             "success_count_raw",
             "success_rate_raw_completed",
+            "success_rate_raw_completed_denominator",
+            "success_rate_raw_completed_excluded_component_invalid_count",
             "success_count",
             "success_rate",
+            "success_rate_denominator",
             "predicate_satisfied_count",
             "env_done_success_count",
             "rollout_terminated_count",
@@ -2050,6 +2446,12 @@ def merge_results(args: argparse.Namespace) -> int:
             "runtime_pass_count",
             "runtime_fail_count",
             "runtime_pass_rate",
+            "runtime_pass_rate_denominator",
+            "runtime_pass_rate_excluded_component_invalid_count",
+            "state_invalid_restore_components_count",
+            "state_invalid_rollout_components_count",
+            "spec_invalid_component_dependency_count",
+            "component_invalid_count",
             "pre_satisfied_start_count",
             "metric_invalid_count",
             "metric_invalid_missing_object_count",
@@ -2059,6 +2461,8 @@ def merge_results(args: argparse.Namespace) -> int:
             "attemptable_segment_count",
             "policy_success_attemptable_count",
             "policy_success_attemptable_rate",
+            "policy_failure_attemptable_count",
+            "policy_failure_attemptable_rate",
             "policy_success_clean_attemptable_count",
             "policy_success_clean_attemptable_rate",
             "short_video_problem_count",
@@ -2085,8 +2489,11 @@ def merge_results(args: argparse.Namespace) -> int:
             "other_metric_unsatisfied_count",
             "success_count_raw",
             "success_rate_raw_completed",
+            "success_rate_raw_completed_denominator",
+            "success_rate_raw_completed_excluded_component_invalid_count",
             "success_count",
             "success_rate",
+            "success_rate_denominator",
             "predicate_satisfied_count",
             "env_done_success_count",
             "rollout_terminated_count",
@@ -2104,11 +2511,19 @@ def merge_results(args: argparse.Namespace) -> int:
             "segment_count",
             "runtime_pass_count",
             "runtime_fail_count",
+            "runtime_pass_rate",
+            "runtime_pass_rate_denominator",
+            "runtime_pass_rate_excluded_component_invalid_count",
+            "state_invalid_restore_components_count",
+            "state_invalid_rollout_components_count",
+            "spec_invalid_component_dependency_count",
+            "component_invalid_count",
             "rawdata_restore_failed_count",
             "rawdata_restore_fallback_count",
             "rawdata_restore_review_needed_count",
             "attemptable_segment_count",
             "policy_success_attemptable_count",
+            "policy_failure_attemptable_count",
             "policy_success_clean_attemptable_count",
             "review_needed_success_count",
             "short_video_problem_count",
@@ -2134,6 +2549,9 @@ def merge_results(args: argparse.Namespace) -> int:
             "env_task_success_grasp_release_review_needed_count",
             "other_metric_unsatisfied_count",
             "success_count_raw",
+            "success_rate_raw_completed",
+            "success_rate_raw_completed_denominator",
+            "success_rate_raw_completed_excluded_component_invalid_count",
         ],
     )
     (args.out_dir / "multinode_skill_summary.md").write_text(render_summary_md(summary))
