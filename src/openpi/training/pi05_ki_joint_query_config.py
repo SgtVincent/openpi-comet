@@ -671,11 +671,26 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # --- Skill bridge baseline: single-task radio, KI=ON, bridge enabled ---
     # Uses verified absolute local paths for base checkpoint/assets (canonical
     # repo) and outputs (feat worktree outputs dir).
-    # FP32 variant (V100 reference, numerically stable)
+    # Paired control (bridge disabled, same paths, 2000 steps, FP32)
+    # For A/B comparison with the bridge variant on the same allocation.
+    _make_pi05_ki_joint_query_single_task_overfit_config(
+        name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_control_fp32",
+        knowledge_insulation=True,
+        precision="float32",
+        num_train_epochs=2000,
+        skill_bridge_enabled=False,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        output_root=str(
+            _REPO_ROOT / "outputs" / "pi05_ki_joint_query_b1k-single_task-radio-ki_on_control_fp32"
+        ),
+    ),
+    # FP32 variant (V100 reference, numerically stable) — bridge enabled
     _make_pi05_ki_joint_query_single_task_overfit_config(
         name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_fp32",
         knowledge_insulation=True,
         precision="float32",
+        num_train_epochs=2000,
         skill_bridge_enabled=True,
         base_checkpoint_path=_CANONICAL_BASE_CKPT,
         base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
