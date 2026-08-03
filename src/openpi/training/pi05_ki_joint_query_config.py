@@ -26,6 +26,10 @@ from openpi.training.train_config import TrainConfig
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _B1K_DATA_ROOT = "/mnt/bn/saiwenresearch/mlx/users/chenjunting/data/2025-challenge-demos/"
 _HL_B1K_DATA_ROOT = "/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/"
+# Verified base checkpoint path (canonical repo; feat worktrees inherit this)
+_CANONICAL_BASE_CKPT = (
+    "/mnt/bn/saiwenresearch/mlx/users/chenjunting/repo/openpi-comet/checkpoints/pi05_base_pytorch"
+)
 _B1K_SUBTASK_TEMPLATES = str(
     _REPO_ROOT / "src/behavior/learning/datas/b1k_subtask_phrase_templates.json"
 )
@@ -133,6 +137,7 @@ def _make_b1k_single_task_data_config(
     skill_bridge_enabled: bool = False,
     skill_bridge_min_pre: int = 1,
     skill_bridge_min_post: int = 1,
+    base_assets_dir: str | None = None,
 ) -> LeRobotB1KDataConfig:
     """Single-task B1K data config with specific episode indices.
 
@@ -144,14 +149,17 @@ def _make_b1k_single_task_data_config(
             (combined subtask_text for valid single-boundary crossings).
         skill_bridge_min_pre: minimum steps before boundary for valid bridge.
         skill_bridge_min_post: minimum steps after boundary for valid bridge.
+        base_assets_dir: if provided, override default assets_dir (useful
+            when base checkpoint lives outside the worktree).
 
     Returns:
         LeRobotB1KDataConfig with subtask_source="annotations_skill"
     """
+    assets_dir = base_assets_dir or f"{_PI05_BASE_CKPT}/assets"
     return LeRobotB1KDataConfig(
         repo_id="behavior-1k/2025-challenge-demos",
         assets=AssetsConfig(
-            assets_dir=f"{_PI05_BASE_CKPT}/assets",
+            assets_dir=assets_dir,
             asset_id="behavior-1k/2025-challenge-demos",
         ),
         base_config=DataConfig(
@@ -392,6 +400,9 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
     skill_bridge_enabled: bool = False,
     skill_bridge_min_pre: int = 1,
     skill_bridge_min_post: int = 1,
+    base_checkpoint_path: str = _PI05_BASE_CKPT,
+    base_assets_dir: str | None = None,
+    output_root: str | None = None,
 ) -> TrainConfig:
     """Factory for single-task overfit experiment with validation split.
 
@@ -435,7 +446,8 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
     train_episodes_index = list(range(train_episodes))
     val_episodes_index = list(range(val_episodes_start, val_episodes_end))
 
-    output_root = f"./outputs/{name}"
+    if output_root is None:
+        output_root = f"./outputs/{name}"
 
     # Decay steps = 1 epoch (estimated upper bound; exact steps_per_epoch
     # will be computed at runtime from the actual dataloader length).
@@ -466,6 +478,7 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
             skill_bridge_enabled=skill_bridge_enabled,
             skill_bridge_min_pre=skill_bridge_min_pre,
             skill_bridge_min_post=skill_bridge_min_post,
+            base_assets_dir=base_assets_dir,
         ),
         val_data=_make_b1k_single_task_data_config(
             task_name,
@@ -474,8 +487,9 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
             skill_bridge_enabled=skill_bridge_enabled,
             skill_bridge_min_pre=skill_bridge_min_pre,
             skill_bridge_min_post=skill_bridge_min_post,
+            base_assets_dir=base_assets_dir,
         ),
-        pytorch_weight_path=_PI05_BASE_CKPT,
+        pytorch_weight_path=base_checkpoint_path,
         num_train_steps=decay_steps,
         num_train_epochs=num_train_epochs,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -654,14 +668,32 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         save_interval=200,
         val_log_interval=100,
     ),
-    # --- Skill bridge baseline: single-task radio FP32, KI=ON, bridge enabled ---
-    # Matches pi05_ki_joint_query_b1k-single_task-radio-ki_on_fp32 but with
-    # skill bridge enabled for combined subtask_text on valid boundary crossings.
+    # --- Skill bridge baseline: single-task radio, KI=ON, bridge enabled ---
+    # Uses verified absolute local paths for base checkpoint/assets (canonical
+    # repo) and outputs (feat worktree outputs dir).
+    # FP32 variant (V100 reference, numerically stable)
     _make_pi05_ki_joint_query_single_task_overfit_config(
         name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_fp32",
         knowledge_insulation=True,
         precision="float32",
         skill_bridge_enabled=True,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        output_root=str(
+            _REPO_ROOT / "outputs" / "pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_fp32"
+        ),
+    ),
+    # BF16 variant (A100/Arnold fast path)
+    _make_pi05_ki_joint_query_single_task_overfit_config(
+        name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_bf16",
+        knowledge_insulation=True,
+        precision="bfloat16",
+        skill_bridge_enabled=True,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        output_root=str(
+            _REPO_ROOT / "outputs" / "pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_bf16"
+        ),
     ),
     # Formal lean B8/W32 run: three stride-12 offsets provide approximate
     # quarter exposure; the exact fixed optimizer-step budget is 104,912.
