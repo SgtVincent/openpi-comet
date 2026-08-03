@@ -673,11 +673,12 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # repo) and outputs (feat worktree outputs dir).
     # Paired control (bridge disabled, same paths, 2000 steps, FP32)
     # For A/B comparison with the bridge variant on the same allocation.
+    # num_train_epochs=1 × ~2000 steps/epoch ≈ 2000 total steps
     _make_pi05_ki_joint_query_single_task_overfit_config(
         name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_control_fp32",
         knowledge_insulation=True,
         precision="float32",
-        num_train_epochs=2000,
+        num_train_epochs=1,
         skill_bridge_enabled=False,
         base_checkpoint_path=_CANONICAL_BASE_CKPT,
         base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
@@ -686,11 +687,12 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         ),
     ),
     # FP32 variant (V100 reference, numerically stable) — bridge enabled
+    # num_train_epochs=1 × ~2000 steps/epoch ≈ 2000 total steps
     _make_pi05_ki_joint_query_single_task_overfit_config(
         name="pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_fp32",
         knowledge_insulation=True,
         precision="float32",
-        num_train_epochs=2000,
+        num_train_epochs=1,
         skill_bridge_enabled=True,
         base_checkpoint_path=_CANONICAL_BASE_CKPT,
         base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
