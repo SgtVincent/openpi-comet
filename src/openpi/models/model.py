@@ -15,9 +15,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
-import safetensors
 import torch
 
+from openpi.models_pytorch.checkpoint_utils import load_pytorch_weights
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
@@ -392,7 +392,7 @@ class BaseModelConfig(abc.ABC):
             )
         _trace("model_load:build_model_done")
         _trace("model_load:safetensors_start")
-        safetensors.torch.load_model(model, weight_path)
+        load_pytorch_weights(model, weight_path, pytorch_model_name=pytorch_model_name)
         _trace("model_load:safetensors_done")
         return model
 
