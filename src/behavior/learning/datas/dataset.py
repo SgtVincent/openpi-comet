@@ -68,6 +68,44 @@ ANNOTATIONS_PATH = "annotations"
 ORCHESTRATORS_PATH = "orchestrators"
 logger = create_module_logger("BehaviorLeRobotDataset")
 
+_B1K_ANCHOR_STRIDE_ENV = "OPENPI_B1K_ANCHOR_STRIDE"
+_B1K_ANCHOR_OFFSET_ENV = "OPENPI_B1K_ANCHOR_OFFSET"
+_B1K_DROP_INCOMPLETE_HORIZON_ENV = "OPENPI_B1K_DROP_INCOMPLETE_HORIZON"
+
+
+def _read_streaming_anchor_env() -> tuple[int, int, bool]:
+    """Read one immutable chunk-streaming anchor contract for this dataset instance."""
+
+    raw_stride = os.environ.get(_B1K_ANCHOR_STRIDE_ENV, "1")
+    raw_offset = os.environ.get(_B1K_ANCHOR_OFFSET_ENV, "0")
+    raw_drop = os.environ.get(_B1K_DROP_INCOMPLETE_HORIZON_ENV, "0")
+    try:
+        stride = int(raw_stride)
+    except ValueError as exc:
+        raise ValueError(f"{_B1K_ANCHOR_STRIDE_ENV} must be an integer, got {raw_stride!r}") from exc
+    try:
+        offset = int(raw_offset)
+    except ValueError as exc:
+        raise ValueError(f"{_B1K_ANCHOR_OFFSET_ENV} must be an integer, got {raw_offset!r}") from exc
+    if stride < 1:
+        raise ValueError(f"{_B1K_ANCHOR_STRIDE_ENV} must be >= 1, got {stride}")
+    if not 0 <= offset < stride:
+        raise ValueError(
+            f"{_B1K_ANCHOR_OFFSET_ENV} must satisfy 0 <= offset < stride; got offset={offset}, stride={stride}"
+        )
+    if raw_drop not in {"0", "1"}:
+        raise ValueError(f"{_B1K_DROP_INCOMPLETE_HORIZON_ENV} must be 0 or 1, got {raw_drop!r}")
+    return stride, offset, raw_drop == "1"
+
+
+def _aligned_streaming_chunk_start(chunk: tuple[int, int, int], *, stride: int, offset: int) -> int | None:
+    """Return the first episode-local aligned global cursor in ``chunk``."""
+
+    global_start, global_end, episode_local_start = chunk
+    delta = (offset - episode_local_start) % stride
+    cursor = global_start + delta
+    return cursor if cursor < global_end else None
+
 
 class BehaviorLeRobotDataset(LeRobotDataset):
     """
@@ -195,6 +233,11 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # ========== Customizations ==========
         self.seed = seed
+        (
+            self._streaming_anchor_stride,
+            self._streaming_anchor_offset,
+            self._streaming_drop_incomplete_horizon,
+        ) = _read_streaming_anchor_env()
         if modalities is None:
             modalities = ["rgb", "depth", "seg_instance_id"]
         if "seg_instance_id" in modalities:
@@ -244,9 +287,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             if shuffle:
                 self.current_streaming_chunk_idx = None
                 self.current_streaming_frame_idx = None
+                self._active_chunks = None
             else:
+                self._active_chunks = self.chunks
                 self.current_streaming_chunk_idx = 0
-                self.current_streaming_frame_idx = self.chunks[self.current_streaming_chunk_idx][0]
+                self.current_streaming_frame_idx = None
+                self._select_aligned_streaming_chunk(start_at_current=True)
             self.obs_loaders = dict()
             self._should_obs_loaders_reload = True
         # record the positional index of each episode index within self.episodes
@@ -809,6 +855,147 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
+    @property
+    def streaming_anchor_stride(self) -> int:
+        return self._streaming_anchor_stride
+
+    @property
+    def streaming_anchor_offset(self) -> int:
+        return self._streaming_anchor_offset
+
+    @property
+    def streaming_drop_incomplete_horizon(self) -> bool:
+        return self._streaming_drop_incomplete_horizon
+
+    def _select_aligned_streaming_chunk(self, *, start_at_current: bool) -> None:
+        if not self._active_chunks:
+            raise RuntimeError("Chunk streaming has no active chunks for this worker")
+        start_idx = int(self.current_streaming_chunk_idx or 0)
+        if not start_at_current:
+            start_idx = (start_idx + 1) % len(self._active_chunks)
+        for shift in range(len(self._active_chunks)):
+            chunk_idx = (start_idx + shift) % len(self._active_chunks)
+            cursor = _aligned_streaming_chunk_start(
+                self._active_chunks[chunk_idx],
+                stride=self._streaming_anchor_stride,
+                offset=self._streaming_anchor_offset,
+            )
+            if cursor is not None:
+                self.current_streaming_chunk_idx = chunk_idx
+                self.current_streaming_frame_idx = cursor
+                return
+        raise RuntimeError(
+            "No active chunk contains an anchor aligned to "
+            f"stride={self._streaming_anchor_stride}, offset={self._streaming_anchor_offset}"
+        )
+
+    def _ensure_streaming_cursor_initialized(self) -> None:
+        if self.current_streaming_chunk_idx is not None:
+            return
+        worker_info = get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        num_workers = 1 if worker_info is None else worker_info.num_workers
+        ddp_rank = int(os.environ.get("RANK", "0"))
+        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        global_num_workers = max(1, num_workers * world_size)
+        global_worker_id = ddp_rank * num_workers + worker_id
+        if self._accept_rng is None:
+            self._accept_rng = random.Random(self.seed + 1000003 * global_worker_id + 17)
+        if self._active_chunks is None:
+            # Existing approximate worker partitioning is intentionally retained.
+            indices = list(range(global_worker_id, len(self.chunks), global_num_workers))
+            if len(indices) == 0:
+                indices = list(range(worker_id, len(self.chunks), num_workers))
+            worker_chunks = [self.chunks[i] for i in indices]
+            rng = np.random.default_rng(self.seed + global_worker_id)
+            rng.shuffle(worker_chunks)
+            self._active_chunks = worker_chunks
+        rng = np.random.default_rng(self.seed + global_worker_id)
+        self.current_streaming_chunk_idx = rng.integers(0, len(self._active_chunks)).item()
+        self._select_aligned_streaming_chunk(start_at_current=True)
+
+    def _move_to_next_streaming_chunk(self) -> None:
+        self._select_aligned_streaming_chunk(start_at_current=False)
+        self._should_obs_loaders_reload = True
+
+    def _next_streaming_observation(self, key: str, *, context: str):
+        try:
+            return next(self.obs_loaders[key])[0]
+        except StopIteration as exc:
+            chunk = self._active_chunks[self.current_streaming_chunk_idx]
+            raise RuntimeError(
+                "Observation loader ended unexpectedly while "
+                f"{context}: modality={key}, cursor={self.current_streaming_frame_idx}, chunk={chunk}, "
+                f"stride={self._streaming_anchor_stride}, offset={self._streaming_anchor_offset}"
+            ) from exc
+
+    def _advance_streaming_anchor(self, *, observation_consumed: bool, context: str) -> None:
+        """Advance all modality readers and the HF cursor to the next aligned anchor."""
+
+        _, chunk_end, _ = self._active_chunks[self.current_streaming_chunk_idx]
+        next_cursor = self.current_streaming_frame_idx + self._streaming_anchor_stride
+        if next_cursor < chunk_end:
+            frames_to_consume = self._streaming_anchor_stride - int(observation_consumed)
+            for _ in range(frames_to_consume):
+                for key in self.meta.video_keys:
+                    self._next_streaming_observation(key, context=context)
+            self.current_streaming_frame_idx = next_cursor
+            return
+
+        # Consume the current rejected/dropped observation, but never decode past
+        # the chunk boundary. The next call closes and reopens at its aligned start.
+        if not observation_consumed:
+            for key in self.meta.video_keys:
+                self._next_streaming_observation(key, context=context)
+        self.current_streaming_frame_idx = chunk_end
+        self._should_obs_loaders_reload = True
+
+    @staticmethod
+    def _action_horizon_is_padded(padding: dict[str, th.Tensor]) -> bool:
+        action_padding = padding.get("action_is_pad")
+        return action_padding is not None and bool(th.as_tensor(action_padding).any().item())
+
+    def _reload_streaming_observation_loaders(self, item: dict, ep_idx: int) -> None:
+        for loader in self.obs_loaders.values():
+            loader.close()
+        self.obs_loaders = {}
+        self.current_streaming_episode_idx = ep_idx
+        chunk_global_start, _, chunk_episode_local_start = self._active_chunks[self.current_streaming_chunk_idx]
+        episode_local_cursor = chunk_episode_local_start + self.current_streaming_frame_idx - chunk_global_start
+        for vid_key in self.meta.video_keys:
+            kwargs = {}
+            task_id = item["task_index"].item()
+            if "seg_instance_id" in vid_key:
+                with open(
+                    self.root / "meta/episodes" / f"task-{task_id:04d}" / f"episode_{ep_idx:08d}.json",
+                ) as f:
+                    meta = json.load(f)
+                    instance_id_mapping = json.loads(meta["ins_id_mapping"])
+                    instance_id_mapping = {int(k): v for k, v in instance_id_mapping.items()}
+                    self.omnigibson_mapping[ep_idx]["instance_id_mapping"] = instance_id_mapping
+                    self.omnigibson_mapping[ep_idx]["unique_ins_ids"][vid_key.split(".")[-1]] = meta[
+                        f"{ROBOT_CAMERA_NAMES['R1Pro'][vid_key.split('.')[-1]]}::unique_ins_ids"
+                    ]
+                    kwargs["id_list"] = th.tensor(
+                        self.omnigibson_mapping[ep_idx]["unique_ins_ids"][vid_key.split(".")[-1]]
+                    )
+            if "rgb" in vid_key:
+                kwargs["train_rgb_type"] = self.train_rgb_type
+            self.obs_loaders[vid_key] = iter(
+                OBS_LOADER_MAP[vid_key.split(".")[2]](
+                    data_path=self.root,
+                    task_id=task_id,
+                    camera_id=vid_key.split(".")[-1],
+                    demo_id=f"{ep_idx:08d}",
+                    start_idx=episode_local_cursor,
+                    start_idx_is_keyframe=False,
+                    batch_size=1,
+                    stride=1,
+                    **kwargs,
+                )
+            )
+        self._should_obs_loaders_reload = False
+
     def __getitem__(self, idx) -> dict:
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
@@ -818,137 +1005,74 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 item["subtask_text"] = subtask_text
             return item
 
-        # Streaming mode: we will load the episode at the current streaming index, and then increment the index for next call
-        # Randomize chunk index on first call
-        if self.current_streaming_chunk_idx is None:
-            worker_info = get_worker_info()
-            worker_id = 0 if worker_info is None else worker_info.id
-            num_workers = 1 if worker_info is None else worker_info.num_workers
-            # Incorporate DDP rank so that different GPUs process different chunks.
-            ddp_rank = int(os.environ.get("RANK", "0"))
-            world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
-            global_num_workers = max(1, num_workers * world_size)
-            global_worker_id = ddp_rank * num_workers + worker_id
-            if self._accept_rng is None:
-                self._accept_rng = random.Random(self.seed + 1000003 * global_worker_id + 17)
-            if not hasattr(self, "_active_chunks") or self._active_chunks is None:
-                # Use a global worker id across all ranks so chunk ownership is
-                # partitioned across GPUs instead of duplicated per-rank.
-                indices = list(range(global_worker_id, len(self.chunks), global_num_workers))
-                if len(indices) == 0:
-                    # Fallback for extreme settings where workers exceed chunk count.
-                    indices = list(range(worker_id, len(self.chunks), num_workers))
-                worker_chunks = [self.chunks[i] for i in indices]
-                rng = np.random.default_rng(self.seed + global_worker_id)
-                rng.shuffle(worker_chunks)
-                self._active_chunks = worker_chunks
-            rng = np.random.default_rng(self.seed + global_worker_id)
-            self.current_streaming_chunk_idx = rng.integers(0, len(self._active_chunks)).item()
-            self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
-        # Current chunk iterated, move to next chunk
-        if self.current_streaming_frame_idx >= self._active_chunks[self.current_streaming_chunk_idx][1]:
-            self.current_streaming_chunk_idx += 1
-            # All data iterated, restart from beginning
-            if self.current_streaming_chunk_idx >= len(self._active_chunks):
-                self.current_streaming_chunk_idx = 0
-            self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
-            self._should_obs_loaders_reload = True
-        item = self.hf_dataset[self.current_streaming_frame_idx]
-        item.pop("observation.task_info")
-        ep_idx = item["episode_index"].item()
+        # Rejections and incomplete horizons advance iteratively; recursion here
+        # could overflow when a long tail or low resampling weight is encountered.
+        while True:
+            self._ensure_streaming_cursor_initialized()
+            _, chunk_end, _ = self._active_chunks[self.current_streaming_chunk_idx]
+            if self.current_streaming_frame_idx >= chunk_end:
+                self._move_to_next_streaming_chunk()
 
-        if self._should_obs_loaders_reload:
-            for loader in self.obs_loaders.values():
-                loader.close()
-            self.obs_loaders = dict()
-            # reload video loaders for new episode
-            self.current_streaming_episode_idx = ep_idx
-            for vid_key in self.meta.video_keys:
-                kwargs = {}
-                task_id = item["task_index"].item()
-                if "seg_instance_id" in vid_key:
-                    # load id list
-                    with open(
-                        self.root / "meta/episodes" / f"task-{task_id:04d}" / f"episode_{ep_idx:08d}.json",
-                    ) as f:
-                        meta = json.load(f)
-                        instance_id_mapping = json.loads(meta["ins_id_mapping"])
-                        instance_id_mapping = {int(k): v for k, v in instance_id_mapping.items()}
-                        self.omnigibson_mapping[ep_idx]["instance_id_mapping"] = instance_id_mapping
-                        self.omnigibson_mapping[ep_idx]["unique_ins_ids"][vid_key.split(".")[-1]] = meta[
-                            f"{ROBOT_CAMERA_NAMES['R1Pro'][vid_key.split('.')[-1]]}::unique_ins_ids"
-                        ]
-                        kwargs["id_list"] = th.tensor(
-                            self.omnigibson_mapping[ep_idx]["unique_ins_ids"][vid_key.split(".")[-1]]
-                        )
-                if "rgb" in vid_key:
-                    kwargs["train_rgb_type"] = self.train_rgb_type
-                self.obs_loaders[vid_key] = iter(
-                    OBS_LOADER_MAP[vid_key.split(".")[2]](
-                        data_path=self.root,
-                        task_id=task_id,
-                        camera_id=vid_key.split(".")[-1],
-                        demo_id=f"{ep_idx:08d}",
-                        start_idx=self._active_chunks[self.current_streaming_chunk_idx][2],
-                        start_idx_is_keyframe=False,
-                        batch_size=1,
-                        stride=1,
-                        **kwargs,
+            item = self.hf_dataset[self.current_streaming_frame_idx]
+            item.pop("observation.task_info")
+            ep_idx = item["episode_index"].item()
+
+            if self._should_obs_loaders_reload:
+                self._reload_streaming_observation_loaders(item, ep_idx)
+
+            if self.delta_indices is not None:
+                query_indices, padding = self._get_query_indices(self.current_streaming_frame_idx, ep_idx)
+                if self._streaming_drop_incomplete_horizon and self._action_horizon_is_padded(padding):
+                    self._advance_streaming_anchor(
+                        observation_consumed=False,
+                        context="dropping an incomplete action horizon",
                     )
-                )
-            self._should_obs_loaders_reload = False
+                    continue
+                query_result = self._query_hf_dataset(query_indices)
+                item = {**item, **padding, **query_result}
 
-        query_indices = None
-        if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(self.current_streaming_frame_idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
-            item = {**item, **padding}
-            for key, val in query_result.items():
-                item[key] = val
+            weight = self._get_resample_weight(item)
+            if self._accept_rng is not None and self._accept_rng.random() >= weight:
+                self._advance_streaming_anchor(observation_consumed=False, context="rejecting a resampled anchor")
+                continue
 
-        weight = self._get_resample_weight(item)
-        if self._accept_rng is not None and self._accept_rng.random() >= weight:
-            self.current_streaming_frame_idx += 1
+            # The current observation consumes one decoded frame per modality.
             for key in self.meta.video_keys:
-                next(self.obs_loaders[key])[0]
-            return self.__getitem__(idx)
+                item[key] = self._next_streaming_observation(key, context="returning an aligned anchor")
 
-        # load visual observations
-        for key in self.meta.video_keys:
-            item[key] = next(self.obs_loaders[key])[0]
+                if self.return_seg_instance and "seg_instance_id" in key:
+                    seg_instance, instance_mapping = instance_id_to_instance(
+                        obs=item[key],
+                        instance_id_mapping=self.omnigibson_mapping[ep_idx]["instance_id_mapping"],
+                        unique_ins_ids=np.array(
+                            self.omnigibson_mapping[ep_idx]["unique_ins_ids"][key.split(".")[-1]]
+                        ),
+                    )
+                    instance_mapping = {instance_name: id for id, instance_name in instance_mapping.items()}
 
-            if self.return_seg_instance and "seg_instance_id" in key:
-                seg_instance, instance_mapping = instance_id_to_instance(
-                    obs=item[key],
-                    instance_id_mapping=self.omnigibson_mapping[ep_idx]["instance_id_mapping"],
-                    unique_ins_ids=np.array(self.omnigibson_mapping[ep_idx]["unique_ins_ids"][key.split(".")[-1]]),
-                )
-                instance_mapping = {instance_name: id for id, instance_name in instance_mapping.items()}
+                    frame_index = round(item["timestamp"].item() * self.fps)
+                    sub_idx = bisect.bisect_right(
+                        self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1
+                    )
+                    skill_annotation = self.meta.annotations[ep_idx]["skill_annotation"]
+                    relative_obj_names = skill_annotation[sub_idx]["object_id"][0]
+                    for i, relative_obj_name in enumerate(relative_obj_names):
+                        instance_id = instance_mapping[relative_obj_name]
+                        seg_instance[seg_instance == instance_id] = -(i + 1)
+                    seg_instance[seg_instance > 0] = 0
+                    seg_instance *= -1
+                    item[key.replace("seg_instance_id", "seg_instance")] = seg_instance
 
-                frame_index = round(item["timestamp"].item() * self.fps)
-                sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
-                skill_annotation = self.meta.annotations[ep_idx]["skill_annotation"]
-                relative_obj_names = skill_annotation[sub_idx]["object_id"][0]
-                for i, relative_obj_name in enumerate(relative_obj_names):
-                    instance_id = instance_mapping[relative_obj_name]
-                    seg_instance[seg_instance == instance_id] = -(i + 1)
-                seg_instance[seg_instance > 0] = 0
-                seg_instance *= -1
-                item[key.replace("seg_instance_id", "seg_instance")] = seg_instance
+            if self.image_transforms is not None:
+                for cam in self.meta.camera_keys:
+                    item[cam] = self.image_transforms(item[cam])
 
-        if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
-
-        # Add task as a string
-        item["task"] = self._get_fine_grained_task(item)
-        subtask_text = self._get_subtask_text(item)
-        if subtask_text is not None:
-            item["subtask_text"] = subtask_text
-        self.current_streaming_frame_idx += 1
-
-        return item
+            item["task"] = self._get_fine_grained_task(item)
+            subtask_text = self._get_subtask_text(item)
+            if subtask_text is not None:
+                item["subtask_text"] = subtask_text
+            self._advance_streaming_anchor(observation_consumed=True, context="advancing after an aligned anchor")
+            return item
 
     def _get_resample_key_from_skill_ann(self, item: dict) -> tuple[str | None, str | None]:
         if self.resample_group_by not in {"skill_type", "skill_description"}:
