@@ -23,6 +23,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 _FULL_TASK_BF16_CONFIG = "pi05_ki_joint_query_b1k-full_task-ki_on_bf16"
 _FULL_TASK_BF16_LAUNCHER = _REPO_ROOT / "scripts/run_pi05_ki_joint_query_full_b1k_bf16_multinode_hl.sh"
 _LQ_FP32_LAUNCHER = _REPO_ROOT / "scripts/run_pi05_ki_joint_query_single_task_radio_fp32_multinode_v100.sh"
+_B1K_HEADLESS_EVAL_LAUNCHER = _REPO_ROOT / "scripts/run_b1k_eval_parallel_single_task_headless.sh"
 
 
 def _manual_preflight_env(**overrides):
@@ -36,6 +37,8 @@ def _manual_preflight_env(**overrides):
             "PATH": f"{Path(sys.executable).parent}{os.pathsep}{env.get('PATH', '')}",
             "PREPARE_HF_CACHE_ONLY": "0",
             "FORCE_LOAD_CACHE": "0",
+            "WANDB_DISABLED": "0",
+            "WANDB_MODE": "online",
             **overrides,
         }
     )
@@ -533,6 +536,26 @@ def test_git_validated_lq_fp32_launcher_contract_remains_unchanged():
     assert '--same_network' in script
 
 
+def test_headless_eval_launcher_scopes_viewer_dimensions_to_eval_custom():
+    """Canonical eval.py must not receive eval_custom.py-only Hydra overrides."""
+    script = _B1K_HEADLESS_EVAL_LAUNCHER.read_text()
+    launch_eval = script.split("launch_eval() {", maxsplit=1)[1].split("\n}\n\nrun_single_checkpoint_mode()", maxsplit=1)[0]
+    custom_marker = 'if [[ "$EVAL_ENTRYPOINT" == "eval_custom.py" ]]; then'
+    eval_py_path, custom_path = launch_eval.split(custom_marker, maxsplit=1)
+    custom_overrides = custom_path.split("\n  fi", maxsplit=1)[0]
+
+    common_overrides = (
+        'feature_args="$feature_args render_viewer_camera=$RENDER_VIEWER_CAMERA '
+        'gui_viewport_only=$GUI_VIEWPORT_ONLY"'
+    )
+    assert common_overrides in eval_py_path
+    assert "viewer_width=" not in eval_py_path
+    assert "viewer_height=" not in eval_py_path
+    assert 'feature_args="$feature_args viewer_width=$VIEWER_WIDTH viewer_height=$VIEWER_HEIGHT"' in custom_overrides
+    assert launch_eval.count("viewer_width=") == 1
+    assert launch_eval.count("viewer_height=") == 1
+
+
 def test_full_task_bf16_hl_contract():
     """Full-task BF16 config should exactly encode the formal HL experiment."""
     from openpi.models.pi05_ki_joint_query_config import Pi05KIJointQueryConfig
@@ -580,19 +603,22 @@ def test_full_task_bf16_hl_contract():
     assert train.assets.assets_dir == "checkpoints/pi05_base_pytorch/assets"
     assert train.assets.asset_id == "behavior-1k/2025-challenge-demos"
 
-    # Step cap 0 delegates the exact target to five runtime dataloader epochs.
-    assert config.num_train_steps == 0
-    assert config.num_train_epochs == 5
-    assert config.lr_schedule.decay_steps == 0
-    assert config.save_interval == 0
-    assert config.checkpoint_policy == "epoch_with_rolling"
-    assert config.rolling_checkpoint_interval == 10000
-    assert config.val_log_interval == 1000
+    # Lean formal mode has a fixed three-pass optimizer-step/LR budget.
+    assert config.num_train_steps == 104_912
+    assert config.num_train_epochs is None
+    assert config.lr_schedule.warmup_steps == 1_000
+    assert config.lr_schedule.peak_lr == 1e-5
+    assert config.lr_schedule.decay_steps == 104_912
+    assert config.lr_schedule.decay_lr == 0.0
+    assert config.save_interval == 10_000
+    assert config.checkpoint_policy == "step"
+    assert config.val_log_interval == 1_000
     assert config.val_num_batches == 20
-    assert config.batch_size_per_gpu == 4
+    assert config.batch_size_per_gpu == 8
     assert config.gradient_accumulation_steps == 1
     assert config.ema_decay is None
-    assert config.wandb_enabled is False
+    assert config.wandb_enabled is True
+    assert config.project_name == "pi05_ki"
 
 
 def test_full_task_bf16_launcher_contract():
@@ -603,20 +629,32 @@ def test_full_task_bf16_launcher_contract():
     assert launcher.is_file()
     assert launcher.stat().st_mode & 0o111
     assert f'CONFIG_NAME="${{CONFIG_NAME:-{_FULL_TASK_BF16_CONFIG}}}"' in script
-    assert 'NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-0}"' in script
-    assert 'NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-5}"' in script
-    assert 'NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-2000}"' not in script
+    assert 'NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-104912}"' in script
+    assert 'NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-' not in script
     assert '--num-train-steps "${NUM_TRAIN_STEPS}"' in script
-    assert '--num-train-epochs "${NUM_TRAIN_EPOCHS}"' in script
-    assert 'CHECKPOINT_POLICY="${CHECKPOINT_POLICY:-epoch_with_rolling}"' in script
-    assert 'ROLLING_CHECKPOINT_INTERVAL="${ROLLING_CHECKPOINT_INTERVAL:-10000}"' in script
+    assert '--num-train-epochs' not in script
+    assert 'CHECKPOINT_POLICY="${CHECKPOINT_POLICY:-step}"' in script
+    assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"' in script
     assert '--checkpoint-policy "${CHECKPOINT_POLICY}"' in script
-    assert '--rolling-checkpoint-interval "${ROLLING_CHECKPOINT_INTERVAL}"' in script
-    assert "SAVE_INTERVAL" not in script
+    assert '--save-interval "${SAVE_INTERVAL}"' in script
+    assert "ROLLING_CHECKPOINT_INTERVAL" not in script
     assert "KEEP_PERIOD" not in script
     assert 'VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-1000}"' in script
     assert 'VAL_NUM_BATCHES="${VAL_NUM_BATCHES:-20}"' in script
-    assert 'BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"' in script
+    assert 'BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"' in script
+    assert 'GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"' in script
+    assert 'WARMUP_STEPS="${WARMUP_STEPS:-1000}"' in script
+    assert 'PEAK_LR="${PEAK_LR:-1e-5}"' in script
+    assert 'FRAME_ANCHOR_STRIDE="${FRAME_ANCHOR_STRIDE:-12}"' in script
+    assert 'FRAME_ANCHOR_OFFSETS="${FRAME_ANCHOR_OFFSETS:-0,4,8}"' in script
+    assert 'DROP_INCOMPLETE_ACTION_HORIZON="${DROP_INCOMPLETE_ACTION_HORIZON:-1}"' in script
+    assert 'export OPENPI_B1K_ANCHOR_STRIDE="12"' in script
+    assert 'export OPENPI_B1K_ANCHOR_OFFSET="0"' in script
+    assert 'export OPENPI_B1K_DROP_INCOMPLETE_HORIZON="1"' in script
+    assert 'export OPENPI_PERSISTENT_WORKERS="${OPENPI_PERSISTENT_WORKERS:-0}"' in script
+    assert "24.9383588896%" in script
+    assert "approximate coverage only" in script
+    assert "formal resume unsupported" in script
     assert 'PYTORCH_TRAINING_PRECISION="${PYTORCH_TRAINING_PRECISION:-bfloat16}"' in script
     assert 'PREPARE_HF_CACHE_ONLY="${PREPARE_HF_CACHE_ONLY:-0}"' in script
     assert 'FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-0}"' in script
@@ -688,6 +726,43 @@ def test_full_task_bf16_launcher_contract():
     assert 'package metadata missing' in script
     assert 'installed_version != expected_version' in script
     assert 'python -m accelerate.commands.launch' in script
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"RESUME": "1"}, "RESUME=1 is unsupported"),
+        ({"WANDB_DISABLED": "1"}, "requires online Byted-W&B"),
+        ({"WANDB_MODE": "offline"}, "requires WANDB_MODE=online"),
+    ],
+)
+def test_full_task_launcher_rejects_unsupported_formal_runtime_modes(overrides, expected):
+    result = _run_full_task_preflight(_manual_preflight_env(**overrides))
+    assert result.returncode != 0
+    assert expected in result.stderr
+
+
+def test_full_task_prepare_only_bypasses_wandb_guard(tmp_path):
+    run_id = f"prepare-only-{tmp_path.name}"
+    user = f"pytest-{os.getpid()}-{tmp_path.name}"
+    local_root = Path("/tmp/openpi-comet") / user / _FULL_TASK_BF16_CONFIG / run_id
+    tmp_alias = _tmp_alias_for(local_root)
+    try:
+        result = _run_full_task_preflight(
+            _manual_preflight_env(
+                PREPARE_HF_CACHE_ONLY="1",
+                WANDB_DISABLED="1",
+                WANDB_MODE="offline",
+                OPENPI_HF_CACHE_RUN_ID=run_id,
+                USER=user,
+            )
+        )
+        assert result.returncode == 0, result.stderr
+        assert "LOCAL_CACHE_PREFLIGHT_OK" in result.stdout
+    finally:
+        if tmp_alias.is_symlink() and os.readlink(tmp_alias) == str(local_root / "tmp"):
+            tmp_alias.unlink()
+        shutil.rmtree(Path("/tmp/openpi-comet") / user, ignore_errors=True)
 
 
 def test_full_task_launcher_manual_run_without_identity_fails_closed():
@@ -1004,19 +1079,17 @@ def test_full_task_launcher_tyro_arguments_parse(monkeypatch):
             "--pytorch-training-precision",
             "bfloat16",
             "--num-train-steps",
-            "0",
-            "--num-train-epochs",
-            "5",
+            "104912",
             "--checkpoint-policy",
-            "epoch_with_rolling",
-            "--rolling-checkpoint-interval",
-            "750",
+            "step",
+            "--save-interval",
+            "10000",
             "--val-log-interval",
-            "100",
+            "1000",
             "--val-num-batches",
             "20",
             "--batch-size-per-gpu",
-            "1",
+            "8",
             "--num-workers",
             "4",
             "--gradient-accumulation-steps",
@@ -1027,7 +1100,6 @@ def test_full_task_launcher_tyro_arguments_parse(monkeypatch):
             "/shared/outputs/checkpoints",
             "--log-base-dir",
             "/shared/outputs/logs",
-            "--no-wandb-enabled",
         ],
     )
 
@@ -1036,20 +1108,19 @@ def test_full_task_launcher_tyro_arguments_parse(monkeypatch):
     assert parsed.pytorch_weight_path == "/shared/checkpoints/pi05_base_pytorch"
     assert parsed.exp_name == "tyro_full_b1k_contract"
     assert parsed.pytorch_training_precision == "bfloat16"
-    assert parsed.num_train_steps == 0
-    assert parsed.num_train_epochs == 5
-    assert parsed.save_interval == 0
-    assert parsed.checkpoint_policy == "epoch_with_rolling"
-    assert parsed.rolling_checkpoint_interval == 750
-    assert parsed.val_log_interval == 100
+    assert parsed.num_train_steps == 104_912
+    assert parsed.num_train_epochs is None
+    assert parsed.save_interval == 10_000
+    assert parsed.checkpoint_policy == "step"
+    assert parsed.val_log_interval == 1_000
     assert parsed.val_num_batches == 20
-    assert parsed.batch_size_per_gpu == 1
+    assert parsed.batch_size_per_gpu == 8
     assert parsed.num_workers == 4
     assert parsed.gradient_accumulation_steps == 1
     assert parsed.assets_base_dir == "/shared/outputs/assets"
     assert parsed.checkpoint_base_dir == "/shared/outputs/checkpoints"
     assert parsed.log_base_dir == "/shared/outputs/logs"
-    assert parsed.wandb_enabled is False
+    assert parsed.wandb_enabled is True
 
 
 def test_full_task_launcher_uses_bf16_zero2_without_optimizer_offload():

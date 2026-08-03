@@ -485,34 +485,23 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     train_episodes: int = 180,
     val_episodes_start: int = 180,
     val_episodes_end: int = 200,
-    num_train_steps: int = 0,
-    num_train_epochs: int = 5,
-    peak_lr: float = 1e-5,
-    warmup_steps: int = 25,
-    rolling_checkpoint_interval: int = 10000,
-    val_log_interval: int = 1000,
-    val_num_batches: int = 20,
-    batch_size_per_gpu: int = 4,
-    gradient_accumulation_steps: int = 1,
     behavior_dataset_root: str = _HL_B1K_DATA_ROOT,
 ) -> TrainConfig:
-    """Formal BF16 π0.5-KI joint-query config over the full B1K task set.
+    """Formal lean B8/W32 BF16 config over the full B1K task set.
 
-    No task filter is applied. Episode indices are interpreted per task, with
-    train episodes ``[0, 180)`` and validation episodes ``[180, 200)`` by
-    default. The default budget is exactly five complete epochs: a non-positive
-    ``num_train_steps`` disables the step cap in ``train_accelerate.py`` while
-    ``num_train_epochs=5`` supplies the stopping criterion.
+    Training uses three streaming stride-12 passes with episode-local offsets
+    ``(0, 4, 8)`` and drops the final 31 incomplete action starts per episode.
+    Pass source/step/consumed/drop budgets are respectively
+    ``(8,955,603, 34,982, 8,955,392, 211)``,
+    ``(8,952,584, 34,971, 8,952,576, 8)``, and
+    ``(8,949,525, 34,959, 8,949,504, 21)``. Their cumulative boundaries are
+    ``34,982 / 69,953 / 104,912``. The theoretical eligible union is
+    26,857,712 anchors and 26,857,472 are consumed, with 240 dropped by global
+    batch truncation: 24.9383588896% of the original 107,696,389 train anchors,
+    i.e. approximate quarter exposure rather than exact unique coverage.
 
-    Default batch size is 4 per GPU (global 128 on 32 GPUs) with 25 warmup
-    steps — sample-aligned with the previous batch_size=1/warmup=100 baseline
-    (3200 warmup samples in both cases).
-
-    Validation defaults to every 1000 optimizer steps with 20 batches per pass.
-    Checkpointing opts into the epoch-oriented policy: each completed epoch gets
-    one durable checkpoint, while ``rolling_checkpoint_interval`` controls one
-    atomically replaced recovery checkpoint during the current epoch (default
-    10000 steps).
+    Validation keeps the baseline stride-1 loader and padding behavior. Formal
+    resume is unsupported; checkpoints are weights/evaluation artifacts only.
     """
     train_episodes_index = list(range(train_episodes))
     val_episodes_index = list(range(val_episodes_start, val_episodes_end))
@@ -543,32 +532,30 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
             behavior_dataset_root=behavior_dataset_root,
         ),
         pytorch_weight_path=_PI05_BASE_CKPT,
-        num_train_steps=num_train_steps,
-        num_train_epochs=num_train_epochs,
+        num_train_steps=104_912,
+        num_train_epochs=None,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=warmup_steps,
-            peak_lr=peak_lr,
-            # train_accelerate.py replaces non-positive decay_steps with the
-            # runtime one-epoch target after the dataloader length is known.
-            decay_steps=num_train_steps,
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=104_912,
             decay_lr=0.0,
         ),
         pytorch_training_precision="bfloat16",
         accelerate_mixed_precision="bf16",
         ema_decay=None,
-        wandb_enabled=False,
+        wandb_enabled=True,
         assets_base_dir=f"{output_root}/assets",
         checkpoint_base_dir=f"{output_root}/checkpoints",
         log_base_dir=f"{output_root}/logs",
         num_workers=2,
-        batch_size_per_gpu=batch_size_per_gpu,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        save_interval=0,
-        checkpoint_policy="epoch_with_rolling",
-        rolling_checkpoint_interval=rolling_checkpoint_interval,
+        batch_size_per_gpu=8,
+        gradient_accumulation_steps=1,
+        save_interval=10_000,
+        checkpoint_policy="step",
+        rolling_checkpoint_interval=10_000,
         log_interval=10,
-        val_log_interval=val_log_interval,
-        val_num_batches=val_num_batches,
+        val_log_interval=1_000,
+        val_num_batches=20,
     )
 
 
@@ -645,9 +632,8 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         save_interval=200,
         val_log_interval=100,
     ),
-    # Formal full B1K challenge task-set BF16 run. ``tasks=None`` selects all
-    # tasks; episode ranges are applied per task. Step cap 0 lets the runtime
-    # dataloader length determine five complete epochs.
+    # Formal lean B8/W32 run: three stride-12 offsets provide approximate
+    # quarter exposure; the exact fixed optimizer-step budget is 104,912.
     _make_pi05_ki_joint_query_full_task_set_bf16_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
     ),

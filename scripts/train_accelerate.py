@@ -20,6 +20,7 @@ DeepSpeed ZeRO:
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
 import dataclasses
 import datetime
 import faulthandler
@@ -260,32 +261,40 @@ def configure_hf_cache(config: _config.TrainConfig, *, accelerator: Accelerator)
         logging.info("OPENPI_LOAD_DATASET_NUM_PROC_CAP=%s", os.environ.get("OPENPI_LOAD_DATASET_NUM_PROC_CAP"))
 
 
+def _init_wandb_run(config: _config.TrainConfig, *, resuming: bool):
+    wandb = _get_wandb()
+    ckpt_dir = config.checkpoint_dir
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+
+    settings = wandb.Settings(init_timeout=120)
+    if resuming:
+        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+        run = wandb.init(id=run_id, resume="must", project=config.project_name, settings=settings)
+    else:
+        run = wandb.init(
+            name=config.exp_name,
+            config=dataclasses.asdict(config),
+            project=config.project_name,
+            settings=settings,
+        )
+        if run is None or not getattr(run, "id", None):
+            raise RuntimeError("wandb.init returned no run id")
+        (ckpt_dir / "wandb_id.txt").write_text(run.id)
+    if run is None:
+        raise RuntimeError("wandb.init returned no run")
+    return run
+
+
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
     if not enabled:
         logging.info("wandb logging disabled")
-        return
+        return None
 
     try:
-        wandb = _get_wandb()
-
-        ckpt_dir = config.checkpoint_dir
-        if not ckpt_dir.exists():
-            raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-
-        settings = wandb.Settings(init_timeout=120)
-        if resuming:
-            run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-            wandb.init(id=run_id, resume="must", project=config.project_name, settings=settings)
-        else:
-            wandb.init(
-                name=config.exp_name,
-                config=dataclasses.asdict(config),
-                project=config.project_name,
-                settings=settings,
-            )
-            (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        return _init_wandb_run(config, resuming=resuming)
     except Exception as exc:
-        # W&B is optional for training; avoid killing a multi-node job due to logging deps.
+        # Legacy configs retain optional W&B initialization.
         debug = os.environ.get("OPENPI_WANDB_DEBUG", "0") in {"1", "true", "TRUE", "True"}
         if debug:
             logging.warning("wandb init failed; continuing without wandb", exc_info=True)
@@ -295,7 +304,183 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
             object.__setattr__(config, "wandb_enabled", False)
         except Exception:
             pass
+        return None
+
+
+_FORMAL_B1K_CONFIG_NAME = "pi05_ki_joint_query_b1k-full_task-ki_on_bf16"
+_FORMAL_B1K_PASS_SPECS = ((0, 34_982), (4, 34_971), (8, 34_959))
+_FORMAL_B1K_PASS_BOUNDARIES = (34_982, 69_953, 104_912)
+_FORMAL_B1K_DATASET_ENV_KEYS = (
+    "OPENPI_B1K_ANCHOR_STRIDE",
+    "OPENPI_B1K_ANCHOR_OFFSET",
+    "OPENPI_B1K_DROP_INCOMPLETE_HORIZON",
+)
+
+
+def _is_formal_b1k_mode(config) -> bool:
+    return getattr(config, "name", None) == _FORMAL_B1K_CONFIG_NAME
+
+
+def _set_formal_b1k_pass_offset(offset: int) -> None:
+    if offset not in {spec[0] for spec in _FORMAL_B1K_PASS_SPECS}:
+        raise ValueError(f"Unsupported formal B1K pass offset: {offset}")
+    os.environ["OPENPI_B1K_ANCHOR_STRIDE"] = "12"
+    os.environ["OPENPI_B1K_ANCHOR_OFFSET"] = str(offset)
+    os.environ["OPENPI_B1K_DROP_INCOMPLETE_HORIZON"] = "1"
+
+
+@contextmanager
+def _baseline_b1k_dataset_env():
+    """Construct validation datasets with legacy stride-1/padding defaults."""
+
+    saved = {key: os.environ.get(key) for key in _FORMAL_B1K_DATASET_ENV_KEYS}
+    try:
+        for key in _FORMAL_B1K_DATASET_ENV_KEYS:
+            os.environ.pop(key, None)
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _formal_b1k_pass_for_step(global_step: int) -> tuple[int, int, int, int, int]:
+    if not 0 <= global_step < _FORMAL_B1K_PASS_BOUNDARIES[-1]:
+        raise ValueError(f"Formal B1K global_step out of range: {global_step}")
+    pass_start = 0
+    for pass_index, ((offset, pass_steps), pass_end) in enumerate(
+        zip(_FORMAL_B1K_PASS_SPECS, _FORMAL_B1K_PASS_BOUNDARIES, strict=True)
+    ):
+        if global_step < pass_end:
+            return pass_index, offset, pass_steps, pass_start, pass_end
+        pass_start = pass_end
+    raise AssertionError("unreachable formal B1K pass lookup")
+
+
+def _close_training_iterator(iterator) -> None:
+    if iterator is None:
         return
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
+def _cosine_lr_value(
+    step: int,
+    *,
+    warmup_steps: int,
+    peak_lr: float,
+    decay_steps: int,
+    end_lr: float,
+) -> float:
+    if step < warmup_steps:
+        init_lr = peak_lr / (warmup_steps + 1)
+        return init_lr + (peak_lr - init_lr) * step / max(1, warmup_steps)
+    progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
+    cosine = 0.5 * (1 + np.cos(np.pi * progress))
+    return end_lr + (peak_lr - end_lr) * cosine
+
+
+def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
+    if not _is_formal_b1k_mode(config):
+        return
+
+    expected_fields = {
+        "batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 1,
+        "num_train_steps": 104_912,
+        "wandb_enabled": True,
+        "project_name": "pi05_ki",
+    }
+    for field, expected in expected_fields.items():
+        actual = getattr(config, field, None)
+        if actual != expected:
+            raise ValueError(
+                f"Formal B1K requires {field}={expected!r}; got {actual!r}. "
+                "Runtime overrides are not supported."
+            )
+    if getattr(config, "num_train_epochs", None) is not None:
+        raise ValueError("Formal B1K requires num_train_epochs=None and the fixed 104,912-step budget")
+    if bool(getattr(config, "resume", False)):
+        raise ValueError(
+            "Formal B1K resume is unsupported: checkpoints are weights/evaluation artifacts, "
+            "not exact data-order resume points"
+        )
+
+    schedule = config.lr_schedule
+    schedule_values = (
+        int(schedule.warmup_steps),
+        float(schedule.peak_lr),
+        int(schedule.decay_steps),
+        float(schedule.decay_lr),
+    )
+    if schedule_values != (1_000, 1e-5, 104_912, 0.0):
+        raise ValueError(
+            "Formal B1K requires warmup=1000, peak_lr=1e-5, decay_steps=104912, decay_lr=0; "
+            f"got {schedule_values}"
+        )
+
+    os.environ.setdefault("FRAME_ANCHOR_STRIDE", "12")
+    os.environ.setdefault("FRAME_ANCHOR_OFFSETS", "0,4,8")
+    if os.environ["FRAME_ANCHOR_STRIDE"] != "12":
+        raise ValueError("Formal B1K requires FRAME_ANCHOR_STRIDE=12")
+    try:
+        frame_offsets = tuple(int(value) for value in os.environ["FRAME_ANCHOR_OFFSETS"].split(","))
+    except ValueError as exc:
+        raise ValueError("Formal B1K FRAME_ANCHOR_OFFSETS must be exactly 0,4,8") from exc
+    if frame_offsets != (0, 4, 8):
+        raise ValueError(
+            f"Formal B1K FRAME_ANCHOR_OFFSETS must be exactly (0, 4, 8); got {frame_offsets}"
+        )
+
+    formal_dataset_defaults = {
+        "OPENPI_B1K_ANCHOR_STRIDE": "12",
+        "OPENPI_B1K_ANCHOR_OFFSET": "0",
+        "OPENPI_B1K_DROP_INCOMPLETE_HORIZON": "1",
+    }
+    for key, expected in formal_dataset_defaults.items():
+        os.environ.setdefault(key, expected)
+        if os.environ[key] != expected:
+            raise ValueError(f"Formal B1K requires initial {key}={expected}; got {os.environ[key]!r}")
+
+    os.environ.setdefault("OPENPI_PERSISTENT_WORKERS", "0")
+    if os.environ["OPENPI_PERSISTENT_WORKERS"] != "0":
+        raise ValueError("Formal B1K requires OPENPI_PERSISTENT_WORKERS=0 so every pass rebuilds workers")
+
+    if accelerator is not None:
+        if int(accelerator.num_processes) != 32:
+            raise ValueError(f"Formal B1K requires world size 32; got {accelerator.num_processes}")
+        if int(accelerator.gradient_accumulation_steps) != 1:
+            raise ValueError(
+                "Formal B1K requires Accelerator gradient_accumulation_steps=1; "
+                f"got {accelerator.gradient_accumulation_steps}"
+            )
+
+
+def _init_formal_b1k_wandb(config, *, accelerator) -> None:
+    """Require rank-0 Byted-W&B init and broadcast one matched result."""
+
+    if not _is_formal_b1k_mode(config) or config.prepare_hf_cache_only:
+        return
+
+    error = None
+    if accelerator.is_main_process:
+        try:
+            _init_wandb_run(config, resuming=False)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+
+    payload = [error]
+    distributed_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if int(accelerator.num_processes) > 1:
+        if not distributed_ready:
+            payload[0] = "distributed process group is not initialized for W&B consensus"
+        else:
+            torch.distributed.broadcast_object_list(payload, src=0)
+    if payload[0] is not None:
+        raise RuntimeError(f"Formal B1K requires online Byted-W&B initialization on rank 0: {payload[0]}")
 
 
 _CHECKPOINT_POLICY_STEP = "step"
@@ -2432,6 +2617,7 @@ def save_checkpoint(
 
 def _validate_runtime_config(config: _config.TrainConfig) -> None:
     """Fail fast on runtime options that would otherwise fail mid-training."""
+    _validate_formal_b1k_contract(config)
     if config.prepare_hf_cache_only and config.force_load_cache:
         raise ValueError(
             "prepare_hf_cache_only and force_load_cache are mutually exclusive. "
@@ -2461,6 +2647,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         gradient_accumulation_steps=int(getattr(config, "gradient_accumulation_steps", 1)),
         kwargs_handlers=kwargs_handlers,
     )
+    _validate_formal_b1k_contract(config, accelerator=accelerator)
 
     is_main = accelerator.is_main_process
     local_rank = accelerator.local_process_index
@@ -2524,8 +2711,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         logging.info("prepare_hf_cache_only=%s", config.prepare_hf_cache_only)
         logging.info("force_load_cache=%s", config.force_load_cache)
 
-    if is_main and not config.prepare_hf_cache_only:
-        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    if not config.prepare_hf_cache_only:
+        if _is_formal_b1k_mode(config):
+            _init_formal_b1k_wandb(config, accelerator=accelerator)
+        elif is_main:
+            init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     # Batch size semantics: keep compatibility with train_pytorch.py.
     world_size = accelerator.num_processes
@@ -2603,7 +2793,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     val_loader = None
     val_data_config = None
     if config.val_data:
-        val_loader, val_data_config = build_val_datasets(config)
+        if _is_formal_b1k_mode(config):
+            with _baseline_b1k_dataset_env():
+                val_loader, val_data_config = build_val_datasets(config)
+        else:
+            val_loader, val_data_config = build_val_datasets(config)
         if is_main:
             val_eps = getattr(val_data_config, "episodes_index", None)
             val_tasks = getattr(val_data_config, "tasks", None)
@@ -2626,6 +2820,13 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     steps_per_epoch = max(1, steps_per_epoch_micro // accelerator.gradient_accumulation_steps)
     if steps_per_epoch <= 0:
         raise RuntimeError(f"Computed steps_per_epoch={steps_per_epoch}, expected a positive value.")
+    if _is_formal_b1k_mode(config) and is_main:
+        logging.info(
+            "Formal B1K lean contract: offsets=(0,4,8), pass_steps=(34982,34971,34959), "
+            "boundaries=(34982,69953,104912), theoretical_eligible=26857712, consumed=26857472, "
+            "global_batch_drop=240, exposure=24.9383588896% of 107696389 anchors. "
+            "Coverage is approximate; checkpoints are weights/eval artifacts and resume is unsupported."
+        )
 
     if config.num_train_epochs is not None:
         if config.num_train_epochs <= 0:
@@ -2900,12 +3101,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     # LR schedule factory — builds an independent cosine schedule for each param group.
     def _make_lr_schedule(peak: float, end_val: float):
         def _schedule(step: int) -> float:
-            if step < warmup_steps:
-                init_lr = peak / (warmup_steps + 1)
-                return init_lr + (peak - init_lr) * step / max(1, warmup_steps)
-            progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
-            cos = 0.5 * (1 + np.cos(np.pi * progress))
-            return end_val + (peak - end_val) * cos
+            return _cosine_lr_value(
+                step,
+                warmup_steps=warmup_steps,
+                peak_lr=peak,
+                decay_steps=decay_steps,
+                end_lr=end_val,
+            )
+
         return _schedule
 
     lr_schedule_bb = _make_lr_schedule(bb_peak_lr, bb_end_lr)
@@ -3009,12 +3212,13 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         )
 
     def lr_schedule(step: int) -> float:
-        if step < warmup_steps:
-            init_lr = peak_lr / (warmup_steps + 1)
-            return init_lr + (peak_lr - init_lr) * step / max(1, warmup_steps)
-        progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
-        cos = 0.5 * (1 + np.cos(np.pi * progress))
-        return end_lr + (peak_lr - end_lr) * cos
+        return _cosine_lr_value(
+            step,
+            warmup_steps=warmup_steps,
+            peak_lr=peak_lr,
+            decay_steps=decay_steps,
+            end_lr=end_lr,
+        )
 
     if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
         _patch_deepspeed_loss_scaler()
@@ -3127,9 +3331,48 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     )
 
     last_epoch_logged = None
+    formal_b1k_mode = _is_formal_b1k_mode(config)
+    formal_pass_index = None
+    formal_pass_offset = None
+    formal_pass_start = 0
+    formal_pass_end = int(config.num_train_steps)
+    train_iterator = None
     while global_step < int(config.num_train_steps):
-        for observation, actions in loader:
+        if formal_b1k_mode:
+            next_pass_index, next_offset, pass_steps, pass_start, pass_end = _formal_b1k_pass_for_step(global_step)
+            if formal_pass_index != next_pass_index:
+                accelerator.wait_for_everyone()
+                _close_training_iterator(train_iterator)
+                train_iterator = None
+                if next_pass_index > 0:
+                    del loader
+                    gc.collect()
+                    _set_formal_b1k_pass_offset(next_offset)
+                    loader, _ = build_datasets(config)
+                    loader = accelerator.prepare(loader)
+                formal_pass_index = next_pass_index
+                formal_pass_offset = next_offset
+                formal_pass_start = pass_start
+                formal_pass_end = pass_end
+                train_iterator = iter(loader)
+                accelerator.wait_for_everyone()
+                if is_main:
+                    logging.info(
+                        "Formal B1K pass=%s offset=%s steps=%s global_range=[%s,%s): "
+                        "streaming stride=12 with approximate quarter exposure; exact unique coverage is not claimed",
+                        formal_pass_index,
+                        formal_pass_offset,
+                        pass_steps,
+                        formal_pass_start,
+                        formal_pass_end,
+                    )
+        else:
+            train_iterator = iter(loader)
+
+        for observation, actions in train_iterator:
             if global_step >= int(config.num_train_steps):
+                break
+            if formal_b1k_mode and global_step >= formal_pass_end:
                 break
 
             profile_memory = is_main and _should_profile_memory_step(global_step)
@@ -3807,6 +4050,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             "grad_norm_total": grad_norm_value,
                             **extra_metrics,
                         }
+                        if formal_b1k_mode:
+                            info_dict.update(
+                                {
+                                    "formal_pass_index": float(formal_pass_index),
+                                    "formal_pass_offset": float(formal_pass_offset),
+                                    "formal_pass_step": float(global_step - formal_pass_start),
+                                }
+                            )
                         # Per-param-group LRs for π0.5-KI joint query model.
                         if is_pi05_ki_joint:
                             for pg in optimizer.param_groups:
@@ -3923,6 +4174,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 }
                                 if avg_loss_scale is not None:
                                     log_payload["loss_scale"] = avg_loss_scale
+                                if formal_b1k_mode:
+                                    log_payload.update(
+                                        {
+                                            "formal/pass_index": float(formal_pass_index),
+                                            "formal/pass_offset": float(formal_pass_offset),
+                                            "formal/pass_step": float(global_step - formal_pass_start),
+                                        }
+                                    )
 
                                 # --- π0.5-KI joint query structured metrics ---
                                 if is_pi05_ki_joint:
@@ -3967,6 +4226,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                                 wandb.log(log_payload, step=global_step)
                             except Exception:
+                                # Formal mode requires init/auth consensus only; individual
+                                # runtime log calls intentionally remain best-effort.
                                 logging.warning("wandb log failed; continuing without wandb", exc_info=True)
                                 try:
                                     object.__setattr__(config, "wandb_enabled", False)
@@ -4035,7 +4296,13 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         )
 
                     # ---- Epoch-end validation with slow metrics (flow_l1) ----
-                    if val_loader is not None and steps_per_epoch > 0 and global_step % steps_per_epoch == 0 and global_step > 0:
+                    if (
+                        not formal_b1k_mode
+                        and val_loader is not None
+                        and steps_per_epoch > 0
+                        and global_step % steps_per_epoch == 0
+                        and global_step > 0
+                    ):
                         # Flush training metrics before epoch-end validation writes.
                         _metrics_buffer_flush()
                         run_validation(
@@ -4053,6 +4320,16 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             slow_metrics=True,
                             val_label="val_epoch_end",
                         )
+
+                    if formal_b1k_mode:
+                        if global_step > formal_pass_end:
+                            raise RuntimeError(
+                                f"Formal B1K pass {formal_pass_index} overshot boundary {formal_pass_end}: {global_step}"
+                            )
+                        if global_step == formal_pass_end:
+                            break
+
+    _close_training_iterator(train_iterator)
 
     # Final validation at end of training (if val data configured)
     # Includes slow metrics (flow_l1) for final evaluation.

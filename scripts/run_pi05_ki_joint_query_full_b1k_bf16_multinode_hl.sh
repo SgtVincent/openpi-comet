@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# π0.5-KI joint-query full B1K task-set BF16 training for Merlin/Arnold on HL.
-# Contract: every B1K challenge task (no tasks filter), per-task episodes 0-179
-# train / 180-199 validation, KI enabled, five complete epochs with no step cap,
-# validation every 1000 steps, durable checkpoint at every epoch end, one rolling
-# recovery checkpoint every 10000 steps, batch size 4 per GPU (global 128 on 32
-# GPUs), Accelerate BF16 + DeepSpeed ZeRO-2 with no optimizer offload.
+# π0.5-KI joint-query lean full-B1K BF16 training for Merlin/Arnold on HL.
+# Fixed contract: B8 x W32, GA1, 104,912 steps across streaming stride-12
+# episode-local offsets (0,4,8), complete H32 targets only, fixed warmup 1000
+# and peak LR 1e-5, online Byted-W&B, and baseline stride-1 validation.
+# Exposure is approximate (24.9383588896% of original train anchors); this mode
+# does not claim exact unique coverage and does not support formal resume.
 
 # ---- Cache mode flags (mutually exclusive) ----
 # PREPARE_HF_CACHE_ONLY=1: build train+val Arrow cache then exit (no training)
@@ -22,6 +22,21 @@ if [[ "${PREPARE_HF_CACHE_ONLY}" == "1" && "${FORCE_LOAD_CACHE}" == "1" ]]; then
   echo "Use only one of these flags, or neither for normal mode." >&2
   exit 2
 fi
+if [[ "${RESUME:-0}" == "1" ]]; then
+  echo "ERROR: RESUME=1 is unsupported for formal lean B1K; checkpoints are weights/eval artifacts only." >&2
+  exit 2
+fi
+if [[ "${PREPARE_HF_CACHE_ONLY}" != "1" ]]; then
+  case "${WANDB_DISABLED:-0}" in
+    1|true|TRUE|True) echo "ERROR: formal lean B1K requires online Byted-W&B; WANDB_DISABLED is set." >&2; exit 2 ;;
+  esac
+  case "${WANDB_MODE:-online}" in
+    disabled|DISABLED|Disabled|offline|OFFLINE|Offline|dryrun|DRYRUN|Dryrun)
+      echo "ERROR: formal lean B1K requires WANDB_MODE=online, got ${WANDB_MODE}." >&2
+      exit 2
+      ;;
+  esac
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -32,6 +47,10 @@ export PYTHONNOUSERSITE=1
 unset PYTHONHOME
 
 CONFIG_NAME="${CONFIG_NAME:-pi05_ki_joint_query_b1k-full_task-ki_on_bf16}"
+if [[ "${CONFIG_NAME}" != "pi05_ki_joint_query_b1k-full_task-ki_on_bf16" ]]; then
+  echo "ERROR: this launcher is restricted to pi05_ki_joint_query_b1k-full_task-ki_on_bf16." >&2
+  exit 2
+fi
 PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-${REPO_ROOT}/outputs/${CONFIG_NAME}}"
 
 # Managed job/task IDs are shared by all nodes in one run, while /tmp itself is
@@ -367,12 +386,29 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 # Manifest probe batches: 0 = metadata-only (skip loader probing for faster startup)
 # Set > 0 to re-enable shape/padding/episode inspection from real batches.
 export OPENPI_DATA_MANIFEST_PROBE_BATCHES="${OPENPI_DATA_MANIFEST_PROBE_BATCHES:-0}"
-if [[ "${OPENPI_OFFLINE}" == "1" ]]; then
-  export WANDB_DISABLED="${WANDB_DISABLED:-1}"
-  export WANDB_MODE="${WANDB_MODE:-disabled}"
-fi
+# OPENPI_OFFLINE applies only to HuggingFace/model assets. Byted-W&B remains
+# online and required for normal formal training; prepare-only skips W&B init.
 
-export OPENPI_PERSISTENT_WORKERS="${OPENPI_PERSISTENT_WORKERS:-1}"
+export OPENPI_PERSISTENT_WORKERS="${OPENPI_PERSISTENT_WORKERS:-0}"
+if [[ "${OPENPI_PERSISTENT_WORKERS}" != "0" ]]; then
+  echo "ERROR: formal lean B1K requires OPENPI_PERSISTENT_WORKERS=0 for pass rebuilds." >&2
+  exit 2
+fi
+FRAME_ANCHOR_STRIDE="${FRAME_ANCHOR_STRIDE:-12}"
+FRAME_ANCHOR_OFFSETS="${FRAME_ANCHOR_OFFSETS:-0,4,8}"
+DROP_INCOMPLETE_ACTION_HORIZON="${DROP_INCOMPLETE_ACTION_HORIZON:-1}"
+if [[ "${FRAME_ANCHOR_STRIDE}" != "12" || "${FRAME_ANCHOR_OFFSETS}" != "0,4,8" ]]; then
+  echo "ERROR: formal lean B1K requires FRAME_ANCHOR_STRIDE=12 and FRAME_ANCHOR_OFFSETS=0,4,8." >&2
+  exit 2
+fi
+if [[ "${DROP_INCOMPLETE_ACTION_HORIZON}" != "1" ]]; then
+  echo "ERROR: formal lean B1K requires DROP_INCOMPLETE_ACTION_HORIZON=1." >&2
+  exit 2
+fi
+export FRAME_ANCHOR_STRIDE FRAME_ANCHOR_OFFSETS DROP_INCOMPLETE_ACTION_HORIZON
+export OPENPI_B1K_ANCHOR_STRIDE="12"
+export OPENPI_B1K_ANCHOR_OFFSET="0"
+export OPENPI_B1K_DROP_INCOMPLETE_HORIZON="1"
 export OPENPI_DATALOADER_TIMEOUT_S="${OPENPI_DATALOADER_TIMEOUT_S:-600}"
 export OPENPI_DATALOADER_PREFETCH_FACTOR="${OPENPI_DATALOADER_PREFETCH_FACTOR:-4}"
 export OPENPI_DATALOADER_PIN_MEMORY="${OPENPI_DATALOADER_PIN_MEMORY:-1}"
@@ -411,32 +447,37 @@ if (( NODE_RANK >= NUM_NODES )); then
   exit 2
 fi
 TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
+if [[ "${TOTAL_GPUS}" != "32" ]]; then
+  echo "ERROR: formal lean B1K requires world size 32, got ${TOTAL_GPUS}." >&2
+  exit 2
+fi
 export MASTER_ADDR MASTER_PORT NUM_NODES GPUS_PER_NODE NODE_RANK
 
-# A non-positive step count disables the cap; train_accelerate.py derives the
-# exact five-epoch target from the full-task dataloader at runtime.
-NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-0}"
-NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-5}"
-CHECKPOINT_POLICY="${CHECKPOINT_POLICY:-epoch_with_rolling}"
-# Rolling recovery writes are collective and I/O-heavy. 10000 optimizer steps is
-# the default compromise; override per run with ROLLING_CHECKPOINT_INTERVAL.
-ROLLING_CHECKPOINT_INTERVAL="${ROLLING_CHECKPOINT_INTERVAL:-10000}"
+NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-104912}"
+CHECKPOINT_POLICY="${CHECKPOINT_POLICY:-step}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
 VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-1000}"
 VAL_NUM_BATCHES="${VAL_NUM_BATCHES:-20}"
-BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
+BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+WARMUP_STEPS="${WARMUP_STEPS:-1000}"
+PEAK_LR="${PEAK_LR:-1e-5}"
 PYTORCH_TRAINING_PRECISION="${PYTORCH_TRAINING_PRECISION:-bfloat16}"
-if [[ "${PYTORCH_TRAINING_PRECISION}" != "bfloat16" ]]; then
-  echo "ERROR: this launcher is BF16-only; PYTORCH_TRAINING_PRECISION must be bfloat16." >&2
+if [[ -n "${NUM_TRAIN_EPOCHS:-}" ]]; then
+  echo "ERROR: NUM_TRAIN_EPOCHS is unsupported; formal lean B1K uses the fixed 104,912-step budget." >&2
   exit 2
 fi
-if [[ "${CHECKPOINT_POLICY}" != "epoch_with_rolling" ]]; then
-  echo "ERROR: this launcher requires CHECKPOINT_POLICY=epoch_with_rolling." >&2
+if [[ "${NUM_TRAIN_STEPS}" != "104912" || "${BATCH_SIZE_PER_GPU}" != "8" || "${GRADIENT_ACCUMULATION_STEPS}" != "1" ]]; then
+  echo "ERROR: formal lean B1K requires NUM_TRAIN_STEPS=104912, BATCH_SIZE_PER_GPU=8, and GRADIENT_ACCUMULATION_STEPS=1." >&2
   exit 2
 fi
-if ! [[ "${ROLLING_CHECKPOINT_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "ERROR: ROLLING_CHECKPOINT_INTERVAL must be a positive integer." >&2
+if [[ "${WARMUP_STEPS}" != "1000" || "${PEAK_LR}" != "1e-5" ]]; then
+  echo "ERROR: formal lean B1K requires WARMUP_STEPS=1000 and PEAK_LR=1e-5 (no LR scaling)." >&2
+  exit 2
+fi
+if [[ "${PYTORCH_TRAINING_PRECISION}" != "bfloat16" || "${CHECKPOINT_POLICY}" != "step" || "${SAVE_INTERVAL}" != "10000" ]]; then
+  echo "ERROR: formal lean B1K requires BF16 and 10,000-step artifact checkpoints under step policy." >&2
   exit 2
 fi
 
@@ -531,15 +572,10 @@ if [[ -z "${EXP_NAME:-}" ]]; then
   _script_start_ts="$(stat -c %Y "${_script_start_sentinel}")"
   trap 'rm -f "${_script_start_sentinel}"' EXIT
   if [[ "${NODE_RANK}" == "0" ]]; then
-    if [[ "${RESUME:-0}" == "1" && -s "${EXP_NAME_FILE}" ]]; then
-      EXP_NAME="$(<"${EXP_NAME_FILE}")"
-      touch "${EXP_NAME_FILE}"
-    else
-      EXP_NAME="pi05_ki_joint_query_full_b1k_bf16_${NUM_NODES}n${GPUS_PER_NODE}g_${TIMESTAMP}"
-      _exp_name_tmp="${EXP_NAME_FILE}.tmp.$$"
-      printf '%s\n' "${EXP_NAME}" > "${_exp_name_tmp}"
-      mv -f "${_exp_name_tmp}" "${EXP_NAME_FILE}"
-    fi
+    EXP_NAME="pi05_ki_joint_query_full_b1k_bf16_${NUM_NODES}n${GPUS_PER_NODE}g_${TIMESTAMP}"
+    _exp_name_tmp="${EXP_NAME_FILE}.tmp.$$"
+    printf '%s\n' "${EXP_NAME}" > "${_exp_name_tmp}"
+    mv -f "${_exp_name_tmp}" "${EXP_NAME_FILE}"
   else
     for _wait_i in $(seq 1 600); do
       if [[ -s "${EXP_NAME_FILE}" ]]; then
@@ -573,12 +609,7 @@ fi
 CONSOLE_LOG="${CONSOLE_LOG_DIR}/node${NODE_RANK}.log"
 
 EXTRA_ARGS=()
-if [[ "${WANDB_DISABLED:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--no-wandb-enabled)
-fi
-if [[ "${RESUME:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--resume)
-elif [[ "${OVERWRITE:-0}" == "1" ]]; then
+if [[ "${OVERWRITE:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--overwrite)
 fi
 if [[ "${PREPARE_HF_CACHE_ONLY}" == "1" ]]; then
@@ -601,9 +632,14 @@ echo "OPENPI_BEHAVIOR_DATASET_ROOT=${OPENPI_BEHAVIOR_DATASET_ROOT}"
 echo "ACCEL_CONFIG=${ACCEL_CONFIG}"
 echo "DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG} (ZeRO-2, GPU-resident optimizer)"
 echo "PRECISION=${PYTORCH_TRAINING_PRECISION} / Accelerate bf16"
-echo "BUDGET=${NUM_TRAIN_EPOCHS} epoch(s); step cap=${NUM_TRAIN_STEPS} (0 disables cap)"
-echo "CHECKPOINTS=${CHECKPOINT_POLICY}; durable every epoch, rolling every ${ROLLING_CHECKPOINT_INTERVAL} steps"
-echo "VALIDATION_INTERVAL=${VAL_LOG_INTERVAL}"
+echo "BUDGET=${NUM_TRAIN_STEPS} optimizer steps; pass boundaries=34982/69953/104912"
+echo "PASSES=offset0 source8955603 steps34982 consumed8955392 drop211; offset4 source8952584 steps34971 consumed8952576 drop8; offset8 source8949525 steps34959 consumed8949504 drop21"
+echo "EXPOSURE=theoretical eligible 26857712; consumed 26857472; global-batch drop 240; 24.9383588896% of original 107696389 (~one quarter, approximate coverage only)"
+echo "ANCHORS=stride=${FRAME_ANCHOR_STRIDE} offsets=${FRAME_ANCHOR_OFFSETS} drop_incomplete_horizon=${DROP_INCOMPLETE_ACTION_HORIZON}; eligible 0<=t<L-31 for H32 (selected min L=970)"
+echo "LR=warmup ${WARMUP_STEPS}; peak ${PEAK_LR}; cosine end 0 at ${NUM_TRAIN_STEPS}; no scaling"
+echo "CHECKPOINTS=${CHECKPOINT_POLICY}; weights/eval artifacts every ${SAVE_INTERVAL} steps; formal resume unsupported"
+echo "VALIDATION_INTERVAL=${VAL_LOG_INTERVAL}; baseline stride1/current padding/current loader behavior"
+echo "WANDB=required online project pi05_ki run ${EXP_NAME} (prepare-only bypass=${PREPARE_HF_CACHE_ONLY})"
 echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "PREPARE_HF_CACHE_ONLY=${PREPARE_HF_CACHE_ONLY}"
 echo "FORCE_LOAD_CACHE=${FORCE_LOAD_CACHE}"
@@ -626,9 +662,8 @@ python -m accelerate.commands.launch \
   --exp-name "${EXP_NAME}" \
   --pytorch-training-precision "${PYTORCH_TRAINING_PRECISION}" \
   --num-train-steps "${NUM_TRAIN_STEPS}" \
-  --num-train-epochs "${NUM_TRAIN_EPOCHS}" \
   --checkpoint-policy "${CHECKPOINT_POLICY}" \
-  --rolling-checkpoint-interval "${ROLLING_CHECKPOINT_INTERVAL}" \
+  --save-interval "${SAVE_INTERVAL}" \
   --val-log-interval "${VAL_LOG_INTERVAL}" \
   --val-num-batches "${VAL_NUM_BATCHES}" \
   --batch-size-per-gpu "${BATCH_SIZE_PER_GPU}" \
