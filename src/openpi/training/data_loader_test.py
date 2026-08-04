@@ -116,12 +116,24 @@ def test_prompt_from_lerobot_item_keeps_subtask_text_when_enabled():
 
 
 def test_subtask_text_routing_matches_model_type():
-    baseline = _config.get_config("pi05_b1k-make_pizza_lr2.5e-6_5ep_sft")
-    subtask = _config.get_config("pi05_subtask_b1k-make_pizza_lr2.5e-6_5ep_sft")
+    baseline = _config.get_config("pi05_b1k-make_pizza_lr1e-4_5ep_sft")
+    subtask = _config.get_config("pi05_subtask_b1k-make_pizza_lr1e-4_5ep_sft")
 
     assert baseline.model.model_type.name == "PI05"
-    assert not _data_loader._include_subtask_text(baseline.model)
+    assert not _data_loader._include_subtask_text(baseline.model)  # noqa: SLF001
 
     assert subtask.model.model_type.name == "PI05_SUBTASK"
-    assert _data_loader._include_subtask_text(subtask.model)
+    assert _data_loader._include_subtask_text(subtask.model)  # noqa: SLF001
     assert subtask.pytorch_model_name == "subtask"
+
+
+def test_sorting_household_items_sft_config_is_task_scoped():
+    cfg = _config.get_config("vlm2_b1k-sorting_household_items_lr2.5e-6_1ep_sft")
+    data_config = cfg.data[0].base_config
+
+    assert cfg.name == "vlm2_b1k-sorting_household_items_lr2.5e-6_1ep_sft"
+    assert cfg.pytorch_model_name == "vlm2"
+    assert data_config is not None
+    assert data_config.tasks == ["sorting_household_items"]
+    assert cfg.num_train_steps == 1
+    assert cfg.num_train_epochs == 1

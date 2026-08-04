@@ -101,6 +101,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         subtask_template_path: str | Path | None = None,
         subtask_object_name_mapping_path: str | Path | None = None,
         subtask_joiner: str = " then ",
+        segment_filter_path: str | Path | None = None,
     ):
         """
         Custom args:
@@ -163,6 +164,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             Path(subtask_object_name_mapping_path) if subtask_object_name_mapping_path is not None else None
         )
         self.subtask_joiner = subtask_joiner
+        self.segment_filter_path = Path(segment_filter_path).expanduser() if segment_filter_path is not None else None
+        self._segment_filter_ranges = self._load_segment_filter_ranges(self.segment_filter_path)
         self._subtask_templates = None
         self._subtask_object_name_mapping = None
         self._subtask_segments = {}
@@ -275,6 +278,88 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         self.omnigibson_mapping = {ep_idx: defaultdict(dict) for ep_idx in self.episodes}
         self._init_subtask_assets()
+
+    def _load_segment_filter_ranges(self, path: Path | None) -> dict[int, list[tuple[int, int]]]:
+        if path is None:
+            return {}
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            records = payload.get("exclude_keys") or payload.get("records") or payload.get("segments") or []
+        else:
+            records = payload
+        ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            episode_index = record.get("episode_index")
+            frame_start = record.get("frame_start")
+            frame_end = record.get("frame_end")
+            if episode_index is None:
+                task_id = record.get("task_id")
+                demo_id = record.get("demo_id")
+                if task_id is not None and demo_id is not None:
+                    try:
+                        episode_index = int(task_id) * 10000 + int(demo_id)
+                    except (TypeError, ValueError):
+                        episode_index = None
+            try:
+                ep = int(episode_index)
+                start = int(frame_start)
+                end = int(frame_end)
+            except (TypeError, ValueError):
+                continue
+            if end < start:
+                start, end = end, start
+            ranges[ep].append((start, end))
+        for ep in list(ranges):
+            ranges[ep].sort()
+        logger.info("Loaded %d segment filter ranges from %s", sum(len(v) for v in ranges.values()), path)
+        return dict(ranges)
+
+    def _is_filtered_frame(self, item: dict) -> bool:
+        if not self._segment_filter_ranges:
+            return False
+        try:
+            ep_idx = int(item["episode_index"].item())
+            frame_index = round(float(item["timestamp"].item()) * self.fps)
+        except Exception:
+            return False
+        return self._is_filtered_frame_index(ep_idx, frame_index)
+
+    def _is_filtered_frame_index(self, ep_idx: int, frame_index: int) -> bool:
+        for start, end in self._segment_filter_ranges.get(ep_idx, ()):
+            if start <= frame_index < end:
+                return True
+        return False
+
+    def _has_filtered_query_indices(self, ep_idx: int, query_indices: dict[str, list[int | bool]] | None) -> bool:
+        if not self._segment_filter_ranges or not query_indices:
+            return False
+        ep_pos = self.episode_data_index_pos[ep_idx]
+        ep_start = int(self.episode_data_index["from"][ep_pos].item())
+        for indices in query_indices.values():
+            for idx in indices:
+                frame_index = int(idx) - ep_start
+                if self._is_filtered_frame_index(ep_idx, frame_index):
+                    return True
+        return False
+
+    def _advance_streaming_frame(self) -> None:
+        if not self._should_obs_loaders_reload:
+            for key in self.meta.video_keys:
+                next(self.obs_loaders[key])[0]
+        self.current_streaming_frame_idx += 1
+        if self.current_streaming_frame_idx >= self._active_chunks[self.current_streaming_chunk_idx][1]:
+            self.current_streaming_chunk_idx += 1
+            if self.current_streaming_chunk_idx >= len(self._active_chunks):
+                self.current_streaming_chunk_idx = 0
+            self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
+            self._should_obs_loaders_reload = True
+
+    def _current_streaming_local_frame_idx(self) -> int:
+        chunk_start, _, chunk_local_start = self._active_chunks[self.current_streaming_chunk_idx]
+        return int(chunk_local_start + (self.current_streaming_frame_idx - chunk_start))
 
     def _init_subtask_assets(self):
         self._subtask_phrase_converter = None
@@ -634,6 +719,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
     def __getitem__(self, idx) -> dict:
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
+            if self._is_filtered_frame(item):
+                return self.__getitem__((idx + 1) % len(self))
             item["task"] = self._get_fine_grained_task(item)
             subtask_text = self._get_subtask_text(item)
             if subtask_text is not None:
@@ -679,6 +766,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         item.pop("observation.task_info")
         ep_idx = item["episode_index"].item()
 
+        if self._is_filtered_frame(item):
+            self._advance_streaming_frame()
+            return self.__getitem__(idx)
+
         if self._should_obs_loaders_reload:
             for loader in self.obs_loaders.values():
                 loader.close()
@@ -711,7 +802,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                         task_id=task_id,
                         camera_id=vid_key.split(".")[-1],
                         demo_id=f"{ep_idx:08d}",
-                        start_idx=self._active_chunks[self.current_streaming_chunk_idx][2],
+                        start_idx=self._current_streaming_local_frame_idx(),
                         start_idx_is_keyframe=False,
                         batch_size=1,
                         stride=1,
@@ -723,6 +814,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         query_indices = None
         if self.delta_indices is not None:
             query_indices, padding = self._get_query_indices(self.current_streaming_frame_idx, ep_idx)
+            if self._has_filtered_query_indices(ep_idx, query_indices):
+                self._advance_streaming_frame()
+                return self.__getitem__(idx)
             query_result = self._query_hf_dataset(query_indices)
             item = {**item, **padding}
             for key, val in query_result.items():
@@ -730,9 +824,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         weight = self._get_resample_weight(item)
         if self._accept_rng is not None and self._accept_rng.random() >= weight:
-            self.current_streaming_frame_idx += 1
-            for key in self.meta.video_keys:
-                next(self.obs_loaders[key])[0]
+            self._advance_streaming_frame()
             return self.__getitem__(idx)
 
         # load visual observations

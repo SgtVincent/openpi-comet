@@ -27,6 +27,8 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         args["subtask_template_path"] = data_config.subtask_template_path
         args["subtask_object_name_mapping_path"] = data_config.subtask_object_name_mapping_path
         args["subtask_joiner"] = data_config.subtask_joiner
+    if getattr(data_config, "segment_filter_path", None):
+        args["segment_filter_path"] = data_config.segment_filter_path
 
     dataset_cls = (
         BehaviorLeRobotSkillDataset

@@ -305,6 +305,75 @@ def get_model_parameters(model):
     )
 
 
+_PI0_ACTION_EXPERT_ONLY_TRAINABLE_SELECTORS = (
+    "paligemma_with_expert.gemma_expert",
+    "action_in_proj",
+    "action_out_proj",
+    "time_mlp_in",
+    "time_mlp_out",
+    "state_proj",
+    "action_time_mlp_in",
+    "action_time_mlp_out",
+)
+
+_PI0_ACTION_EXPERT_ONLY_FROZEN_PREFIX_SELECTORS = (
+    "paligemma_with_expert.paligemma",
+)
+
+
+def apply_pytorch_freeze_mode(model, *, mode: str | None, pytorch_model_name: str) -> dict[str, object]:
+    """Apply explicit PyTorch parameter freezing and return an auditable summary."""
+    if mode in (None, "", "none"):
+        return {
+            "freeze_mode": "none",
+            "pytorch_model_name": pytorch_model_name,
+            "applied": False,
+        }
+    if mode != "pi0_action_expert_only":
+        raise ValueError(f"Unsupported OPENPI_PYTORCH_FREEZE_MODE={mode!r}")
+    if pytorch_model_name != "pi0":
+        raise ValueError("pi0_action_expert_only freeze mode is only valid for pytorch_model_name='pi0'")
+
+    target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    trainable_names: list[str] = []
+    frozen_names: list[str] = []
+    trainable_params = 0
+    frozen_params = 0
+
+    for name, param in target.named_parameters():
+        should_train = any(selector in name for selector in _PI0_ACTION_EXPERT_ONLY_TRAINABLE_SELECTORS)
+        param.requires_grad = bool(should_train)
+        if should_train:
+            trainable_names.append(name)
+            trainable_params += param.numel()
+        else:
+            frozen_names.append(name)
+            frozen_params += param.numel()
+
+    violations = [
+        name
+        for name in trainable_names
+        if any(selector in name for selector in _PI0_ACTION_EXPERT_ONLY_FROZEN_PREFIX_SELECTORS)
+    ]
+    if violations:
+        preview = ", ".join(violations[:10])
+        raise RuntimeError(f"Frozen prefix parameters remained trainable under pi0_action_expert_only: {preview}")
+    if trainable_params == 0:
+        raise RuntimeError("pi0_action_expert_only selected no trainable parameters")
+
+    return {
+        "freeze_mode": mode,
+        "pytorch_model_name": pytorch_model_name,
+        "applied": True,
+        "trainable_param_count": trainable_params,
+        "frozen_param_count": frozen_params,
+        "trainable_tensor_count": len(trainable_names),
+        "frozen_tensor_count": len(frozen_names),
+        "trainable_name_preview": trainable_names[:25],
+        "frozen_name_preview": frozen_names[:25],
+    }
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, *, force: bool = False):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     # Only save if it's time to save, if it's the final step, or if forced by caller (e.g., epoch-end save).
@@ -883,6 +952,22 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             num_trainable,
             100.0 * num_trainable / max(1, num_total),
             num_total,
+        )
+
+    freeze_summary = apply_pytorch_freeze_mode(
+        model,
+        mode=os.environ.get("OPENPI_PYTORCH_FREEZE_MODE"),
+        pytorch_model_name=config.pytorch_model_name,
+    )
+    if freeze_summary["applied"]:
+        logging.info(
+            "Applied PyTorch freeze mode %s: trainable_params=%s frozen_params=%s trainable_tensors=%s frozen_tensors=%s trainable_preview=%s",
+            freeze_summary["freeze_mode"],
+            freeze_summary["trainable_param_count"],
+            freeze_summary["frozen_param_count"],
+            freeze_summary["trainable_tensor_count"],
+            freeze_summary["frozen_tensor_count"],
+            freeze_summary["trainable_name_preview"],
         )
 
     optim_params = [p for p in model.parameters() if p.requires_grad]

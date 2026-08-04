@@ -134,6 +134,11 @@ class DataConfig:
     # skill list to use for training
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
 
+    # Optional B1K segment filter file. Expected schema is a JSON list with
+    # episode_index, frame_start, and frame_end fields, such as noise_scan's
+    # training_filters/exclude_keys.json.
+    segment_filter_path: str | None = None
+
     resample_group_by: str | None = None
     resample_weights: dict[str, float] | None = None
     resample_default_weight: float = 1.0
@@ -264,6 +269,8 @@ class DataConfigFactory(abc.ABC):
     base_config: tyro.conf.Suppress[DataConfig | None] = None
     # Meta image keys to use for training
     meta_image_keys: list[str] = dataclasses.field(default_factory=list)
+    # Optional B1K segment filter file passed through to DataConfig.
+    segment_filter_path: str | None = None
 
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -278,6 +285,7 @@ class DataConfigFactory(abc.ABC):
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            segment_filter_path=self.segment_filter_path,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
