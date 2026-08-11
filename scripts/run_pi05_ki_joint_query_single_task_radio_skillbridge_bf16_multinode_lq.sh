@@ -60,7 +60,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${LOCAL_CACHE_ROOT}/xdg}"
 export TORCH_HOME="${TORCH_HOME:-${LOCAL_CACHE_ROOT}/torch}"
-export TMPDIR="${TMPDIR:-${LOCAL_CACHE_ROOT}/tmp}"
+LOCAL_TMP_BACKING="${LOCAL_CACHE_ROOT}/tmp"
 mkdir -p \
   "${OPENPI_DATA_HOME}" \
   "${HF_HUB_CACHE}" \
@@ -68,7 +68,118 @@ mkdir -p \
   "${TRANSFORMERS_CACHE}" \
   "${XDG_CACHE_HOME}" \
   "${TORCH_HOME}" \
-  "${TMPDIR}"
+  "${LOCAL_TMP_BACKING}"
+
+# Python's multiprocess.Manager appends pymp-*/listener-* below TMPDIR. Keep the
+# storage inside LOCAL_CACHE_ROOT, but expose it through a short node-local alias
+# so the AF_UNIX pathname remains below Linux sockaddr_un.sun_path's 107 usable
+# bytes. A 96-bit SHA-256 prefix makes aliases collision-safe without embedding
+# the potentially long config/job key in the socket pathname.
+#
+# TMPDIR is bound authoritatively (not "${TMPDIR:-...}"): an inherited TMPDIR
+# from the Merlin task environment is exactly how the overflow reached training
+# before, so inheritance must not silently bypass this fix. Deliberate opt-out
+# stays available through OPENPI_ALLOW_EXTERNAL_TMPDIR=1.
+_tmp_alias_digest="$(printf '%s' "${LOCAL_CACHE_ROOT}" | sha256sum)"
+_tmp_alias_digest="${_tmp_alias_digest%% *}"
+TMP_ALIAS="/tmp/openpi-tmp-${UID:-$(id -u)}-${_tmp_alias_digest:0:24}"
+if [[ "${OPENPI_ALLOW_EXTERNAL_TMPDIR:-0}" == "1" && -n "${TMPDIR:-}" ]]; then
+  echo "WARNING: honouring externally provided TMPDIR=${TMPDIR} (OPENPI_ALLOW_EXTERNAL_TMPDIR=1);" >&2
+  echo "         AF_UNIX socket length is now the caller's responsibility." >&2
+  _TMP_ALIAS_MANAGED=0
+else
+  _TMP_ALIAS_MANAGED=1
+  if [[ -e "${TMP_ALIAS}" && ! -L "${TMP_ALIAS}" ]]; then
+    echo "ERROR: refusing to replace non-symlink TMP alias path: ${TMP_ALIAS}" >&2
+    exit 1
+  fi
+  if [[ -L "${TMP_ALIAS}" ]]; then
+    _tmp_alias_target="$(readlink -- "${TMP_ALIAS}")"
+    if [[ "${_tmp_alias_target}" != "${LOCAL_TMP_BACKING}" ]]; then
+      rm -f -- "${TMP_ALIAS}"
+    fi
+  fi
+  if [[ ! -L "${TMP_ALIAS}" ]]; then
+    # A concurrent rank may win this race; treat an equivalent symlink as success.
+    if ! ln -s -- "${LOCAL_TMP_BACKING}" "${TMP_ALIAS}" 2>/dev/null; then
+      if [[ ! -L "${TMP_ALIAS}" || "$(readlink -- "${TMP_ALIAS}")" != "${LOCAL_TMP_BACKING}" ]]; then
+        echo "ERROR: failed to create TMP alias ${TMP_ALIAS} -> ${LOCAL_TMP_BACKING}" >&2
+        exit 1
+      fi
+    fi
+  fi
+  if [[ "$(readlink -- "${TMP_ALIAS}")" != "${LOCAL_TMP_BACKING}" ]]; then
+    echo "ERROR: TMP alias target mismatch: ${TMP_ALIAS}" >&2
+    exit 1
+  fi
+  export TMPDIR="${TMP_ALIAS}"
+fi
+export TMP="${TMPDIR}"
+export TEMP="${TMPDIR}"
+if [[ ! -d "${TMPDIR}" || ! -w "${TMPDIR}" ]]; then
+  echo "ERROR: TMPDIR is not a writable directory: ${TMPDIR}" >&2
+  exit 1
+fi
+
+# Exercise the exact lightweight primitive that overflowed sun_path before, so a
+# regression fails here instead of mid-training. This intentionally imports
+# neither the trainer nor any model/data module.
+python - "${TMPDIR}" "${LOCAL_TMP_BACKING}" "${_TMP_ALIAS_MANAGED}" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+import multiprocess
+
+expected_tmpdir = Path(sys.argv[1])
+expected_backing = Path(sys.argv[2])
+# Alias identity is only guaranteed when this launcher owns the binding; the
+# sun_path budget and the Manager round-trip are verified either way.
+alias_managed = sys.argv[3] == "1"
+
+actual_tmpdir = Path(tempfile.gettempdir())
+if actual_tmpdir != expected_tmpdir:
+    raise SystemExit(
+        f"ERROR: tempfile.gettempdir()={actual_tmpdir} does not equal intended TMPDIR {expected_tmpdir}"
+    )
+if alias_managed and actual_tmpdir.resolve() != expected_backing.resolve():
+    raise SystemExit(
+        f"ERROR: short TMPDIR {actual_tmpdir} does not resolve to backing directory {expected_backing}"
+    )
+if not os.access(actual_tmpdir, os.W_OK):
+    raise SystemExit(f"ERROR: tempfile.gettempdir() is not writable: {actual_tmpdir}")
+
+# Linux sockaddr_un.sun_path has 108 bytes including its trailing NUL.
+af_unix_path_max_bytes = 107
+representative_socket = actual_tmpdir / "pymp-12345678" / "listener-12345678"
+representative_socket_bytes = len(os.fsencode(representative_socket))
+if representative_socket_bytes > af_unix_path_max_bytes:
+    raise SystemExit(
+        "ERROR: representative multiprocess Manager socket path is too long: "
+        f"{representative_socket_bytes} > {af_unix_path_max_bytes}: {representative_socket}"
+    )
+
+with multiprocess.Manager() as manager:
+    probe = manager.dict()
+    probe["ready"] = True
+    if probe.get("ready") is not True:
+        raise SystemExit("ERROR: multiprocess.Manager proxy round-trip failed")
+    manager_socket = Path(os.fsdecode(manager._address))
+    manager_socket_bytes = len(os.fsencode(manager_socket))
+    if manager_socket_bytes > af_unix_path_max_bytes:
+        raise SystemExit(
+            "ERROR: live multiprocess Manager socket path is too long: "
+            f"{manager_socket_bytes} > {af_unix_path_max_bytes}: {manager_socket}"
+        )
+
+print(f"TEMPFILE_GETTEMPDIR={actual_tmpdir}")
+print(f"TMPDIR_REALPATH={actual_tmpdir.resolve()}")
+print(f"MANAGER_SOCKET_REPRESENTATIVE_BYTES={representative_socket_bytes}")
+print(f"AF_UNIX_PATH_MAX_BYTES={af_unix_path_max_bytes}")
+print(f"MULTIPROCESS_MANAGER_SOCKET_BYTES={manager_socket_bytes}")
+print("MULTIPROCESS_MANAGER_PREFLIGHT_OK")
+PY
 
 # Offline tokenizer bootstrap.
 # NOTE: the tokenizer cache is NOT part of the Git checkout (untracked).
