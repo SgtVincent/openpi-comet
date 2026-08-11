@@ -213,9 +213,22 @@ check_kv WANDB_MODE "online"
 check_kv WANDB_DISABLED "0"
 check_kv KEEPALIVE_ON_SUCCESS "1"
 check_kv STRICT_GPU_COUNT "0"
-check_kv NUM_TRAIN_STEPS "2000"
-check_kv NUM_TRAIN_EPOCHS "1"
-check_kv BATCH_SIZE_PER_GPU "1"
+# --- B4 / full-5-epoch contract lock ---------------------------------------
+# These three values define the run's compute budget and are the ones most
+# likely to be silently reverted by a future edit, so they are asserted
+# explicitly rather than being folded into a generic loop:
+#   BATCH_SIZE_PER_GPU=4 -> global batch 4 × 64 GPUs = 256
+#   NUM_TRAIN_EPOCHS=5   -> five full dataset passes
+#   NUM_TRAIN_STEPS=0    -> step cap DISABLED. Must stay non-positive: the
+#     trainer resolves the budget as
+#       computed = epochs * steps_per_epoch
+#       target   = computed if num_train_steps <= 0 else min(steps, computed)
+#     (scripts/train_accelerate.py L2832-2837), so ANY positive value risks
+#     truncating the run below 5 epochs. The old 2000 here capped the previous
+#     8×8 run at ~0.32 epoch — that regression is what this lock prevents.
+check_kv NUM_TRAIN_STEPS "0"
+check_kv NUM_TRAIN_EPOCHS "5"
+check_kv BATCH_SIZE_PER_GPU "4"
 check_kv NUM_WORKERS "4"
 check_kv SAVE_INTERVAL "200"
 check_kv VAL_LOG_INTERVAL "100"
@@ -261,6 +274,99 @@ if [[ "$(record_value wrapper NUM_TRAIN_STEPS)" == "7" ]]; then
   ok "explicit NUM_TRAIN_STEPS override is honoured"
 else
   bad "explicit override lost: NUM_TRAIN_STEPS=$(record_value wrapper NUM_TRAIN_STEPS)"
+fi
+
+run_stub ARNOLD_WORKER_NUM=8 ARNOLD_WORKER_GPU=8 ARNOLD_ID=0 BATCH_SIZE_PER_GPU=2 NUM_TRAIN_EPOCHS=3
+if [[ "$(record_value wrapper BATCH_SIZE_PER_GPU)" == "2" \
+   && "$(record_value wrapper NUM_TRAIN_EPOCHS)" == "3" ]]; then
+  ok "explicit BATCH_SIZE_PER_GPU / NUM_TRAIN_EPOCHS overrides are honoured"
+else
+  bad "batch/epoch overrides lost"
+fi
+
+echo
+echo "=== A3. B4 / 5-epoch budget reporting ==="
+
+# The defaults live in the source as ${VAR:-default}. Assert the literals so
+# the env-override form cannot be replaced by a hardcoded value (which would
+# still satisfy check_kv above but break operator overrides).
+assert_src() {
+  local desc="$1" pattern="$2"
+  if grep -Fq -- "${pattern}" "${ENTRYPOINT}"; then
+    ok "source: ${desc}"
+  else
+    bad "source: ${desc} — pattern not found: ${pattern}"
+  fi
+}
+assert_src 'NUM_TRAIN_STEPS default 0 keeps ${VAR:-} override form' \
+  'export NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-0}"'
+assert_src 'NUM_TRAIN_EPOCHS default 5 keeps ${VAR:-} override form' \
+  'export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-5}"'
+assert_src 'BATCH_SIZE_PER_GPU default 4 keeps ${VAR:-} override form' \
+  'export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"'
+
+# The banner must not resurrect the misleading "min(0 steps, N epoch)" wording,
+# and must state the disabled cap plus the exact global batch.
+run_stub ARNOLD_WORKER_NUM=8 ARNOLD_WORKER_GPU=8 ARNOLD_ID=0
+BANNER="${TEST_TMP}/stub.out"
+
+if grep -q 'min(0 steps' "${BANNER}"; then
+  bad "banner shows misleading 'min(0 steps, ...)' budget"
+else
+  ok "banner does not claim a min(0 steps, ...) budget"
+fi
+if grep -q 'step cap DISABLED' "${BANNER}"; then
+  ok "banner states the step cap is disabled"
+else
+  bad "banner does not state that the step cap is disabled"
+fi
+if grep -q 'GLOBAL_BATCH=256 ' "${BANNER}"; then
+  ok "banner reports GLOBAL_BATCH=256 (4 × 64)"
+else
+  bad "banner GLOBAL_BATCH wrong: $(grep -o 'GLOBAL_BATCH=[0-9]*' "${BANNER}" | head -1)"
+fi
+if grep -q 'BUDGET=5 full epochs' "${BANNER}"; then
+  ok "banner reports a 5-full-epoch budget"
+else
+  bad "banner does not report a 5-full-epoch budget"
+fi
+# The step total must be flagged as an estimate, never a hard promise, because
+# steps_per_epoch is only known at runtime.
+if grep -q 'BUDGET_NOTE=estimate only' "${BANNER}"; then
+  ok "banner marks the step total as a runtime-computed estimate"
+else
+  bad "banner does not mark the step total as an estimate"
+fi
+# The expected LR-decay override warning must be pre-announced so operators do
+# not treat it as a failure.
+if grep -q 'WARNING is expected' "${BANNER}"; then
+  ok "banner pre-announces the expected LR decay_steps override warning"
+else
+  bad "banner does not pre-announce the LR decay override warning"
+fi
+# No stale 2000-step budget claim anywhere in the banner.
+if grep -q 'BUDGET.*2000' "${BANNER}"; then
+  bad "banner still advertises a 2000-step budget"
+else
+  ok "banner carries no stale 2000-step budget claim"
+fi
+
+# When a caller re-enables the cap, the banner must say so rather than keep
+# printing "disabled".
+run_stub ARNOLD_WORKER_NUM=8 ARNOLD_WORKER_GPU=8 ARNOLD_ID=0 NUM_TRAIN_STEPS=123
+if grep -q 'step cap ACTIVE' "${TEST_TMP}/stub.out"; then
+  ok "banner reports an ACTIVE step cap when one is set"
+else
+  bad "banner still claims a disabled cap despite NUM_TRAIN_STEPS=123"
+fi
+
+# A non-numeric schedule value must be rejected before any launch, since these
+# feed shell arithmetic and are forwarded to the trainer.
+run_stub ARNOLD_WORKER_NUM=8 ARNOLD_WORKER_GPU=8 ARNOLD_ID=0 BATCH_SIZE_PER_GPU=four
+if [[ "${STUB_RC}" -ne 0 && ! -f "${RECORD_DIR}/wrapper.env" ]]; then
+  ok "non-numeric BATCH_SIZE_PER_GPU rejected before launch"
+else
+  bad "non-numeric BATCH_SIZE_PER_GPU was not rejected (rc=${STUB_RC})"
 fi
 
 # Offline / disabled W&B must be rejected: this trial requires online tracking.

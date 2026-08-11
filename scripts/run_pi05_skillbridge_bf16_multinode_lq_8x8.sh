@@ -6,6 +6,20 @@
 #
 #   exec bash scripts/run_pi05_skillbridge_bf16_multinode_lq_8x8.sh
 #
+# TRAINING CONTRACT (current)
+# ---------------------------
+#   * BATCH_SIZE_PER_GPU = 4  ->  global batch 4 × 64 = 256 (grad-accum 1)
+#   * NUM_TRAIN_EPOCHS   = 5  ->  five FULL passes over the dataset
+#   * NUM_TRAIN_STEPS    = 0  ->  step cap DISABLED; the epoch budget governs
+#
+# There is deliberately NO 2000-step cap any more. The earlier 8×8 run stopped
+# at a 2000-step ceiling (~0.32 epoch); this configuration instead trains to
+# completion. Expect roughly 1556 steps/epoch and ~7780 optimizer steps in
+# total, but note those are ESTIMATES: the authoritative steps_per_epoch is
+# computed at runtime from the actual dataloader length. See the "Frozen
+# training schedule" block below for the exact trainer semantics, including the
+# expected LR-decay override warning.
+#
 # WHY THIS EXISTS
 # ---------------
 # The previous 8×8 hot-update entrypoint called the keepalive wrapper directly
@@ -190,15 +204,72 @@ export PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-${LQ_NAS_USER_ROOT}/rep
 # nodes divergent names / checkpoint dirs.
 
 # ---------------------------------------------------------------------------
-# Frozen training schedule (matches the 4×8 Skill Bridge formal contract).
+# Frozen training schedule: B4 × 64 GPUs = global batch 256, FULL 5 epochs.
+#
+# NUM_TRAIN_STEPS=0 DISABLES the step cap on purpose. In
+# scripts/train_accelerate.py (L2832-2837) the budget resolves as
+#     computed_steps = num_train_epochs * steps_per_epoch
+#     target_steps   = computed_steps if num_train_steps <= 0
+#                      else min(num_train_steps, computed_steps)
+# so a non-positive NUM_TRAIN_STEPS selects computed_steps outright with no
+# min() clamp. That is the only way to guarantee all 5 epochs actually run: any
+# positive value here would silently truncate the run whenever it happened to
+# be smaller than the epoch budget.
+#
+# THE STEP COUNT IS APPROXIMATE. steps_per_epoch is computed at RUNTIME from
+# the real dataloader length, never here. The 8×8 B1 run observed
+# steps_per_epoch=6227, so B4 should land near 6227/4 ≈ 1556 steps/epoch and
+# ≈ 7780 optimizer steps across 5 epochs. Estimates only — not a contract.
+#
+# LR SCHEDULE IS AUTO-EXTENDED, AND LOGS A WARNING BY DESIGN.
+# The config bakes in decay_steps=2000 (an estimated 1-epoch budget). Since
+# 2000 < the ~7780 real budget, train_accelerate.py L3081-3088 takes its SECOND
+# override branch and rewrites decay_steps to the true num_train_steps, so the
+# cosine decay stretches over the whole 5-epoch run instead of reaching LR=0 at
+# roughly a quarter of the way through. That branch emits a logging.WARNING:
+#   "decay_steps=2000 < num_train_steps=<N> — LR will reach 0 before training
+#    ends; overriding to num_train_steps"
+# This warning is EXPECTED AND CORRECT here, not an error. (The other branch,
+# decay_steps<=0, logs at info level instead — we do not hit it.) Do not
+# "fix" it by editing the config's decay_steps.
+#
+# BATCH_SIZE_PER_GPU=4 is a deliberate, user-mandated choice. It roughly
+# quadruples activation memory versus the validated B1 run and so carries real
+# OOM risk on A100. There is intentionally NO protective fallback or
+# auto-downgrade: if it OOMs, that outcome is itself the signal being sought.
+# The keepalive wrapper still holds the 64-GPU allocation on failure, so an OOM
+# does not cost the batch.
 # ---------------------------------------------------------------------------
 export PYTORCH_TRAINING_PRECISION="${PYTORCH_TRAINING_PRECISION:-bfloat16}"
-export NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-2000}"
-export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-1}"
+export NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-0}"
+export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-5}"
+export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
 export NUM_WORKERS="${NUM_WORKERS:-4}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-200}"
 export VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-100}"
+
+# Validate the two schedule knobs that feed shell arithmetic below, so a typo'd
+# env override fails here with a clear message instead of as a cryptic
+# arithmetic error (or, worse, reaching the trainer).
+[[ "${NUM_TRAIN_STEPS}" =~ ^-?[0-9]+$ ]] || die "NUM_TRAIN_STEPS must be an integer, got '${NUM_TRAIN_STEPS}'"
+[[ "${NUM_TRAIN_EPOCHS}" =~ ^[0-9]+$ ]] || die "NUM_TRAIN_EPOCHS must be a non-negative integer, got '${NUM_TRAIN_EPOCHS}'"
+[[ "${BATCH_SIZE_PER_GPU}" =~ ^[1-9][0-9]*$ ]] || die "BATCH_SIZE_PER_GPU must be a positive integer, got '${BATCH_SIZE_PER_GPU}'"
+
+# Reporting-only derived numbers (never passed to the trainer).
+# GLOBAL_BATCH is exact: micro-batch × world size, grad-accum is 1 here.
+GLOBAL_BATCH=$((BATCH_SIZE_PER_GPU * TOTAL_GPUS))
+# Step estimate anchored on the measured 8×8 B1 run (steps_per_epoch=6227).
+# steps_per_epoch scales inversely with the micro-batch at fixed world size.
+B1_STEPS_PER_EPOCH_MEASURED=6227
+EST_STEPS_PER_EPOCH_B4=$((B1_STEPS_PER_EPOCH_MEASURED / BATCH_SIZE_PER_GPU))
+EST_TOTAL_STEPS=$((EST_STEPS_PER_EPOCH_B4 * NUM_TRAIN_EPOCHS))
+# Human-readable step-cap state, so the banner stays truthful even if a caller
+# re-enables the cap through the environment.
+if (( NUM_TRAIN_STEPS > 0 )); then
+  STEP_CAP_DESC="step cap ACTIVE at ${NUM_TRAIN_STEPS}"
+else
+  STEP_CAP_DESC="step cap disabled"
+fi
 
 # ---------------------------------------------------------------------------
 # Online Byted-W&B.
@@ -238,6 +309,7 @@ export STRICT_GPU_COUNT="${STRICT_GPU_COUNT:-0}"
 # ---------------------------------------------------------------------------
 info "============================================================"
 info "π0.5-KI Skill Bridge BF16 — LQ 8×8 all-in-one entrypoint"
+info "PLAN=B${BATCH_SIZE_PER_GPU} × ${TOTAL_GPUS} GPUs = global batch ${GLOBAL_BATCH}, ${NUM_TRAIN_EPOCHS} full epochs, ${STEP_CAP_DESC}"
 info "REPO_ROOT=${REPO_ROOT}"
 info "CONFIG_NAME=${CONFIG_NAME}"
 info "TOPOLOGY=${NUM_NODES} nodes × ${GPUS_PER_NODE} GPUs (rank ${NODE_RANK}, world ${TOTAL_GPUS})"
@@ -248,9 +320,17 @@ info "BASE_PI05_CKPT=${BASE_PI05_CKPT}"
 info "B1K_DATASET_ROOT=${B1K_DATASET_ROOT}"
 info "REPO_OPENPI_CACHE=${REPO_OPENPI_CACHE}"
 info "PERSISTENT_OUTPUT_ROOT=${PERSISTENT_OUTPUT_ROOT}"
-info "BUDGET=min(${NUM_TRAIN_STEPS} steps, ${NUM_TRAIN_EPOCHS} epoch)"
+if (( NUM_TRAIN_STEPS > 0 )); then
+  info "BUDGET=min(${NUM_TRAIN_STEPS} steps, ${NUM_TRAIN_EPOCHS} epochs) [step cap ACTIVE - overridden from the default]"
+else
+  info "BUDGET=${NUM_TRAIN_EPOCHS} full epochs, step cap DISABLED (NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS})"
+  info "BUDGET_ESTIMATE=~${EST_STEPS_PER_EPOCH_B4} steps/epoch × ${NUM_TRAIN_EPOCHS} ≈ ${EST_TOTAL_STEPS} optimizer steps"
+  info "BUDGET_NOTE=estimate only; steps_per_epoch is computed at runtime by the dataloader"
+  info "BUDGET_NOTE=LR decay auto-extends to the real total; a 'decay_steps=... < num_train_steps' WARNING is expected"
+fi
 info "INTERVALS=validation ${VAL_LOG_INTERVAL}, save ${SAVE_INTERVAL}"
 info "BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU} NUM_WORKERS=${NUM_WORKERS}"
+info "GLOBAL_BATCH=${GLOBAL_BATCH} (${BATCH_SIZE_PER_GPU} per GPU × ${TOTAL_GPUS} GPUs)"
 info "WANDB_MODE=${WANDB_MODE} (WANDB_DISABLED=${WANDB_DISABLED})"
 info "KEEPALIVE_ON_SUCCESS=${KEEPALIVE_ON_SUCCESS} STRICT_GPU_COUNT=${STRICT_GPU_COUNT}"
 info "LAUNCHER=${LAUNCHER}"
