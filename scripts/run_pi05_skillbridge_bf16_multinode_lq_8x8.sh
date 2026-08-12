@@ -16,13 +16,14 @@
 # warmstarted from a 360k-step checkpoint that lives only on HL NAS and is
 # unavailable here; this run warmstarts from the LQ base pi05 checkpoint.
 # Run 2 also used a fixed 104,912-step budget across three stride-12 passes
-# (offsets 0/4/8); this run uses 3 real stride-1 epochs with the standard
-# loader. The only intended algorithmic A/B difference vs the control is
-# skill_bridge.enabled=True.
+# (offsets 0/4/8); this run uses 3 real stride-4 epochs with the standard
+# loader (validation stays stride-1). The only intended algorithmic A/B
+# difference vs the control is skill_bridge.enabled=True.
 #
-# Expect roughly 420,689 steps/epoch and ~1,262,067 optimizer steps in total
-# at global batch 256, but those are ESTIMATES: the authoritative
-# steps_per_epoch is computed at runtime from the actual dataloader length.
+# Expect roughly 105,172 steps/epoch and ~315,516 optimizer steps in total
+# at global batch 256 (raw stride-1 length ~420,689 / stride 4), but those
+# are ESTIMATES: the authoritative steps_per_epoch is computed at runtime
+# from the actual dataloader length divided by streaming_anchor_stride=4.
 # See the "Frozen training schedule" block below for exact trainer semantics.
 #
 # WHY THIS EXISTS
@@ -228,12 +229,14 @@ export PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-${LQ_NAS_USER_ROOT}/rep
 # min() clamp. That is the only way to guarantee all 3 epochs actually run.
 #
 # THE STEP COUNT IS APPROXIMATE. steps_per_epoch is computed at RUNTIME from
-# the real dataloader length, never here. For Full B1K (50 tasks × 180 train
-# episodes, stride-1) at global batch 256 the estimate is ~420,689 steps/epoch
-# and ~1,262,067 optimizer steps across 3 epochs. Estimates only — not a
-# contract; the trainer prints the authoritative computed value at startup.
+# the real dataloader length divided by streaming_anchor_stride=4, never here.
+# For Full B1K (50 tasks × 180 train episodes) at global batch 256 the raw
+# stride-1 length is ~420,689 steps/epoch, so with stride=4 the estimate is
+# ~105,172 steps/epoch and ~315,516 optimizer steps across 3 epochs. Estimates
+# only — not a contract; the trainer prints the authoritative computed value
+# at startup.
 #
-# LR SCHEDULE: warmup 10,000 (~1% of the ~1.26M-step budget), peak_lr 1e-5,
+# LR SCHEDULE: warmup 10,000 (~3% of the ~315k-step budget), peak_lr 1e-5,
 # cosine decay to 0. The new Full-B1K Skill Bridge config sets
 # decay_steps=0, which the trainer (train_accelerate.py) treats as "use
 # num_train_steps" via its decay_steps<=0 branch (info-level log, no warning).
@@ -268,7 +271,8 @@ GLOBAL_BATCH=$((BATCH_SIZE_PER_GPU * TOTAL_GPUS))
 # at global batch 256. Anchored on Tracking Run 2's measured throughput at the
 # same global batch; the trainer computes the authoritative steps_per_epoch at
 # runtime from the real dataloader length, so this is a reporting estimate only.
-EST_STEPS_PER_EPOCH=420689
+# Raw stride-1 steps/epoch (~420,689) divided by streaming_anchor_stride=4.
+EST_STEPS_PER_EPOCH=$((420689 / 4))
 EST_TOTAL_STEPS=$((EST_STEPS_PER_EPOCH * NUM_TRAIN_EPOCHS))
 # Human-readable step-cap state, so the banner stays truthful even if a caller
 # re-enables the cap through the environment.

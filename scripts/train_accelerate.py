@@ -2849,6 +2849,40 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     steps_per_epoch = max(1, steps_per_epoch_micro // accelerator.gradient_accumulation_steps)
     if steps_per_epoch <= 0:
         raise RuntimeError(f"Computed steps_per_epoch={steps_per_epoch}, expected a positive value.")
+
+    # Streaming anchor stride: the B1K streaming dataset advances its cursor by
+    # ``config.streaming_anchor_stride`` frames per sample, so a single pass over
+    # the unique anchors spans ``len(loader) // stride`` micro-batches, not the
+    # full raw frame count. Without this correction, ``num_train_epochs=N``
+    # would iterate the anchor cycle ~``stride`` times per "epoch". We floor to
+    # the nearest complete anchor (incomplete trailing horizons are dropped,
+    # matching ``_streaming_drop_incomplete_horizon`` semantics). The grad-accum
+    # division is applied AFTER the stride reduction, so the effective optimizer
+    # steps per epoch == (microbatches // stride) // grad_accum. The formal B1K
+    # control uses a fixed 104,912-step budget (epochs=None) and is left
+    # untouched; this adjustment only affects epoch-based runs.
+    streaming_stride = int(getattr(config, "streaming_anchor_stride", 1))
+    if streaming_stride > 1 and config.num_train_epochs is not None:
+        effective_micro = max(1, steps_per_epoch_micro // streaming_stride)
+        effective_steps_per_epoch = max(
+            1, effective_micro // accelerator.gradient_accumulation_steps
+        )
+        if is_main:
+            logging.info(
+                "Streaming anchor stride=%s: steps_per_epoch reduced from %s to %s "
+                "(raw_micro=%s, effective_micro=%s//%s=%s, grad_accum=%s) "
+                "so one epoch == one pass over unique anchors",
+                streaming_stride,
+                steps_per_epoch,
+                effective_steps_per_epoch,
+                steps_per_epoch_micro,
+                steps_per_epoch_micro,
+                streaming_stride,
+                effective_micro,
+                accelerator.gradient_accumulation_steps,
+            )
+        steps_per_epoch = effective_steps_per_epoch
+
     if _is_formal_b1k_mode(config) and is_main:
         logging.info(
             "Formal B1K lean contract: offsets=(0,4,8), pass_steps=(34982,34971,34959), "
