@@ -185,6 +185,10 @@ def _make_b1k_full_task_set_data_config(
     episodes_index: list[int],
     *,
     behavior_dataset_root: str = _B1K_DATA_ROOT,
+    skill_bridge_enabled: bool = False,
+    skill_bridge_min_pre: int = 1,
+    skill_bridge_min_post: int = 1,
+    base_assets_dir: str | None = None,
 ) -> LeRobotB1KDataConfig:
     """Full B1K challenge task-set data config with per-task episode indices.
 
@@ -194,14 +198,21 @@ def _make_b1k_full_task_set_data_config(
     Args:
         episodes_index: episode indices to use for every B1K challenge task
         behavior_dataset_root: persistent B1K dataset location for this config
+        skill_bridge_enabled: if True, enable the skill bridge baseline that
+            concatenates adjacent subtask spans across single skill boundaries.
+        skill_bridge_min_pre: minimum steps before a boundary for a valid bridge.
+        skill_bridge_min_post: minimum steps after a boundary for a valid bridge.
+        base_assets_dir: if provided, override the default assets_dir (useful
+            when the base checkpoint lives outside the worktree).
 
     Returns:
         LeRobotB1KDataConfig with no task filter and annotations_skill subtasks
     """
+    assets_dir = base_assets_dir or f"{_PI05_BASE_CKPT}/assets"
     return LeRobotB1KDataConfig(
         repo_id="behavior-1k/2025-challenge-demos",
         assets=AssetsConfig(
-            assets_dir=f"{_PI05_BASE_CKPT}/assets",
+            assets_dir=assets_dir,
             asset_id="behavior-1k/2025-challenge-demos",
         ),
         base_config=DataConfig(
@@ -213,6 +224,11 @@ def _make_b1k_full_task_set_data_config(
             subtask_template_path=_B1K_SUBTASK_TEMPLATES,
             subtask_object_name_mapping_path=_B1K_OBJECT_MAPPING,
             subtask_joiner=" then ",
+            skill_bridge=SkillBridgeConfig(
+                enabled=skill_bridge_enabled,
+                min_pre_boundary_steps=skill_bridge_min_pre,
+                min_post_boundary_steps=skill_bridge_min_post,
+            ),
         ),
     )
 
@@ -522,22 +538,38 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     val_episodes_start: int = 180,
     val_episodes_end: int = 200,
     behavior_dataset_root: str = _HL_B1K_DATA_ROOT,
+    skill_bridge_enabled: bool = False,
+    skill_bridge_min_pre: int = 1,
+    skill_bridge_min_post: int = 1,
+    base_checkpoint_path: str = _PI05_BASE_CKPT,
+    base_assets_dir: str | None = None,
+    num_train_steps: int = 104_912,
+    num_train_epochs: int | None = None,
+    warmup_steps: int = 1_000,
+    peak_lr: float = 1e-5,
+    decay_steps: int = 104_912,
+    decay_lr: float = 0.0,
+    batch_size_per_gpu: int = 8,
+    save_interval: int = 10_000,
+    val_log_interval: int = 1_000,
+    val_num_batches: int = 20,
+    log_interval: int = 10,
 ) -> TrainConfig:
-    """Formal lean B8/W32 BF16 config over the full B1K task set.
+    """Formal lean BF16 config over the full B1K task set.
 
-    Training uses three streaming stride-12 passes with episode-local offsets
-    ``(0, 4, 8)`` and drops the final 31 incomplete action starts per episode.
-    Pass source/step/consumed/drop budgets are respectively
-    ``(8,955,603, 34,982, 8,955,392, 211)``,
-    ``(8,952,584, 34,971, 8,952,576, 8)``, and
-    ``(8,949,525, 34,959, 8,949,504, 21)``. Their cumulative boundaries are
-    ``34,982 / 69,953 / 104,912``. The theoretical eligible union is
-    26,857,712 anchors and 26,857,472 are consumed, with 240 dropped by global
-    batch truncation: 24.9383588896% of the original 107,696,389 train anchors,
-    i.e. approximate quarter exposure rather than exact unique coverage.
+    Defaults reproduce the non-Skill-Bridge Run 2 control
+    (``pi05_ki_joint_query_b1k-full_task-ki_on_bf16``): three streaming stride-12
+    passes with offsets ``(0, 4, 8)``, a fixed 104,912 optimizer-step budget,
+    warmup 1,000, peak LR 1e-5, cosine decay to 0, B8 (global batch 256 on
+    32 GPUs), HL dataset root, base ``pi05`` checkpoint.
 
-    Validation keeps the baseline stride-1 loader and padding behavior. Formal
-    resume is unsupported; checkpoints are weights/evaluation artifacts only.
+    Pass ``skill_bridge_enabled=True`` to obtain the Skill-Bridge variant that
+    is otherwise matched to the control. The formal stride-12 / fixed-budget
+    guard in ``train_accelerate.py`` keys on the control config name only, so
+    the Skill-Bridge variant runs with the standard stride-1 data loader and
+    the caller's ``num_train_epochs`` / ``num_train_steps`` budget.
+
+    Validation keeps the baseline stride-1 loader and padding behavior.
     """
     train_episodes_index = list(range(train_episodes))
     val_episodes_index = list(range(val_episodes_start, val_episodes_end))
@@ -562,19 +594,27 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
         data=_make_b1k_full_task_set_data_config(
             train_episodes_index,
             behavior_dataset_root=behavior_dataset_root,
+            skill_bridge_enabled=skill_bridge_enabled,
+            skill_bridge_min_pre=skill_bridge_min_pre,
+            skill_bridge_min_post=skill_bridge_min_post,
+            base_assets_dir=base_assets_dir,
         ),
         val_data=_make_b1k_full_task_set_data_config(
             val_episodes_index,
             behavior_dataset_root=behavior_dataset_root,
+            skill_bridge_enabled=skill_bridge_enabled,
+            skill_bridge_min_pre=skill_bridge_min_pre,
+            skill_bridge_min_post=skill_bridge_min_post,
+            base_assets_dir=base_assets_dir,
         ),
-        pytorch_weight_path=_PI05_BASE_CKPT,
-        num_train_steps=104_912,
-        num_train_epochs=None,
+        pytorch_weight_path=base_checkpoint_path,
+        num_train_steps=num_train_steps,
+        num_train_epochs=num_train_epochs,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-5,
-            decay_steps=104_912,
-            decay_lr=0.0,
+            warmup_steps=warmup_steps,
+            peak_lr=peak_lr,
+            decay_steps=decay_steps,
+            decay_lr=decay_lr,
         ),
         pytorch_training_precision="bfloat16",
         accelerate_mixed_precision="bf16",
@@ -584,14 +624,14 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
         checkpoint_base_dir=f"{output_root}/checkpoints",
         log_base_dir=f"{output_root}/logs",
         num_workers=2,
-        batch_size_per_gpu=8,
+        batch_size_per_gpu=batch_size_per_gpu,
         gradient_accumulation_steps=1,
-        save_interval=10_000,
+        save_interval=save_interval,
         checkpoint_policy="step",
         rolling_checkpoint_interval=10_000,
-        log_interval=10,
-        val_log_interval=1_000,
-        val_num_batches=20,
+        log_interval=log_interval,
+        val_log_interval=val_log_interval,
+        val_num_batches=val_num_batches,
     )
 
 
@@ -714,7 +754,29 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     ),
     # Formal lean B8/W32 run: three stride-12 offsets provide approximate
     # quarter exposure; the exact fixed optimizer-step budget is 104,912.
+    # This is the non-Skill-Bridge control (Tracking Run 2). Left untouched.
     _make_pi05_ki_joint_query_full_task_set_bf16_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
+    ),
+    # Full-B1K Skill Bridge variant (LQ, 8x8 A100, B4, 3 epochs, stride-1).
+    # NOT a strict Run 2 A/B: warmstarts from the LQ base pi05 checkpoint
+    # (Run 2's 360k-step warmstart lives on HL NAS and is unavailable on LQ),
+    # uses 3 real stride-1 epochs (~1.26M optimizer steps) instead of Run 2's
+    # fixed 104,912-step three stride-12 passes, and B4 on 64 GPUs for the same
+    # global batch 256. The only intended algorithmic A/B difference vs the
+    # control above is skill_bridge.enabled=True.
+    _make_pi05_ki_joint_query_full_task_set_bf16_config(
+        name="pi05_ki_joint_query_b1k-full_task-ki_on_skillbridge_bf16",
+        behavior_dataset_root=_B1K_DATA_ROOT,
+        skill_bridge_enabled=True,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        num_train_steps=0,
+        num_train_epochs=3,
+        warmup_steps=10_000,
+        peak_lr=1e-5,
+        decay_steps=0,
+        decay_lr=0.0,
+        batch_size_per_gpu=4,
     ),
 ]

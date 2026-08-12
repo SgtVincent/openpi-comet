@@ -9,16 +9,21 @@
 # TRAINING CONTRACT (current)
 # ---------------------------
 #   * BATCH_SIZE_PER_GPU = 4  ->  global batch 4 × 64 = 256 (grad-accum 1)
-#   * NUM_TRAIN_EPOCHS   = 5  ->  five FULL passes over the dataset
+#   * NUM_TRAIN_EPOCHS   = 3  ->  three FULL stride-1 passes over Full B1K
 #   * NUM_TRAIN_STEPS    = 0  ->  step cap DISABLED; the epoch budget governs
 #
-# There is deliberately NO 2000-step cap any more. The earlier 8×8 run stopped
-# at a 2000-step ceiling (~0.32 epoch); this configuration instead trains to
-# completion. Expect roughly 1556 steps/epoch and ~7780 optimizer steps in
-# total, but note those are ESTIMATES: the authoritative steps_per_epoch is
-# computed at runtime from the actual dataloader length. See the "Frozen
-# training schedule" block below for the exact trainer semantics, including the
-# expected LR-decay override warning.
+# NOT a strict Tracking Run 2 A/B. Run 2 (the non-Skill-Bridge control)
+# warmstarted from a 360k-step checkpoint that lives only on HL NAS and is
+# unavailable here; this run warmstarts from the LQ base pi05 checkpoint.
+# Run 2 also used a fixed 104,912-step budget across three stride-12 passes
+# (offsets 0/4/8); this run uses 3 real stride-1 epochs with the standard
+# loader. The only intended algorithmic A/B difference vs the control is
+# skill_bridge.enabled=True.
+#
+# Expect roughly 420,689 steps/epoch and ~1,262,067 optimizer steps in total
+# at global batch 256, but those are ESTIMATES: the authoritative
+# steps_per_epoch is computed at runtime from the actual dataloader length.
+# See the "Frozen training schedule" block below for exact trainer semantics.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -187,7 +192,15 @@ export REPO_OPENPI_CACHE="${REPO_OPENPI_CACHE:-${LQ_CANONICAL_REPO}/.cache/openp
 
 # Skill Bridge BF16 training config (registered in
 # src/openpi/training/pi05_ki_joint_query_config.py).
-export CONFIG_NAME="${CONFIG_NAME:-pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_bf16}"
+#
+# Full-B1K Skill Bridge variant (50 tasks, 180 train / 180-199 val episodes
+# per task, stride-1 loader). NOT a strict Run 2 A/B: warmstarts from the LQ
+# base pi05 checkpoint (Run 2's 360k-step warmstart lives on HL NAS and is
+# unavailable on LQ), runs 3 real stride-1 epochs instead of Run 2's fixed
+# 104,912-step three stride-12 passes, and uses B4 on 64 GPUs for the same
+# global batch 256. The only intended algorithmic A/B difference vs the
+# non-Skill-Bridge control is skill_bridge.enabled=True.
+export CONFIG_NAME="${CONFIG_NAME:-pi05_ki_joint_query_b1k-full_task-ki_on_skillbridge_bf16}"
 
 # Dedicated 8×8 output root, kept separate from the 4×8 root so the two
 # topologies never share checkpoints or experiment-name sync state.
@@ -204,34 +217,27 @@ export PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-${LQ_NAS_USER_ROOT}/rep
 # nodes divergent names / checkpoint dirs.
 
 # ---------------------------------------------------------------------------
-# Frozen training schedule: B4 × 64 GPUs = global batch 256, FULL 5 epochs.
+# Frozen training schedule: B4 × 64 GPUs = global batch 256, 3 Full-B1K epochs.
 #
 # NUM_TRAIN_STEPS=0 DISABLES the step cap on purpose. In
-# scripts/train_accelerate.py (L2832-2837) the budget resolves as
+# scripts/train_accelerate.py the budget resolves as
 #     computed_steps = num_train_epochs * steps_per_epoch
 #     target_steps   = computed_steps if num_train_steps <= 0
 #                      else min(num_train_steps, computed_steps)
 # so a non-positive NUM_TRAIN_STEPS selects computed_steps outright with no
-# min() clamp. That is the only way to guarantee all 5 epochs actually run: any
-# positive value here would silently truncate the run whenever it happened to
-# be smaller than the epoch budget.
+# min() clamp. That is the only way to guarantee all 3 epochs actually run.
 #
 # THE STEP COUNT IS APPROXIMATE. steps_per_epoch is computed at RUNTIME from
-# the real dataloader length, never here. The 8×8 B1 run observed
-# steps_per_epoch=6227, so B4 should land near 6227/4 ≈ 1556 steps/epoch and
-# ≈ 7780 optimizer steps across 5 epochs. Estimates only — not a contract.
+# the real dataloader length, never here. For Full B1K (50 tasks × 180 train
+# episodes, stride-1) at global batch 256 the estimate is ~420,689 steps/epoch
+# and ~1,262,067 optimizer steps across 3 epochs. Estimates only — not a
+# contract; the trainer prints the authoritative computed value at startup.
 #
-# LR SCHEDULE IS AUTO-EXTENDED, AND LOGS A WARNING BY DESIGN.
-# The config bakes in decay_steps=2000 (an estimated 1-epoch budget). Since
-# 2000 < the ~7780 real budget, train_accelerate.py L3081-3088 takes its SECOND
-# override branch and rewrites decay_steps to the true num_train_steps, so the
-# cosine decay stretches over the whole 5-epoch run instead of reaching LR=0 at
-# roughly a quarter of the way through. That branch emits a logging.WARNING:
-#   "decay_steps=2000 < num_train_steps=<N> — LR will reach 0 before training
-#    ends; overriding to num_train_steps"
-# This warning is EXPECTED AND CORRECT here, not an error. (The other branch,
-# decay_steps<=0, logs at info level instead — we do not hit it.) Do not
-# "fix" it by editing the config's decay_steps.
+# LR SCHEDULE: warmup 10,000 (~1% of the ~1.26M-step budget), peak_lr 1e-5,
+# cosine decay to 0. The new Full-B1K Skill Bridge config sets
+# decay_steps=0, which the trainer (train_accelerate.py) treats as "use
+# num_train_steps" via its decay_steps<=0 branch (info-level log, no warning).
+# decay therefore spans the whole 3-epoch run and reaches 0 exactly at the end.
 #
 # BATCH_SIZE_PER_GPU=4 is a deliberate, user-mandated choice. It roughly
 # quadruples activation memory versus the validated B1 run and so carries real
@@ -242,7 +248,7 @@ export PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-${LQ_NAS_USER_ROOT}/rep
 # ---------------------------------------------------------------------------
 export PYTORCH_TRAINING_PRECISION="${PYTORCH_TRAINING_PRECISION:-bfloat16}"
 export NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-0}"
-export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-5}"
+export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3}"
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
 export NUM_WORKERS="${NUM_WORKERS:-4}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-200}"
@@ -258,11 +264,12 @@ export VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-100}"
 # Reporting-only derived numbers (never passed to the trainer).
 # GLOBAL_BATCH is exact: micro-batch × world size, grad-accum is 1 here.
 GLOBAL_BATCH=$((BATCH_SIZE_PER_GPU * TOTAL_GPUS))
-# Step estimate anchored on the measured 8×8 B1 run (steps_per_epoch=6227).
-# steps_per_epoch scales inversely with the micro-batch at fixed world size.
-B1_STEPS_PER_EPOCH_MEASURED=6227
-EST_STEPS_PER_EPOCH_B4=$((B1_STEPS_PER_EPOCH_MEASURED / BATCH_SIZE_PER_GPU))
-EST_TOTAL_STEPS=$((EST_STEPS_PER_EPOCH_B4 * NUM_TRAIN_EPOCHS))
+# Step estimate for Full B1K (all 50 tasks, 180 train episodes/task, stride-1)
+# at global batch 256. Anchored on Tracking Run 2's measured throughput at the
+# same global batch; the trainer computes the authoritative steps_per_epoch at
+# runtime from the real dataloader length, so this is a reporting estimate only.
+EST_STEPS_PER_EPOCH=420689
+EST_TOTAL_STEPS=$((EST_STEPS_PER_EPOCH * NUM_TRAIN_EPOCHS))
 # Human-readable step-cap state, so the banner stays truthful even if a caller
 # re-enables the cap through the environment.
 if (( NUM_TRAIN_STEPS > 0 )); then
@@ -324,9 +331,9 @@ if (( NUM_TRAIN_STEPS > 0 )); then
   info "BUDGET=min(${NUM_TRAIN_STEPS} steps, ${NUM_TRAIN_EPOCHS} epochs) [step cap ACTIVE - overridden from the default]"
 else
   info "BUDGET=${NUM_TRAIN_EPOCHS} full epochs, step cap DISABLED (NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS})"
-  info "BUDGET_ESTIMATE=~${EST_STEPS_PER_EPOCH_B4} steps/epoch × ${NUM_TRAIN_EPOCHS} ≈ ${EST_TOTAL_STEPS} optimizer steps"
+  info "BUDGET_ESTIMATE=~${EST_STEPS_PER_EPOCH} steps/epoch × ${NUM_TRAIN_EPOCHS} ≈ ${EST_TOTAL_STEPS} optimizer steps"
   info "BUDGET_NOTE=estimate only; steps_per_epoch is computed at runtime by the dataloader"
-  info "BUDGET_NOTE=LR decay auto-extends to the real total; a 'decay_steps=... < num_train_steps' WARNING is expected"
+  info "BUDGET_NOTE=LR decay_steps=0 in config; trainer auto-aligns decay to the computed total steps (info log)"
 fi
 info "INTERVALS=validation ${VAL_LOG_INTERVAL}, save ${SAVE_INTERVAL}"
 info "BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU} NUM_WORKERS=${NUM_WORKERS}"
