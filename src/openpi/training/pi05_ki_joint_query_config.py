@@ -554,6 +554,7 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     val_log_interval: int = 1_000,
     val_num_batches: int = 20,
     log_interval: int = 10,
+    streaming_anchor_stride: int = 12,
 ) -> TrainConfig:
     """Formal lean BF16 config over the full B1K task set.
 
@@ -569,7 +570,14 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     the Skill-Bridge variant runs with the standard stride-1 data loader and
     the caller's ``num_train_epochs`` / ``num_train_steps`` budget.
 
-    Validation keeps the baseline stride-1 loader and padding behavior.
+    ``streaming_anchor_stride`` (default 12, matching the formal control) pins
+    the B1K chunk-streaming anchor stride for the *training* loader. It is
+    stored on ``TrainConfig``; the trainer applies it by setting
+    ``OPENPI_B1K_ANCHOR_STRIDE`` scoped to the train-loader construction. The
+    validation loader always runs with the baseline stride-1 / no-drop
+    contract (see ``_baseline_b1k_dataset_env`` in ``train_accelerate.py``),
+    so validation metrics are computed on the full-resolution data regardless
+    of the training stride.
     """
     train_episodes_index = list(range(train_episodes))
     val_episodes_index = list(range(val_episodes_start, val_episodes_end))
@@ -632,6 +640,7 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
         log_interval=log_interval,
         val_log_interval=val_log_interval,
         val_num_batches=val_num_batches,
+        streaming_anchor_stride=streaming_anchor_stride,
     )
 
 
@@ -778,5 +787,8 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         decay_steps=0,
         decay_lr=0.0,
         batch_size_per_gpu=4,
+        save_interval=10_000,
+        val_log_interval=2_000,
+        streaming_anchor_stride=4,
     ),
 ]

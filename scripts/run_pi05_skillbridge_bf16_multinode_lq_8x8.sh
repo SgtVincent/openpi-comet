@@ -251,8 +251,8 @@ export NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-0}"
 export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3}"
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
 export NUM_WORKERS="${NUM_WORKERS:-4}"
-export SAVE_INTERVAL="${SAVE_INTERVAL:-200}"
-export VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-100}"
+export SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
+export VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-2000}"
 
 # Validate the two schedule knobs that feed shell arithmetic below, so a typo'd
 # env override fails here with a clear message instead of as a cryptic
