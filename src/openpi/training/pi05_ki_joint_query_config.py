@@ -14,6 +14,7 @@ Precision variants:
 - ``*_bf16``: bfloat16 (formal HL/Arnold training precision)
 """
 
+import dataclasses
 from pathlib import Path
 
 import openpi.models.pi05_ki_joint_query_config as pi05_ki_joint_query_config
@@ -559,6 +560,51 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     )
 
 
+# Continuation phase 2 budget. Phase 1 spent 104,912 optimizer steps on offsets
+# (0, 4, 8). The fresh offsets (1, 5, 9) hold slightly fewer eligible anchors --
+# each episode's stride-12 progression starts one frame later against a fixed
+# ``L - 32`` cap -- so their exact floor-safe capacities at global batch 256 are:
+#
+#     offset 1: 8,954,823 anchors -> 34,979 steps
+#     offset 5: 8,951,844 anchors -> 34,968 steps
+#     offset 9: 8,948,791 anchors -> 34,956 steps
+#     total                          104,903 steps
+#
+# (Method validated by reproducing all twelve phase-1 ground-truth figures
+# exactly, including union=26,857,712 and 24.9383588896%.)
+#
+# The budget is therefore exact-fit at 104,903 rather than reusing phase 1's
+# 104,912: holding 104,912 would over-subscribe every pass by 3 steps and
+# re-expose 2,304 already-consumed-in-this-phase anchors. ``decay_steps`` tracks
+# ``num_train_steps`` so the cosine still lands exactly at 0 on the final step.
+_PI05_KI_CONT2_NUM_TRAIN_STEPS = 104_903
+
+
+def _make_pi05_ki_joint_query_full_task_set_bf16_cont2_config(*, name: str) -> TrainConfig:
+    """Continuation-phase-2 variant of the formal lean full-task-set BF16 config.
+
+    Derived from :func:`_make_pi05_ki_joint_query_full_task_set_bf16_config` so the
+    model, data, split, precision, checkpoint and validation contract stay
+    bit-identical to phase 1. Only the step budget and the matching cosine horizon
+    change; ``output_root`` is already name-derived, so artifacts never collide.
+
+    The fresh anchor offsets (1, 5, 9) are not expressed here: they live in the
+    pass plan in ``scripts/train_accelerate.py`` (``_FORMAL_B1K_PLANS``) and are
+    pinned by ``scripts/run_pi05_ki_joint_query_full_b1k_bf16_multinode_hl_cont2.sh``.
+    """
+    base = _make_pi05_ki_joint_query_full_task_set_bf16_config(name=name)
+    return dataclasses.replace(
+        base,
+        num_train_steps=_PI05_KI_CONT2_NUM_TRAIN_STEPS,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=_PI05_KI_CONT2_NUM_TRAIN_STEPS,
+            decay_lr=0.0,
+        ),
+    )
+
+
 _PI05_KI_JOINT_QUERY_CONFIGS = [
     # --- fp16 base configs (intended production; may be unstable on V100) ---
     _make_pi05_ki_joint_query_config(
@@ -636,5 +682,38 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # quarter exposure; the exact fixed optimizer-step budget is 104,912.
     _make_pi05_ki_joint_query_full_task_set_bf16_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
+    ),
+    # Continuation phase 2 of the formal lean run. The phase-1 run exhausted its
+    # full 104,912-step cosine schedule (final LR 2.29e-15), so it stopped by
+    # schedule rather than by convergence while validation loss was still
+    # falling. Phase 2 therefore restores a fresh cosine (warmup 1000, peak
+    # 1e-5, decay to 0) and consumes fresh, never-seen stride-12
+    # anchors at episode-local offsets (1, 5, 9); phase 1 consumed (0, 4, 8).
+    #
+    # The budget is 104,903 rather than 104,912 -- the exact floor-safe capacity
+    # of offsets (1, 5, 9); see _PI05_KI_CONT2_NUM_TRAIN_STEPS above. This makes
+    # every pass exact-fit, so no anchor is re-exposed and the dataloader never
+    # runs dry mid-pass.
+    #
+    # Everything that defines the learning problem is intentionally identical to
+    # phase 1 (KI ON, alpha=10, flow_loss_weight=10, 32 query tokens, H32,
+    # train episodes [0,180) / val [180,200), same dataset root). Only the LR
+    # phase, the step budget, the anchor offsets, and the output tree differ.
+    # ``output_root`` is
+    # derived from ``name``, so phase-2 artifacts land in
+    # ``./outputs/pi05_ki_joint_query_b1k-full_task-ki_on_bf16_cont2`` and never
+    # collide with phase 1.
+    #
+    # Warm-start weights and normalization assets are injected by the launcher
+    # (``--pytorch-weight-path`` / ``BASE_PI05_CKPT``), pointing at the phase-1
+    # step-104912 checkpoint. Norm stats stay byte-identical to phase 1
+    # (sha256 4dde119e...), which is required for continuity: the model learned
+    # its action scaling in that space.
+    #
+    # The (1, 5, 9) offsets are realized by the pass plan in
+    # scripts/train_accelerate.py (``_FORMAL_B1K_PLANS``) and pinned by
+    # scripts/run_pi05_ki_joint_query_full_b1k_bf16_multinode_hl_cont2.sh.
+    _make_pi05_ki_joint_query_full_task_set_bf16_cont2_config(
+        name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16_cont2",
     ),
 ]

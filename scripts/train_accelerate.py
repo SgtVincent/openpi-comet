@@ -310,6 +310,32 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 _FORMAL_B1K_CONFIG_NAME = "pi05_ki_joint_query_b1k-full_task-ki_on_bf16"
 _FORMAL_B1K_PASS_SPECS = ((0, 34_982), (4, 34_971), (8, 34_959))
 _FORMAL_B1K_PASS_BOUNDARIES = (34_982, 69_953, 104_912)
+# Continuation phase 2: fresh episode-local offsets (1, 5, 9). Phase 1 consumed
+# (0, 4, 8), so under stride 12 these anchors are disjoint from everything the
+# warm-start checkpoint has already seen.
+#
+# Unlike phase 1 this plan is EXACT-FIT. Measured eligible anchors for this split
+# (50 tasks x 180 episodes, H32, drop-incomplete-horizon, global batch 256) are
+# 8,954,823 / 8,951,844 / 8,948,791, giving floor-safe capacities of
+# 34,979 / 34,968 / 34,956 = 104,903 steps. Each offset holds exactly 3 fewer
+# steps than its phase-1 counterpart because every episode's progression starts
+# one frame later against a fixed L-32 cap. The budget is therefore 104,903, not
+# phase 1's 104,912: reusing 104,912 would over-subscribe each pass by 3 steps
+# and re-expose 2,304 anchors. Exact-fit also means no pass can run its loader
+# dry, so the re-epoch guard in the training loop stays unreachable here.
+_FORMAL_B1K_CONT2_CONFIG_NAME = "pi05_ki_joint_query_b1k-full_task-ki_on_bf16_cont2"
+_FORMAL_B1K_CONT2_PASS_SPECS = ((1, 34_979), (5, 34_968), (9, 34_956))
+_FORMAL_B1K_CONT2_PASS_BOUNDARIES = (34_979, 69_947, 104_903)
+# Registry of formal-B1K pass plans keyed by config name. Adding a plan here is
+# what makes a config "formal": it opts the run into the fixed-budget contract,
+# the per-pass anchor-offset rotation, and baseline stride-1 validation.
+_FORMAL_B1K_PLANS = {
+    _FORMAL_B1K_CONFIG_NAME: (_FORMAL_B1K_PASS_SPECS, _FORMAL_B1K_PASS_BOUNDARIES),
+    _FORMAL_B1K_CONT2_CONFIG_NAME: (
+        _FORMAL_B1K_CONT2_PASS_SPECS,
+        _FORMAL_B1K_CONT2_PASS_BOUNDARIES,
+    ),
+}
 _FORMAL_B1K_DATASET_ENV_KEYS = (
     "OPENPI_B1K_ANCHOR_STRIDE",
     "OPENPI_B1K_ANCHOR_OFFSET",
@@ -318,11 +344,25 @@ _FORMAL_B1K_DATASET_ENV_KEYS = (
 
 
 def _is_formal_b1k_mode(config) -> bool:
-    return getattr(config, "name", None) == _FORMAL_B1K_CONFIG_NAME
+    return getattr(config, "name", None) in _FORMAL_B1K_PLANS
 
 
-def _set_formal_b1k_pass_offset(offset: int) -> None:
-    if offset not in {spec[0] for spec in _FORMAL_B1K_PASS_SPECS}:
+def _formal_b1k_plan(config) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
+    """Return ``(pass_specs, pass_boundaries)`` for a formal-B1K config."""
+
+    name = getattr(config, "name", None)
+    try:
+        return _FORMAL_B1K_PLANS[name]
+    except KeyError as exc:
+        raise ValueError(f"No formal B1K pass plan registered for config {name!r}") from exc
+
+
+def _set_formal_b1k_pass_offset(
+    offset: int,
+    *,
+    specs: tuple[tuple[int, int], ...] = _FORMAL_B1K_PASS_SPECS,
+) -> None:
+    if offset not in {spec[0] for spec in specs}:
         raise ValueError(f"Unsupported formal B1K pass offset: {offset}")
     os.environ["OPENPI_B1K_ANCHOR_STRIDE"] = "12"
     os.environ["OPENPI_B1K_ANCHOR_OFFSET"] = str(offset)
@@ -346,12 +386,17 @@ def _baseline_b1k_dataset_env():
                 os.environ[key] = value
 
 
-def _formal_b1k_pass_for_step(global_step: int) -> tuple[int, int, int, int, int]:
-    if not 0 <= global_step < _FORMAL_B1K_PASS_BOUNDARIES[-1]:
+def _formal_b1k_pass_for_step(
+    global_step: int,
+    *,
+    specs: tuple[tuple[int, int], ...] = _FORMAL_B1K_PASS_SPECS,
+    boundaries: tuple[int, ...] = _FORMAL_B1K_PASS_BOUNDARIES,
+) -> tuple[int, int, int, int, int]:
+    if not 0 <= global_step < boundaries[-1]:
         raise ValueError(f"Formal B1K global_step out of range: {global_step}")
     pass_start = 0
     for pass_index, ((offset, pass_steps), pass_end) in enumerate(
-        zip(_FORMAL_B1K_PASS_SPECS, _FORMAL_B1K_PASS_BOUNDARIES, strict=True)
+        zip(specs, boundaries, strict=True)
     ):
         if global_step < pass_end:
             return pass_index, offset, pass_steps, pass_start, pass_end
@@ -387,10 +432,25 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
     if not _is_formal_b1k_mode(config):
         return
 
+    # The active plan is the single source of truth for both the anchor offsets
+    # and the step budget. The FRAME_ANCHOR_* env vars and the TrainConfig budget
+    # are operator-facing declarations that must agree with it, so a launcher or
+    # config pinned to the wrong values fails closed here rather than silently
+    # training on already-consumed anchors or running a pass dry.
+    pass_specs, pass_boundaries = _formal_b1k_plan(config)
+    plan_offsets = tuple(spec[0] for spec in pass_specs)
+    plan_offsets_env = ",".join(str(offset) for offset in plan_offsets)
+    plan_total_steps = int(pass_boundaries[-1])
+    if plan_total_steps != sum(spec[1] for spec in pass_specs):
+        raise ValueError(
+            f"Formal B1K plan for {config.name!r} is inconsistent: boundaries end at "
+            f"{plan_total_steps} but pass steps sum to {sum(spec[1] for spec in pass_specs)}"
+        )
+
     expected_fields = {
         "batch_size_per_gpu": 8,
         "gradient_accumulation_steps": 1,
-        "num_train_steps": 104_912,
+        "num_train_steps": plan_total_steps,
         "wandb_enabled": True,
         "project_name": "pi05_ki",
     }
@@ -402,7 +462,9 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
                 "Runtime overrides are not supported."
             )
     if getattr(config, "num_train_epochs", None) is not None:
-        raise ValueError("Formal B1K requires num_train_epochs=None and the fixed 104,912-step budget")
+        raise ValueError(
+            f"Formal B1K requires num_train_epochs=None and the fixed {plan_total_steps}-step budget"
+        )
     if bool(getattr(config, "resume", False)):
         raise ValueError(
             "Formal B1K resume is unsupported: checkpoints are weights/evaluation artifacts, "
@@ -416,28 +478,29 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
         int(schedule.decay_steps),
         float(schedule.decay_lr),
     )
-    if schedule_values != (1_000, 1e-5, 104_912, 0.0):
+    if schedule_values != (1_000, 1e-5, plan_total_steps, 0.0):
         raise ValueError(
-            "Formal B1K requires warmup=1000, peak_lr=1e-5, decay_steps=104912, decay_lr=0; "
-            f"got {schedule_values}"
+            "Formal B1K requires warmup=1000, peak_lr=1e-5, "
+            f"decay_steps={plan_total_steps}, decay_lr=0; got {schedule_values}"
         )
 
+
     os.environ.setdefault("FRAME_ANCHOR_STRIDE", "12")
-    os.environ.setdefault("FRAME_ANCHOR_OFFSETS", "0,4,8")
+    os.environ.setdefault("FRAME_ANCHOR_OFFSETS", plan_offsets_env)
     if os.environ["FRAME_ANCHOR_STRIDE"] != "12":
         raise ValueError("Formal B1K requires FRAME_ANCHOR_STRIDE=12")
     try:
         frame_offsets = tuple(int(value) for value in os.environ["FRAME_ANCHOR_OFFSETS"].split(","))
     except ValueError as exc:
-        raise ValueError("Formal B1K FRAME_ANCHOR_OFFSETS must be exactly 0,4,8") from exc
-    if frame_offsets != (0, 4, 8):
+        raise ValueError(f"Formal B1K FRAME_ANCHOR_OFFSETS must be exactly {plan_offsets_env}") from exc
+    if frame_offsets != plan_offsets:
         raise ValueError(
-            f"Formal B1K FRAME_ANCHOR_OFFSETS must be exactly (0, 4, 8); got {frame_offsets}"
+            f"Formal B1K FRAME_ANCHOR_OFFSETS must be exactly {plan_offsets}; got {frame_offsets}"
         )
 
     formal_dataset_defaults = {
         "OPENPI_B1K_ANCHOR_STRIDE": "12",
-        "OPENPI_B1K_ANCHOR_OFFSET": "0",
+        "OPENPI_B1K_ANCHOR_OFFSET": str(plan_offsets[0]),
         "OPENPI_B1K_DROP_INCOMPLETE_HORIZON": "1",
     }
     for key, expected in formal_dataset_defaults.items():
@@ -2821,12 +2884,26 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     if steps_per_epoch <= 0:
         raise RuntimeError(f"Computed steps_per_epoch={steps_per_epoch}, expected a positive value.")
     if _is_formal_b1k_mode(config) and is_main:
+        _log_pass_specs, _log_boundaries = _formal_b1k_plan(config)
         logging.info(
-            "Formal B1K lean contract: offsets=(0,4,8), pass_steps=(34982,34971,34959), "
-            "boundaries=(34982,69953,104912), theoretical_eligible=26857712, consumed=26857472, "
-            "global_batch_drop=240, exposure=24.9383588896% of 107696389 anchors. "
-            "Coverage is approximate; checkpoints are weights/eval artifacts and resume is unsupported."
+            "Formal B1K lean contract: offsets=%s, pass_steps=%s, boundaries=%s. "
+            "Coverage is approximate; checkpoints are weights/eval artifacts and resume is unsupported.",
+            tuple(spec[0] for spec in _log_pass_specs),
+            tuple(spec[1] for spec in _log_pass_specs),
+            tuple(_log_boundaries),
         )
+        if config.name == _FORMAL_B1K_CONFIG_NAME:
+            logging.info(
+                "Formal B1K phase-1 exposure: theoretical_eligible=26857712, consumed=26857472, "
+                "global_batch_drop=240, exposure=24.9383588896% of 107696389 anchors."
+            )
+        else:
+            logging.info(
+                "Formal B1K continuation: offsets are disjoint from phase-1 (0,4,8) under stride 12, "
+                "so every consumed anchor is fresh. Per-pass budgets equal the measured floor-safe "
+                "capacities (34979/34968/34956 = 104903), so this plan is exact-fit: no anchor is "
+                "re-exposed and no pass runs its loader dry. Exact unique coverage is not claimed."
+            )
 
     if config.num_train_epochs is not None:
         if config.num_train_epochs <= 0:
@@ -3332,6 +3409,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     last_epoch_logged = None
     formal_b1k_mode = _is_formal_b1k_mode(config)
+    formal_pass_specs: tuple[tuple[int, int], ...] = ()
+    formal_pass_boundaries: tuple[int, ...] = ()
+    if formal_b1k_mode:
+        formal_pass_specs, formal_pass_boundaries = _formal_b1k_plan(config)
     formal_pass_index = None
     formal_pass_offset = None
     formal_pass_start = 0
@@ -3339,7 +3420,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     train_iterator = None
     while global_step < int(config.num_train_steps):
         if formal_b1k_mode:
-            next_pass_index, next_offset, pass_steps, pass_start, pass_end = _formal_b1k_pass_for_step(global_step)
+            next_pass_index, next_offset, pass_steps, pass_start, pass_end = _formal_b1k_pass_for_step(
+                global_step,
+                specs=formal_pass_specs,
+                boundaries=formal_pass_boundaries,
+            )
             if formal_pass_index != next_pass_index:
                 accelerator.wait_for_everyone()
                 _close_training_iterator(train_iterator)
@@ -3347,7 +3432,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 if next_pass_index > 0:
                     del loader
                     gc.collect()
-                    _set_formal_b1k_pass_offset(next_offset)
+                    _set_formal_b1k_pass_offset(next_offset, specs=formal_pass_specs)
                     loader, _ = build_datasets(config)
                     loader = accelerator.prepare(loader)
                 formal_pass_index = next_pass_index
@@ -4328,6 +4413,28 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         if global_step == formal_pass_end:
                             break
+
+        # Defence in depth: a pass whose loader is exhausted before its step
+        # budget must re-epoch the same (already-set) offset. Without this, the
+        # outer loop would spin forever on a dead iterator, because the pass index
+        # has not changed so neither the rebuild branch nor `iter(loader)` above
+        # would run again. Both registered plans size each pass at or below its
+        # measured anchor capacity, so this is unreachable in the happy path; it
+        # exists so that a future mis-sized plan degrades to duplicate exposure
+        # rather than to a silent multi-day hang.
+        if formal_b1k_mode and global_step < formal_pass_end:
+            if is_main:
+                logging.info(
+                    "Formal B1K pass %s exhausted its loader at step %s before boundary %s; "
+                    "re-epoching the same offset %s for the remaining %s steps.",
+                    formal_pass_index,
+                    global_step,
+                    formal_pass_end,
+                    formal_pass_offset,
+                    formal_pass_end - global_step,
+                )
+            _close_training_iterator(train_iterator)
+            train_iterator = iter(loader)
 
     _close_training_iterator(train_iterator)
 
