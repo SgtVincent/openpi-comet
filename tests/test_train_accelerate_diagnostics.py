@@ -102,18 +102,16 @@ class TestGatherFiniteConsensus:
     """Test the cheap finite-consensus function."""
 
     def test_single_finite_scalar(self):
-        """Single finite scalar returns (True, [value])."""
+        """Single finite scalar returns True."""
         if not HAS_TRAIN_ACCELERATE:
             pytest.skip("train_accelerate module not importable")
         accel = _make_mock_accelerator()
         # Mock dist to be not initialised (single process)
         with mock.patch.object(_train_accel.torch.distributed, "is_initialized", return_value=False):
-            all_finite, vals = _train_accel._gather_finite_consensus(
+            all_finite = _train_accel._gather_finite_consensus(
                 accel, torch.tensor(0.42)
             )
         assert all_finite is True
-        assert len(vals) == 1
-        assert abs(vals[0] - 0.42) < 1e-6
 
     def test_multiple_finite_scalars(self):
         """Multiple finite scalars all report finite."""
@@ -121,43 +119,35 @@ class TestGatherFiniteConsensus:
             pytest.skip("train_accelerate module not importable")
         accel = _make_mock_accelerator()
         with mock.patch.object(_train_accel.torch.distributed, "is_initialized", return_value=False):
-            all_finite, vals = _train_accel._gather_finite_consensus(
+            all_finite = _train_accel._gather_finite_consensus(
                 accel,
                 torch.tensor(0.1),
                 torch.tensor(0.2),
                 torch.tensor(0.3),
             )
         assert all_finite is True
-        assert len(vals) == 3
-        assert abs(vals[0] - 0.1) < 1e-6
-        assert abs(vals[1] - 0.2) < 1e-6
-        assert abs(vals[2] - 0.3) < 1e-6
 
     def test_single_infinite_scalar(self):
-        """Single infinite scalar returns (False, [inf])."""
+        """Single infinite scalar returns False."""
         if not HAS_TRAIN_ACCELERATE:
             pytest.skip("train_accelerate module not importable")
         accel = _make_mock_accelerator()
         with mock.patch.object(_train_accel.torch.distributed, "is_initialized", return_value=False):
-            all_finite, vals = _train_accel._gather_finite_consensus(
+            all_finite = _train_accel._gather_finite_consensus(
                 accel, torch.tensor(float("inf"))
             )
         assert all_finite is False
-        assert len(vals) == 1
-        assert np.isinf(vals[0])
 
     def test_single_nan_scalar(self):
-        """Single NaN scalar returns (False, [nan])."""
+        """Single NaN scalar returns False."""
         if not HAS_TRAIN_ACCELERATE:
             pytest.skip("train_accelerate module not importable")
         accel = _make_mock_accelerator()
         with mock.patch.object(_train_accel.torch.distributed, "is_initialized", return_value=False):
-            all_finite, vals = _train_accel._gather_finite_consensus(
+            all_finite = _train_accel._gather_finite_consensus(
                 accel, torch.tensor(float("nan"))
             )
         assert all_finite is False
-        assert len(vals) == 1
-        assert np.isnan(vals[0])
 
     def test_mixed_finite_infinite(self):
         """Mixed finite and infinite scalars report False."""
@@ -165,17 +155,13 @@ class TestGatherFiniteConsensus:
             pytest.skip("train_accelerate module not importable")
         accel = _make_mock_accelerator()
         with mock.patch.object(_train_accel.torch.distributed, "is_initialized", return_value=False):
-            all_finite, vals = _train_accel._gather_finite_consensus(
+            all_finite = _train_accel._gather_finite_consensus(
                 accel,
                 torch.tensor(0.1),
                 torch.tensor(float("inf")),
                 torch.tensor(0.3),
             )
         assert all_finite is False
-        assert len(vals) == 3
-        assert abs(vals[0] - 0.1) < 1e-6
-        assert np.isinf(vals[1])
-        assert abs(vals[2] - 0.3) < 1e-6
 
     def test_zero_scalars(self):
         """Zero scalars — vacuously true (edge case)."""
@@ -183,9 +169,8 @@ class TestGatherFiniteConsensus:
             pytest.skip("train_accelerate module not importable")
         accel = _make_mock_accelerator()
         with mock.patch.object(_train_accel.torch.distributed, "is_initialized", return_value=False):
-            all_finite, vals = _train_accel._gather_finite_consensus(accel)
+            all_finite = _train_accel._gather_finite_consensus(accel)
         assert all_finite is True
-        assert vals == []
 
     def test_uses_only_one_all_reduce_when_distributed(self):
         """When distributed, only one all_reduce call is made (cheap!)."""
@@ -201,18 +186,33 @@ class TestGatherFiniteConsensus:
 
         with mock.patch.object(_train_accel.torch.distributed, "is_initialized", return_value=True), \
              mock.patch.object(_train_accel.torch.distributed, "all_reduce", side_effect=_fake_all_reduce):
-            all_finite, vals = _train_accel._gather_finite_consensus(
+            all_finite = _train_accel._gather_finite_consensus(
                 accel,
                 torch.tensor(0.1),
                 torch.tensor(0.2),
             )
 
         assert all_finite is True
-        assert len(vals) == 2
         # Key assertion: exactly 1 all-reduce, not 5 like _gather_scalar_stats
         assert call_count["n"] == 1, (
             f"Expected 1 all-reduce for cheap consensus, got {call_count['n']}"
         )
+    def test_remote_nonfinite_flag_changes_local_verdict(self):
+        """A non-finite flag contributed by another rank makes every rank fail."""
+        if not HAS_TRAIN_ACCELERATE:
+            pytest.skip("train_accelerate module not importable")
+        accel = _make_mock_accelerator(num_processes=2)
+
+        def _fake_all_reduce(tensor, op):
+            # Local rank is finite, but another rank contributes one bad scalar.
+            tensor.add_(1.0)
+            return tensor
+
+        with mock.patch.object(_train_accel.torch.distributed, "is_initialized", return_value=True), \
+             mock.patch.object(_train_accel.torch.distributed, "all_reduce", side_effect=_fake_all_reduce):
+            all_finite = _train_accel._gather_finite_consensus(accel, torch.tensor(0.1))
+
+        assert all_finite is False
 
 
 # ===========================================================================
