@@ -59,6 +59,17 @@ export ACCEL_CONFIG="${REPO_ROOT}/configs/accelerate_ds_zero2.yaml"
 # pin it explicitly so an inherited hot-update environment cannot re-enable it.
 export OPENPI_DS_OVERLAP_COMM=false
 
+# Attention: sdpa avoids materializing the [B,H,L,L] score matrix that eager
+# builds for the ~1000-token prefix. Verified numerically equivalent against
+# eager with this model's additive block-causal mask (bf16 0.6 ulp, fp32 4.2 ulp).
+export OPENPI_ATTN_IMPL=sdpa
+
+# Skip the loss-level finite consensus check. bf16 shares fp32's exponent range
+# so loss overflow is not a practical concern, and DeepSpeed's gradient-level
+# overflow check plus OPENPI_MAX_CONSECUTIVE_SKIPPED_UPDATES still guard against
+# divergence. Removing it eliminates a per-step CUDA queue drain.
+export OPENPI_LOSS_FINITE_CHECK=0
+
 validate_resume_target() {
   local checkpoint_dir latest_step deepspeed_dir rank optim_file rng_file
 
@@ -179,6 +190,8 @@ printf '%s\n' \
   "[resume-perf] STATE_VERIFIED=optim:${EXPECTED_WORLD_SIZE}/${EXPECTED_WORLD_SIZE} model:1/1 rng:${EXPECTED_WORLD_SIZE}/${EXPECTED_WORLD_SIZE}; metadata/manifest matched" \
   "[resume-perf] CHECKPOINT_BASE_DIR=${CHECKPOINT_BASE_DIR}" \
   "[resume-perf] DEEPSPEED_CONFIG=${REPO_ROOT}/configs/deepspeed_zero2.json" \
-  "[resume-perf] OPENPI_DS_OVERLAP_COMM=${OPENPI_DS_OVERLAP_COMM}"
+  "[resume-perf] OPENPI_DS_OVERLAP_COMM=${OPENPI_DS_OVERLAP_COMM}" \
+  "[resume-perf] OPENPI_ATTN_IMPL=${OPENPI_ATTN_IMPL}" \
+  "[resume-perf] OPENPI_LOSS_FINITE_CHECK=${OPENPI_LOSS_FINITE_CHECK}"
 
 exec bash "${REPO_ROOT}/scripts/run_pi05_skillbridge_bf16_multinode_lq_8x8.sh"

@@ -6,6 +6,7 @@ from torch import nn
 from openpi.models_pytorch.action_experts.base import ActionExpert
 from openpi.models_pytorch.cache_utils import PreserveCacheLen
 from openpi.models_pytorch.dtype_utils import align_tensors_to_reference_dtype
+from openpi.models_pytorch.attn_impl import resolve_attn_impl
 
 
 class GemmaTokenExpert(ActionExpert):
@@ -23,7 +24,7 @@ class GemmaTokenExpert(ActionExpert):
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = model._prepare_attention_masks_4d(prefix_att_2d_masks)
 
-        model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = resolve_attn_impl()  # noqa: SLF001
         _, past_key_values = model.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -100,7 +101,7 @@ class GemmaTokenExpert(ActionExpert):
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
         full_att_2d_masks_4d = model._prepare_attention_masks_4d(full_att_2d_masks)
 
-        model.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        model.paligemma_with_expert.gemma_expert.model.config._attn_implementation = resolve_attn_impl()  # noqa: SLF001
         # Preserve prefix cache length: HF attention layers mutate past_key_values
         # in-place even with use_cache=False, which would break subsequent
         # denoising steps that expect a fixed-length prefix cache.

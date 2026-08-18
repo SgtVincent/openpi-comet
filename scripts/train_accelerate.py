@@ -1455,6 +1455,26 @@ def _metrics_buffer_close() -> None:
         _safe_log_warning("metrics.jsonl close failed: %s", exc)
 
 
+def _loss_finite_check_enabled() -> bool:
+    """Whether the per-step loss-level finite consensus check runs.
+
+    Defaults to enabled so unset environments keep their current behavior. Set
+    ``OPENPI_LOSS_FINITE_CHECK=0`` to skip it.
+
+    Skipping is safe for bf16 / fp32 because a non-finite loss still produces
+    non-finite gradients, and DeepSpeed runs its own gradient-level overflow
+    check (``check_grad_overflow`` defaults to True) which zeroes the gradients
+    and returns without stepping the optimizer. The trainer additionally aborts
+    after ``OPENPI_MAX_CONSECUTIVE_SKIPPED_UPDATES`` skipped updates, so the
+    runaway-divergence guard is preserved.
+
+    The benefit is removing a per-step host/device synchronization: the loss is
+    the terminal node of the forward graph, so reading it drains the CUDA queue
+    between forward and backward and destroys CPU run-ahead.
+    """
+    return os.environ.get("OPENPI_LOSS_FINITE_CHECK", "1").strip().lower() not in {"0", "false", "no"}
+
+
 def _gather_finite_consensus(
     accelerator: Accelerator, *scalars: torch.Tensor
 ) -> bool:
@@ -3541,7 +3561,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     # Cheap cross-rank finiteness check for backbone loss
                     # (1 all-reduce instead of 5 from _gather_scalar_stats).
-                    bb_all_finite = _gather_finite_consensus(accelerator, bb_loss)
+                    bb_all_finite = (
+                        _gather_finite_consensus(accelerator, bb_loss)
+                        if _loss_finite_check_enabled()
+                        else True
+                    )
                     bb_nonfinite = not bb_all_finite
 
                     if bb_nonfinite:
@@ -3634,7 +3658,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     # Cheap cross-rank finiteness check for expert loss
                     # (1 all-reduce instead of 5 from _gather_scalar_stats).
-                    ex_all_finite = _gather_finite_consensus(accelerator, ex_loss)
+                    ex_all_finite = (
+                        _gather_finite_consensus(accelerator, ex_loss)
+                        if _loss_finite_check_enabled()
+                        else True
+                    )
                     ex_nonfinite = not ex_all_finite
 
                     if ex_nonfinite:
@@ -3885,7 +3913,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         (accelerator.sync_gradients and global_step % int(config.log_interval) == 0)
                         or _debug_overflow_enabled(config)
                     )
-                    loss_all_finite = _gather_finite_consensus(accelerator, loss)
+                    loss_all_finite = (
+                        _gather_finite_consensus(accelerator, loss)
+                        if _loss_finite_check_enabled()
+                        else True
+                    )
                     any_rank_has_nonfinite_loss = not loss_all_finite
 
                     if any_rank_has_nonfinite_loss or _need_detailed_stats:

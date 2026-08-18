@@ -99,6 +99,7 @@ from torch import nn
 
 from openpi.models_pytorch.cache_utils import get_cache_seq_len
 from openpi.models_pytorch.pi05_subtask import PI05SubtaskPytorch
+from openpi.models_pytorch.attn_impl import resolve_attn_impl
 
 logger = logging.getLogger("openpi")
 
@@ -338,7 +339,7 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         full_prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(full_prefix_att_2d_masks)
 
         # ---- Run backbone forward (PaliGemma first stream only) ----
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = resolve_attn_impl()
         (prefix_out, _), _ = self.paligemma_with_expert.forward(
             attention_mask=full_prefix_att_2d_masks_4d,
             position_ids=full_prefix_position_ids,
@@ -494,7 +495,7 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
             prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
             prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
 
-            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = resolve_attn_impl()
 
             # Temporarily disable GC so use_cache works (GC forces use_cache=False)
             with self._no_gc_on_backbone():
@@ -739,7 +740,7 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         full_prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(full_prefix_att_2d_masks)
 
         # ---- Run backbone forward ----
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = resolve_attn_impl()
         (prefix_out, _), _ = self.paligemma_with_expert.forward(
             attention_mask=full_prefix_att_2d_masks_4d,
             position_ids=full_prefix_position_ids,
@@ -976,7 +977,7 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
             prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
             prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
 
-            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = resolve_attn_impl()
             with self._no_gc_on_backbone():
                 _, past_key_values = self.paligemma_with_expert.forward(
                     attention_mask=prefix_att_2d_masks_4d,
