@@ -1065,6 +1065,107 @@ def _validate_deepspeed_precision_config(accelerator: Accelerator, ds_config: di
         raise ValueError(f"Requested float32 training but accelerator.mixed_precision={accel_mp}.")
 
 
+def _fast_grad_norm_enabled() -> bool:
+    """Whether the batched fp32 ZeRO gradient-norm replacement is installed.
+
+    Defaults to disabled so unset environments keep DeepSpeed's stock float64
+    behavior. Set ``OPENPI_DS_FAST_GRAD_NORM=1`` to enable.
+    """
+    return os.environ.get("OPENPI_DS_FAST_GRAD_NORM", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def _patch_deepspeed_grad_norm() -> None:
+    """Compute ZeRO gradient norms in fp32 with batched multi-tensor kernels.
+
+    DeepSpeed's ``get_grad_norm_direct`` casts **every** gradient tensor to
+    float64 before taking its norm::
+
+        torch.linalg.vector_norm(g.data.double().detach(), ord=norm_type)
+
+    This model has ~812 parameter tensors, so each call issues roughly 1600
+    kernels (one cast plus one norm per tensor), and the call runs once per
+    parameter group per optimizer step. Profiling with ``py-spy --native``
+    showed the main thread busy inside ``libcuda`` rather than waiting on the
+    GPU, i.e. the cost is kernel-launch overhead rather than arithmetic.
+
+    float64 is not needed for this quantity, and it is not what the reference
+    pipelines in this repository use:
+
+    * ``scripts/train.py`` clips through ``optax.clip_by_global_norm``, and JAX
+      leaves ``jax_enable_x64`` disabled by default, so float64 is silently
+      downgraded and the norm is computed in float32 at best.
+    * ``scripts/train_pytorch.py`` calls ``torch.nn.utils.clip_grad_norm_``,
+      which preserves the gradient dtype and therefore returns bfloat16 for
+      bfloat16 gradients.
+
+    Measured against a float64 reference over 812 tensors, float32 accumulation
+    differs by about 5e-7 relative, while the sum of squared norms keeps roughly
+    1e32 headroom before float32 would overflow. Accumulating in the native
+    bfloat16 instead would give ~7e-5, so the dtype is pinned to float32.
+
+    The replacement keeps cross-rank and model-parallel reduction, the parameter
+    filtering rules, the ``inf``-norm branch and the non-finite masking
+    behavior. It falls back to the original implementation on any error.
+    """
+    try:
+        from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    except ImportError:
+        return
+
+    if getattr(DeepSpeedZeroOptimizer, "_openpi_fast_grad_norm_patched", False):
+        return
+
+    ds_module = sys.modules[DeepSpeedZeroOptimizer.__module__]
+    _orig_get_grad_norm_direct = DeepSpeedZeroOptimizer.get_grad_norm_direct
+
+    @functools.wraps(_orig_get_grad_norm_direct)
+    def _patched_get_grad_norm_direct(self, gradients, params, norm_type=2):
+        norm_type = float(norm_type)
+        # The infinity norm is cheap and rarely used; keep DeepSpeed's version.
+        if norm_type == ds_module.inf:
+            return _orig_get_grad_norm_direct(self, gradients, params, norm_type)
+
+        try:
+            selected = []
+            for grad, param in zip(gradients, params):
+                if grad is None:
+                    continue
+                # Pipeline parallelism may replicate parameters; avoid multi-counting.
+                if getattr(param, ds_module.PIPE_REPLICATED, False):
+                    continue
+                if ds_module.is_model_parallel_parameter(param) or self.model_parallel_rank == 0:
+                    selected.append(grad.detach())
+
+            total_norm = torch.zeros((), dtype=torch.float32, device=self.device)
+            if selected:
+                # _foreach_norm requires a uniform device and dtype per batch.
+                batches: dict[tuple, list] = {}
+                for tensor in selected:
+                    batches.setdefault((tensor.device, tensor.dtype), []).append(tensor)
+                for batch in batches.values():
+                    norms = torch._foreach_norm(batch, norm_type, dtype=torch.float32)
+                    total_norm = total_norm + torch.stack(norms).square().sum()
+        except Exception as exc:
+            _safe_log_warning(
+                "fast ZeRO grad-norm failed (%s); falling back to the DeepSpeed implementation", exc
+            )
+            return _orig_get_grad_norm_direct(self, gradients, params, norm_type)
+
+        # Sum of squared norms across data-parallel and model-parallel ranks.
+        ds_module.dist.all_reduce(total_norm, op=ds_module.dist.ReduceOp.SUM, group=self.dp_process_group)
+        self._model_parallel_all_reduce(tensor=total_norm, op=ds_module.dist.ReduceOp.SUM)
+
+        total_norm = total_norm.pow(1.0 / norm_type)
+        ds_module.mask_nan_or_inf_with_val_inplace(total_norm, device=self.device)
+        return total_norm
+
+    DeepSpeedZeroOptimizer.get_grad_norm_direct = _patched_get_grad_norm_direct
+    DeepSpeedZeroOptimizer._openpi_fast_grad_norm_patched = True
+    logging.info(
+        "Patched DeepSpeed get_grad_norm_direct: batched fp32 norms (was per-tensor float64)"
+    )
+
+
 def _patch_deepspeed_autocast(accelerator: Accelerator) -> None:
     """Patch DeepSpeed engine to be transparent to external torch.autocast contexts.
 
@@ -3294,6 +3395,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
         _patch_deepspeed_loss_scaler()
+        if _fast_grad_norm_enabled():
+            _patch_deepspeed_grad_norm()
 
     # Prepare with Accelerator (DDP or DeepSpeed).
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)

@@ -9,6 +9,11 @@
     "reduce_bucket_size": 500000000,
     "allgather_bucket_size": 500000000
   },
+  "timers": {
+    "throughput": {
+      "enabled": false
+    }
+  },
   "bf16": {
     "enabled": true
   },

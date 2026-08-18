@@ -70,6 +70,14 @@ export OPENPI_ATTN_IMPL=sdpa
 # divergence. Removing it eliminates a per-step CUDA queue drain.
 export OPENPI_LOSS_FINITE_CHECK=0
 
+# Replace DeepSpeed's per-tensor float64 ZeRO gradient-norm loop with batched
+# fp32 norms. Profiling attributed ~18% of samples to that loop, dominated by
+# kernel-launch overhead across ~812 parameter tensors. float64 is not used by
+# either reference pipeline: train.py goes through optax.global_norm with JAX
+# x64 disabled, and train_pytorch.py uses torch.nn.utils.clip_grad_norm_ in the
+# gradient dtype. fp32 deviates ~5e-7 relative from a float64 reference.
+export OPENPI_DS_FAST_GRAD_NORM=1
+
 validate_resume_target() {
   local checkpoint_dir latest_step deepspeed_dir rank optim_file rng_file
 
@@ -192,6 +200,8 @@ printf '%s\n' \
   "[resume-perf] DEEPSPEED_CONFIG=${REPO_ROOT}/configs/deepspeed_zero2.json" \
   "[resume-perf] OPENPI_DS_OVERLAP_COMM=${OPENPI_DS_OVERLAP_COMM}" \
   "[resume-perf] OPENPI_ATTN_IMPL=${OPENPI_ATTN_IMPL}" \
-  "[resume-perf] OPENPI_LOSS_FINITE_CHECK=${OPENPI_LOSS_FINITE_CHECK}"
+  "[resume-perf] OPENPI_LOSS_FINITE_CHECK=${OPENPI_LOSS_FINITE_CHECK}" \
+  "[resume-perf] OPENPI_DS_FAST_GRAD_NORM=${OPENPI_DS_FAST_GRAD_NORM}" \
+  "[resume-perf] deepspeed timers.throughput=disabled"
 
 exec bash "${REPO_ROOT}/scripts/run_pi05_skillbridge_bf16_multinode_lq_8x8.sh"
