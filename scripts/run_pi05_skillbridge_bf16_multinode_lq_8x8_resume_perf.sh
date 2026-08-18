@@ -9,11 +9,19 @@
 #   - Forces RESUME=1 and OVERWRITE=0.
 #   - Pins EXP_NAME to the currently running experiment so a changed Arnold
 #     run key cannot accidentally mint a fresh experiment during hot-update.
-#   - Verifies that at least one numeric checkpoint exists before launching.
+#   - Verifies checkpoint completeness before launching, with retries so that
+#     transient BN-mount staleness does not release the 64-GPU allocation.
 #   - Keeps topology, data, batch size, schedule, and output root identical to
 #     the current run; only finite-consensus diagnostics and DeepSpeed
 #     overlap-communication behavior differ.
-set -euo pipefail
+#
+# Shell-option note: validation runs WITHOUT `set -e` on purpose. On Merlin an
+# entrypoint that exits releases the whole allocation, and this repo has a
+# documented history of transient BN-mount staleness (the `_exp_name_sync`
+# freshness timeouts). Validation therefore retries, and a persistent failure is
+# reported loudly and then handed to the keepalive wrapper, which holds the GPUs
+# for inspection instead of returning them to the queue.
+set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export REPO_ROOT
@@ -24,6 +32,9 @@ readonly CURRENT_OUTPUT_ROOT="/mnt/bn/saiwenresearch/mlx/users/chenjunting/repo/
 readonly CURRENT_CHECKPOINT_DIR="${CURRENT_OUTPUT_ROOT}/checkpoints/${CURRENT_EXP_NAME}"
 readonly MIN_RESUME_STEP=80000
 readonly TRAINING_PYTHON="/mnt/bn/saiwenresearch/mlx/users/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python"
+readonly EXPECTED_WORLD_SIZE=64
+readonly VALIDATION_ATTEMPTS="${RESUME_PERF_VALIDATION_ATTEMPTS:-5}"
+readonly VALIDATION_RETRY_SLEEP_S="${RESUME_PERF_VALIDATION_RETRY_SLEEP_S:-20}"
 
 # Force the exact current run identity and training contract. Do not allow an
 # inherited hot-update environment to turn resume off or drift the schedule.
@@ -48,64 +59,66 @@ export ACCEL_CONFIG="${REPO_ROOT}/configs/accelerate_ds_zero2.yaml"
 # pin it explicitly so an inherited hot-update environment cannot re-enable it.
 export OPENPI_DS_OVERLAP_COMM=false
 
-if [[ ! -d "${CURRENT_CHECKPOINT_DIR}" ]]; then
-  echo "ERROR: current checkpoint directory does not exist: ${CURRENT_CHECKPOINT_DIR}" >&2
-  exit 2
-fi
+validate_resume_target() {
+  local checkpoint_dir latest_step deepspeed_dir rank optim_file rng_file
 
-LATEST_STEP="$(
-  {
-    find "${CURRENT_CHECKPOINT_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
-      | grep -E '^[0-9]+$' \
-      | sort -n \
-      | tail -1
-  } || true
-)"
-if [[ -z "${LATEST_STEP}" ]]; then
-  echo "ERROR: no numeric checkpoint found under ${CURRENT_CHECKPOINT_DIR}" >&2
-  exit 2
-fi
-if (( LATEST_STEP < MIN_RESUME_STEP )); then
-  echo "ERROR: refusing to resume below the verified floor: latest=${LATEST_STEP} minimum=${MIN_RESUME_STEP}" >&2
-  exit 2
-fi
-
-LATEST_CHECKPOINT_DIR="${CURRENT_CHECKPOINT_DIR}/${LATEST_STEP}"
-for required_file in manifest.json metadata.pt model.safetensors optimizer.pt; do
-  if [[ ! -s "${LATEST_CHECKPOINT_DIR}/${required_file}" ]]; then
-    echo "ERROR: latest checkpoint is incomplete; missing/non-empty file required: ${LATEST_CHECKPOINT_DIR}/${required_file}" >&2
-    exit 2
+  if [[ ! -d "${CURRENT_CHECKPOINT_DIR}" ]]; then
+    echo "validation: checkpoint directory not visible: ${CURRENT_CHECKPOINT_DIR}" >&2
+    return 1
   fi
-done
 
-ACCELERATE_STATE_DIR="${LATEST_CHECKPOINT_DIR}/accelerate_state"
-DEEPSPEED_STATE_DIR="${ACCELERATE_STATE_DIR}/pytorch_model"
-if [[ ! -d "${DEEPSPEED_STATE_DIR}" ]]; then
-  echo "ERROR: latest checkpoint is missing DeepSpeed state: ${DEEPSPEED_STATE_DIR}" >&2
-  exit 2
-fi
-if [[ "$(<"${ACCELERATE_STATE_DIR}/latest")" != "pytorch_model" ]]; then
-  echo "ERROR: invalid DeepSpeed latest tracker: ${ACCELERATE_STATE_DIR}/latest" >&2
-  exit 2
-fi
-if [[ ! -s "${DEEPSPEED_STATE_DIR}/mp_rank_00_model_states.pt" ]]; then
-  echo "ERROR: missing/non-empty DeepSpeed model state: ${DEEPSPEED_STATE_DIR}/mp_rank_00_model_states.pt" >&2
-  exit 2
-fi
-for rank in $(seq 0 63); do
-  optim_file="${DEEPSPEED_STATE_DIR}/bf16_zero_pp_rank_${rank}_mp_rank_00_optim_states.pt"
-  rng_file="${ACCELERATE_STATE_DIR}/random_states_${rank}.pkl"
-  if [[ ! -s "${optim_file}" ]]; then
-    echo "ERROR: missing/non-empty optimizer shard for rank ${rank}: ${optim_file}" >&2
-    exit 2
+  latest_step="$(
+    {
+      find "${CURRENT_CHECKPOINT_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+        | grep -E '^[0-9]+$' \
+        | sort -n \
+        | tail -1
+    } 2>/dev/null || true
+  )"
+  if [[ -z "${latest_step}" ]]; then
+    echo "validation: no numeric checkpoint found under ${CURRENT_CHECKPOINT_DIR}" >&2
+    return 1
   fi
-  if [[ ! -s "${rng_file}" ]]; then
-    echo "ERROR: missing/non-empty RNG shard for rank ${rank}: ${rng_file}" >&2
-    exit 2
+  if (( latest_step < MIN_RESUME_STEP )); then
+    echo "validation: latest checkpoint ${latest_step} is below the verified floor ${MIN_RESUME_STEP}" >&2
+    return 1
   fi
-done
 
-"${TRAINING_PYTHON}" - "${LATEST_CHECKPOINT_DIR}" "${LATEST_STEP}" <<'PY'
+  checkpoint_dir="${CURRENT_CHECKPOINT_DIR}/${latest_step}"
+  for required_file in manifest.json metadata.pt model.safetensors optimizer.pt; do
+    if [[ ! -s "${checkpoint_dir}/${required_file}" ]]; then
+      echo "validation: missing or empty ${checkpoint_dir}/${required_file}" >&2
+      return 1
+    fi
+  done
+
+  deepspeed_dir="${checkpoint_dir}/accelerate_state/pytorch_model"
+  if [[ ! -d "${deepspeed_dir}" ]]; then
+    echo "validation: missing DeepSpeed state directory ${deepspeed_dir}" >&2
+    return 1
+  fi
+  if [[ "$(cat "${checkpoint_dir}/accelerate_state/latest" 2>/dev/null)" != "pytorch_model" ]]; then
+    echo "validation: invalid DeepSpeed latest tracker in ${checkpoint_dir}/accelerate_state" >&2
+    return 1
+  fi
+  if [[ ! -s "${deepspeed_dir}/mp_rank_00_model_states.pt" ]]; then
+    echo "validation: missing or empty ${deepspeed_dir}/mp_rank_00_model_states.pt" >&2
+    return 1
+  fi
+  for rank in $(seq 0 $((EXPECTED_WORLD_SIZE - 1))); do
+    optim_file="${deepspeed_dir}/bf16_zero_pp_rank_${rank}_mp_rank_00_optim_states.pt"
+    rng_file="${checkpoint_dir}/accelerate_state/random_states_${rank}.pkl"
+    if [[ ! -s "${optim_file}" ]]; then
+      echo "validation: missing or empty optimizer shard for rank ${rank}" >&2
+      return 1
+    fi
+    if [[ ! -s "${rng_file}" ]]; then
+      echo "validation: missing or empty RNG shard for rank ${rank}" >&2
+      return 1
+    fi
+  done
+
+  if ! "${TRAINING_PYTHON}" - "${checkpoint_dir}" "${latest_step}" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -119,18 +132,51 @@ metadata_step = int(metadata.get("global_step", -1))
 manifest_step = int(manifest.get("run_metadata", {}).get("global_step", -1))
 if metadata_step != expected_step or manifest_step != expected_step:
     raise SystemExit(
-        "ERROR: checkpoint step mismatch: "
+        "validation: checkpoint step mismatch: "
         f"directory={expected_step} metadata={metadata_step} manifest={manifest_step}"
     )
 PY
+  then
+    echo "validation: checkpoint step metadata did not agree for step ${latest_step}" >&2
+    return 1
+  fi
+
+  RESUME_TARGET_STEP="${latest_step}"
+  return 0
+}
+
+RESUME_TARGET_STEP=""
+for attempt in $(seq 1 "${VALIDATION_ATTEMPTS}"); do
+  if validate_resume_target; then
+    break
+  fi
+  if (( attempt < VALIDATION_ATTEMPTS )); then
+    echo "[resume-perf] checkpoint validation attempt ${attempt}/${VALIDATION_ATTEMPTS} failed; " \
+         "retrying in ${VALIDATION_RETRY_SLEEP_S}s (BN mount staleness is transient)" >&2
+    sleep "${VALIDATION_RETRY_SLEEP_S}"
+  fi
+done
+
+if [[ -z "${RESUME_TARGET_STEP}" ]]; then
+  # Do NOT exit: exiting the Merlin entrypoint releases all 64 GPUs. Hand over to
+  # the keepalive wrapper with training disabled so the allocation is held for
+  # inspection. Set RESUME_PERF_EXIT_ON_INVALID=1 to fail fast instead.
+  echo "ERROR[resume-perf]: checkpoint validation failed after ${VALIDATION_ATTEMPTS} attempts." >&2
+  echo "ERROR[resume-perf]: refusing to start training; the allocation will be held instead." >&2
+  if [[ "${RESUME_PERF_EXIT_ON_INVALID:-0}" == "1" ]]; then
+    exit 2
+  fi
+  export TRAIN_COMMAND="bash -c 'echo \"resume-perf: checkpoint validation failed; training intentionally not started\"; exit 1'"
+  exec bash "${REPO_ROOT}/scripts/run_pi05_skillbridge_lq_keepalive_on_failure.sh"
+fi
 
 printf '%s\n' \
   "[resume-perf] REPO_ROOT=${REPO_ROOT}" \
   "[resume-perf] EXP_NAME=${EXP_NAME}" \
   "[resume-perf] RESUME=${RESUME} OVERWRITE=${OVERWRITE}" \
   "[resume-perf] CHECKPOINT_DIR=${CURRENT_CHECKPOINT_DIR}" \
-  "[resume-perf] LATEST_CHECKPOINT_STEP=${LATEST_STEP}" \
-  "[resume-perf] STATE_SHARDS=optim:64/64 model:1/1 rng:64/64; metadata/manifest matched" \
+  "[resume-perf] RESUME_TARGET_STEP=${RESUME_TARGET_STEP}" \
+  "[resume-perf] STATE_VERIFIED=optim:${EXPECTED_WORLD_SIZE}/${EXPECTED_WORLD_SIZE} model:1/1 rng:${EXPECTED_WORLD_SIZE}/${EXPECTED_WORLD_SIZE}; metadata/manifest matched" \
   "[resume-perf] CHECKPOINT_BASE_DIR=${CHECKPOINT_BASE_DIR}" \
   "[resume-perf] DEEPSPEED_CONFIG=${REPO_ROOT}/configs/deepspeed_zero2.json" \
   "[resume-perf] OPENPI_DS_OVERLAP_COMM=${OPENPI_DS_OVERLAP_COMM}"
