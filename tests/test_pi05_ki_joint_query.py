@@ -868,11 +868,281 @@ class TestKIToggle:
 class TestQueryAttentionMask:
     """Test query tokens use bidirectional self-attention within the block."""
 
-    def test_query_att_masks_all_zeros(self, model_ki):
-        """query_att_masks = all zeros → bidirectional within query block."""
+    NUM_QUERY = 6
+    HIDDEN = 32
+
+    def _real_query_masks(self):
+        """Call the REAL _embed_query_tokens with a minimal attribute shim.
+
+        The shared ``model_ki`` fixture is a hand-written stub that does not
+        implement this method, so bind the production implementation to a
+        namespace that supplies exactly the attributes it touches. This keeps
+        the assertions pinned to shipping code rather than to a test double.
+        """
+        import types
+
+        import torch
+        from torch import nn
+
         from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
-        import inspect
-        src = inspect.getsource(PI05KIJointQueryPytorch._embed_query_tokens)
-        # Check that attention mask is zeros (bidirectional block), not [1, 0, 0...]
-        # (all zeros = same block, bidirectional under make_att_2d_masks cumsum semantics)
-        assert "query_att_masks = torch.zeros" in src
+
+        shim = types.SimpleNamespace(
+            num_query_tokens=self.NUM_QUERY,
+            query_embeddings=nn.Parameter(torch.randn(self.NUM_QUERY, self.HIDDEN) * 0.02),
+            query_to_vlm_proj=nn.Identity(),
+            _vlm_hidden_dim=self.HIDDEN,
+        )
+        return PI05KIJointQueryPytorch._embed_query_tokens(
+            shim,
+            batch_size=2,
+            device=torch.device("cpu"),
+            target_dtype=torch.float32,
+        )
+
+    def test_query_att_masks_open_own_block(self):
+        """Query block is bidirectional internally but invisible to the prefix.
+
+        The first query token must set att_mask=1 so the group opens a fresh
+        attention block; the remaining tokens stay 0 so they join it
+        bidirectionally. All-zeros would merge the queries into the final
+        subtask token's block and leak them backwards.
+        """
+        import torch
+
+        _, pad_masks, att_masks = self._real_query_masks()
+        n = self.NUM_QUERY
+        assert att_masks.shape == (2, n)
+        assert att_masks.dtype == torch.bool
+        assert pad_masks.all(), "query tokens are never padding"
+        assert att_masks[:, 0].all(), "first query token must start a new attention block"
+        assert not att_masks[:, 1:].any(), "non-first query tokens must join the same block"
+
+    def test_prefix_cannot_attend_to_query_tokens(self):
+        """End-to-end mask check: no prefix row attends to any query column.
+
+        Also pins the invariant that makes the phase1 -> phase2 prefix KV
+        hand-off sound: the prefix-by-prefix submatrix is bit-identical whether
+        or not the query tokens are appended.
+        """
+        import torch
+
+        from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+
+        n = self.NUM_QUERY
+        _, _, query_att = self._real_query_masks()
+        query_att = query_att[:1]
+
+        # Realistic prefix: image block (first token opens it) then causal text.
+        prefix_att = torch.tensor([[1, 0, 0, 0, 1, 1, 1, 1, 1]], dtype=torch.bool)
+        prefix_len = prefix_att.shape[1]
+
+        att_masks = torch.cat([prefix_att, query_att], dim=1)
+        pad_masks = torch.ones(1, prefix_len + n, dtype=torch.bool)
+        att_2d = make_att_2d_masks(pad_masks, att_masks)
+
+        assert not att_2d[0, :prefix_len, prefix_len:].any(), (
+            "prefix positions must not attend to query tokens"
+        )
+        assert att_2d[0, prefix_len:, prefix_len:].all(), (
+            "query tokens must attend to each other bidirectionally"
+        )
+        assert att_2d[0, prefix_len:, :prefix_len].all(), (
+            "query tokens must attend to the full prefix"
+        )
+
+        # Prefix-only reference must match the prefix block of the joint mask.
+        prefix_only = make_att_2d_masks(
+            torch.ones(1, prefix_len, dtype=torch.bool), prefix_att
+        )
+        assert torch.equal(att_2d[0, :prefix_len, :prefix_len], prefix_only[0]), (
+            "appending query tokens must not change how prefix tokens attend "
+            "to each other - this is what makes prefix KV reuse valid"
+        )
+
+
+class TestPrefixKVReuse:
+    """Phase 1 -> phase 2 prefix KV hand-off (OPENPI_REUSE_PREFIX_KV)."""
+
+    @staticmethod
+    def _make_cache(num_layers=3, batch=2, heads=2, seq=9, head_dim=4):
+        import torch
+
+        return [
+            (torch.randn(batch, heads, seq, head_dim), torch.randn(batch, heads, seq, head_dim))
+            for _ in range(num_layers)
+        ]
+
+    @staticmethod
+    def _handoff_shim(**attrs):
+        """Shim exposing the real class methods needed by the hand-off logic."""
+        import types
+
+        from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
+
+        shim = types.SimpleNamespace(**attrs)
+        shim._should_reuse_prefix_kv = (
+            lambda: PI05KIJointQueryPytorch._should_reuse_prefix_kv(shim)
+        )
+        return shim
+
+    def test_slice_kv_cache_list_of_tuples(self):
+        import torch
+
+        from openpi.models_pytorch.pi05_ki_joint_query import _slice_kv_cache
+
+        cache = self._make_cache(seq=9)
+        keep = 5
+        sliced = _slice_kv_cache([(k.clone(), v.clone()) for k, v in cache], keep)
+        assert len(sliced) == len(cache)
+        for (k, v), (ok, ov) in zip(sliced, cache, strict=True):
+            assert k.shape[-2] == keep
+            assert v.shape[-2] == keep
+            # Kept rows must be untouched, not reordered or recomputed.
+            assert torch.equal(k, ok[..., :keep, :])
+            assert torch.equal(v, ov[..., :keep, :])
+
+    def test_slice_kv_cache_dynamic_cache_layers(self):
+        import torch
+
+        from openpi.models_pytorch.pi05_ki_joint_query import _slice_kv_cache
+
+        class _Layer:
+            def __init__(self, k, v):
+                self.keys, self.values = k, v
+
+        class _Cache:
+            def __init__(self, pairs):
+                self.layers = [_Layer(k, v) for k, v in pairs]
+
+        pairs = self._make_cache(seq=9)
+        cache = _Cache([(k.clone(), v.clone()) for k, v in pairs])
+        out = _slice_kv_cache(cache, 5)
+        for layer, (ok, ov) in zip(out.layers, pairs, strict=True):
+            assert layer.keys.shape[-2] == 5
+            assert torch.equal(layer.keys, ok[..., :5, :])
+            assert torch.equal(layer.values, ov[..., :5, :])
+
+    def test_slice_kv_cache_rejects_unknown_type(self):
+        import pytest
+
+        from openpi.models_pytorch.pi05_ki_joint_query import _slice_kv_cache
+
+        with pytest.raises(TypeError):
+            _slice_kv_cache(object(), 3)
+
+    def test_reuse_disabled_by_default(self, monkeypatch):
+        from openpi.models_pytorch.pi05_ki_joint_query import _prefix_kv_reuse_enabled
+
+        monkeypatch.delenv("OPENPI_REUSE_PREFIX_KV", raising=False)
+        assert _prefix_kv_reuse_enabled() is False, (
+            "reuse must be opt-in so existing runs keep exact behaviour"
+        )
+
+    def test_reuse_env_parsing(self, monkeypatch):
+        from openpi.models_pytorch.pi05_ki_joint_query import _prefix_kv_reuse_enabled
+
+        for val in ("1", "true", "TRUE", "yes", " 1 "):
+            monkeypatch.setenv("OPENPI_REUSE_PREFIX_KV", val)
+            assert _prefix_kv_reuse_enabled() is True, val
+        for val in ("0", "false", "no", ""):
+            monkeypatch.setenv("OPENPI_REUSE_PREFIX_KV", val)
+            assert _prefix_kv_reuse_enabled() is False, val
+
+    def _gate(self, *, enabled, ki, truncate):
+        import types
+
+        from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
+
+        shim = types.SimpleNamespace(knowledge_insulation=ki, truncate_expert_kv=truncate)
+        import openpi.models_pytorch.pi05_ki_joint_query as mod
+
+        orig = mod._prefix_kv_reuse_enabled
+        mod._prefix_kv_reuse_enabled = lambda: enabled
+        try:
+            return PI05KIJointQueryPytorch._should_reuse_prefix_kv(shim)
+        finally:
+            mod._prefix_kv_reuse_enabled = orig
+
+    def test_gate_requires_all_three_conditions(self):
+        assert self._gate(enabled=True, ki=True, truncate=True) is True
+        # Env off -> off.
+        assert self._gate(enabled=False, ki=True, truncate=True) is False
+        # KI off means phase 2 wants gradients through the backbone; a detached
+        # reused cache would silently drop them.
+        assert self._gate(enabled=True, ki=False, truncate=True) is False
+        # Without truncation phase 2 needs the query rows too, which the
+        # truncated hand-off cannot supply.
+        assert self._gate(enabled=True, ki=True, truncate=False) is False
+
+    def test_publish_then_consume_roundtrip_and_clears(self):
+        import torch
+
+        from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
+
+        cls = PI05KIJointQueryPytorch
+        shim = self._handoff_shim(
+            knowledge_insulation=True, truncate_expert_kv=True, _prefix_kv_handoff=None
+        )
+        import openpi.models_pytorch.pi05_ki_joint_query as mod
+
+        orig = mod._prefix_kv_reuse_enabled
+        mod._prefix_kv_reuse_enabled = lambda: True
+        try:
+            full = self._make_cache(seq=9)
+            full = [(k.requires_grad_(), v.requires_grad_()) for k, v in full]
+            pad = torch.ones(2, 5, dtype=torch.bool)
+
+            cls._publish_prefix_kv(shim, past_key_values=full, prefix_len=5, prefix_pad_masks=pad)
+            out = cls._consume_prefix_kv(shim)
+            assert out is not None
+            got_pad, got_kv = out
+            assert got_pad.shape == (2, 5)
+            assert not got_pad.requires_grad
+            for k, v in got_kv:
+                assert k.shape[-2] == 5, "cache must be truncated to the prefix"
+                detached = "reused cache must be detached so expert grads cannot reach the backbone"
+                assert not k.requires_grad, detached
+                assert not v.requires_grad, detached
+
+            # Second consume must return None: no cross-step reuse.
+            assert cls._consume_prefix_kv(shim) is None
+        finally:
+            mod._prefix_kv_reuse_enabled = orig
+
+    def test_consume_returns_none_when_gate_closed(self):
+        import torch
+
+        from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
+
+        shim = self._handoff_shim(
+            knowledge_insulation=True,
+            truncate_expert_kv=True,
+            _prefix_kv_handoff={
+                "past_key_values": self._make_cache(seq=5),
+                "prefix_pad_masks": torch.ones(2, 5, dtype=torch.bool),
+                "prefix_len": 5,
+            },
+        )
+        import openpi.models_pytorch.pi05_ki_joint_query as mod
+
+        orig = mod._prefix_kv_reuse_enabled
+        mod._prefix_kv_reuse_enabled = lambda: False
+        try:
+            assert PI05KIJointQueryPytorch._consume_prefix_kv(shim) is None
+            # Slot is cleared even when the gate is closed.
+            assert shim._prefix_kv_handoff is None
+        finally:
+            mod._prefix_kv_reuse_enabled = orig
+
+    def test_consume_on_fresh_instance_without_attribute(self):
+        from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
+
+        shim = self._handoff_shim(knowledge_insulation=True, truncate_expert_kv=True)
+        import openpi.models_pytorch.pi05_ki_joint_query as mod
+
+        orig = mod._prefix_kv_reuse_enabled
+        mod._prefix_kv_reuse_enabled = lambda: True
+        try:
+            assert PI05KIJointQueryPytorch._consume_prefix_kv(shim) is None
+        finally:
+            mod._prefix_kv_reuse_enabled = orig

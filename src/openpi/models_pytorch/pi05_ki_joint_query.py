@@ -90,6 +90,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import os
 from typing import Any
 
 import torch
@@ -107,6 +108,53 @@ logger = logging.getLogger("openpi")
 # ---------------------------------------------------------------------------
 #  KV cache helpers
 # ---------------------------------------------------------------------------
+
+def _slice_kv_cache(past_key_values: Any, keep_len: int) -> Any:
+    """Truncate every layer of a KV cache to the first ``keep_len`` positions.
+
+    Mirrors the container handling of :func:`_detach_kv_cache`. The sequence
+    axis is second-to-last for all supported layouts, i.e. ``[B, heads, seq,
+    head_dim]``.
+    """
+    # New-style DynamicCache: layers[i].keys / layers[i].values
+    if hasattr(past_key_values, "layers") and isinstance(past_key_values.layers, (list, tuple)):
+        for layer in past_key_values.layers:
+            if hasattr(layer, "keys") and isinstance(layer.keys, Tensor):
+                layer.keys = layer.keys[..., :keep_len, :]
+            if hasattr(layer, "values") and isinstance(layer.values, Tensor):
+                layer.values = layer.values[..., :keep_len, :]
+        return past_key_values
+
+    # Old-style DynamicCache: key_cache / value_cache lists
+    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        for i in range(len(past_key_values.key_cache)):
+            past_key_values.key_cache[i] = past_key_values.key_cache[i][..., :keep_len, :]
+            past_key_values.value_cache[i] = past_key_values.value_cache[i][..., :keep_len, :]
+        return past_key_values
+
+    if isinstance(past_key_values, list):
+        return [(k[..., :keep_len, :], v[..., :keep_len, :]) for k, v in past_key_values]
+
+    if isinstance(past_key_values, tuple):
+        return tuple((k[..., :keep_len, :], v[..., :keep_len, :]) for k, v in past_key_values)
+
+    raise TypeError(f"unsupported KV cache type for slicing: {type(past_key_values)!r}")
+
+
+def _prefix_kv_reuse_enabled() -> bool:
+    """Whether phase 2 reuses the prefix KV produced by phase 1.
+
+    Defaults to disabled so existing runs keep their exact behaviour. Set
+    ``OPENPI_REUSE_PREFIX_KV=1`` to enable.
+
+    Phase 2 otherwise re-runs the vision tower and all backbone layers under
+    ``no_grad`` purely to rebuild a KV cache that phase 1 already computed.
+    Reuse is only sound because the query tokens open their own attention
+    block, so no prefix position can attend to them and the prefix rows of the
+    two caches are identical. See ``_embed_query_tokens``.
+    """
+    return os.environ.get("OPENPI_REUSE_PREFIX_KV", "0").strip().lower() in {"1", "true", "yes"}
+
 
 def _detach_kv_cache(past_key_values: Any) -> Any:
     """Detach all tensors in a KV cache.
@@ -340,13 +388,30 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
 
         # ---- Run backbone forward (PaliGemma first stream only) ----
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = resolve_attn_impl()
-        (prefix_out, _), _ = self.paligemma_with_expert.forward(
-            attention_mask=full_prefix_att_2d_masks_4d,
-            position_ids=full_prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[full_prefix_embs, None],
-            use_cache=False,
-        )
+        capture_prefix_kv = self._should_reuse_prefix_kv()
+        full_prefix_kv = None
+        if capture_prefix_kv:
+            # Ask for a KV cache so phase 2 can skip re-encoding the prefix.
+            # HF disables ``use_cache`` whenever gradient checkpointing is on,
+            # so the cache is only obtainable inside ``_no_gc_on_backbone``.
+            # That trades extra backbone activation memory for one fewer full
+            # vision+language forward per step.
+            with self._no_gc_on_backbone():
+                (prefix_out, _), full_prefix_kv = self.paligemma_with_expert.forward(
+                    attention_mask=full_prefix_att_2d_masks_4d,
+                    position_ids=full_prefix_position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[full_prefix_embs, None],
+                    use_cache=True,
+                )
+        else:
+            (prefix_out, _), _ = self.paligemma_with_expert.forward(
+                attention_mask=full_prefix_att_2d_masks_4d,
+                position_ids=full_prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[full_prefix_embs, None],
+                use_cache=False,
+            )
 
         # ---- CE loss ----
         ce_loss = self._compute_ce_loss(
@@ -367,6 +432,23 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
 
         # Backbone total: weighted sum
         backbone_loss = self.beta_text * ce_loss + self.beta_query * query_mse_loss
+
+        if capture_prefix_kv and full_prefix_kv is not None:
+            self._publish_prefix_kv(
+                past_key_values=full_prefix_kv,
+                prefix_len=prefix_after_subtask_len,
+                prefix_pad_masks=prefix_pad_masks,
+            )
+        elif capture_prefix_kv and not self._warned_missing_prefix_kv:
+            # Something re-forced gradient checkpointing (which pins
+            # use_cache=False), so there is nothing to hand over. Phase 2 will
+            # silently fall back to re-encoding the prefix; say so once.
+            self._warned_missing_prefix_kv = True
+            logger.warning(
+                "OPENPI_REUSE_PREFIX_KV is on but the backbone returned no KV cache; "
+                "phase 2 will keep re-encoding the prefix. Check that "
+                "_no_gc_on_backbone actually disables gradient checkpointing."
+            )
 
         return {
             "backbone_loss": backbone_loss,
@@ -401,6 +483,53 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
             if old_gc:
                 lm.gradient_checkpointing = old_gc
             lm.config.use_cache = old_use_cache
+
+    # ------------------------------------------------------------------
+    #  Prefix KV hand-off between phase 1 and phase 2
+    # ------------------------------------------------------------------
+
+    #: Set once we have warned that a requested cache never materialised.
+    _warned_missing_prefix_kv: bool = False
+
+    def _should_reuse_prefix_kv(self) -> bool:
+        """Whether the phase 1 -> phase 2 prefix KV hand-off is active.
+
+        Requires all of:
+
+        * ``OPENPI_REUSE_PREFIX_KV`` enabled.
+        * ``knowledge_insulation`` — the reused cache is detached, so the flow
+          loss must not be expected to backprop into the backbone.
+        * ``truncate_expert_kv`` — phase 2 must want exactly the prefix rows
+          that phase 1's cache can supply, without the query tokens.
+        """
+        return bool(
+            _prefix_kv_reuse_enabled() and self.knowledge_insulation and self.truncate_expert_kv
+        )
+
+    def _publish_prefix_kv(self, past_key_values: Any, prefix_len: int, prefix_pad_masks: Tensor) -> None:
+        """Hand phase 1's prefix KV to the next :meth:`compute_expert_loss` call.
+
+        The cache is truncated to the pre-query positions and detached, so it
+        is exactly what phase 2 would have rebuilt on its own.
+        """
+        self._prefix_kv_handoff = {
+            "past_key_values": _detach_kv_cache(_slice_kv_cache(past_key_values, prefix_len)),
+            "prefix_pad_masks": prefix_pad_masks.detach(),
+            "prefix_len": int(prefix_len),
+        }
+
+    def _consume_prefix_kv(self) -> tuple[Tensor, Any] | None:
+        """Pop the prefix KV published by phase 1, or ``None`` if unavailable.
+
+        Always clears the slot, so a cache is never reused across steps even
+        if phase 2 is skipped. A stale entry from a step whose phase 2 never
+        ran is harmless because phase 1 overwrites the slot every step.
+        """
+        handoff = getattr(self, "_prefix_kv_handoff", None)
+        self._prefix_kv_handoff = None
+        if handoff is None or not self._should_reuse_prefix_kv():
+            return None
+        return handoff["prefix_pad_masks"], handoff["past_key_values"]
 
     def compute_expert_loss(
         self,
@@ -460,72 +589,82 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         #   for memory efficiency — no graph is kept for vision/language backbone.
         #   Valid because flow grads never reach backbone via KI anyway.
         # KI=OFF: build with grad so flow loss backprops through full backbone.
-        _grad_ctx = torch.no_grad() if self.knowledge_insulation else contextlib.nullcontext()
-        with _grad_ctx:
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                images, img_masks, lang_tokens, lang_masks
-            )
+        reused_prefix = self._consume_prefix_kv()
+        if reused_prefix is not None:
+            # Phase 1 already encoded this exact prefix. Because the query
+            # tokens open their own attention block, no prefix position can
+            # attend to them, so phase 1's prefix KV rows are mathematically
+            # identical to what the block below would recompute (up to kernel
+            # reduction order, since phase 1 attends over a longer sequence).
+            # Adopt them and skip the vision tower plus every backbone layer.
+            prefix_pad_masks, past_key_values = reused_prefix
+        else:
+            _grad_ctx = torch.no_grad() if self.knowledge_insulation else contextlib.nullcontext()
+            with _grad_ctx:
+                prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                    images, img_masks, lang_tokens, lang_masks
+                )
 
-            if has_subtask:
-                prefix_embs, prefix_pad_masks, prefix_att_masks = (
-                    self.action_expert._embed_conditioning_subtask(
-                        model=self,
-                        prefix_embs=prefix_embs,
-                        prefix_pad_masks=prefix_pad_masks,
-                        prefix_att_masks=prefix_att_masks,
-                        subtask_tokens=subtask_tokens,
-                        subtask_mask=subtask_mask,
-                        causal=True,
+                if has_subtask:
+                    prefix_embs, prefix_pad_masks, prefix_att_masks = (
+                        self.action_expert._embed_conditioning_subtask(
+                            model=self,
+                            prefix_embs=prefix_embs,
+                            prefix_pad_masks=prefix_pad_masks,
+                            prefix_att_masks=prefix_att_masks,
+                            subtask_tokens=subtask_tokens,
+                            subtask_mask=subtask_mask,
+                            causal=True,
+                        )
                     )
+
+                # If truncation is disabled (ablation), include query tokens in expert prefix
+                if not self.truncate_expert_kv:
+                    query_embs, query_pad_masks, query_att_masks = self._embed_query_tokens(
+                        batch_size=batch_size,
+                        device=device,
+                        target_dtype=prefix_embs.dtype,
+                    )
+                    prefix_embs = torch.cat([prefix_embs, query_embs], dim=1)
+                    prefix_pad_masks = torch.cat([prefix_pad_masks, query_pad_masks], dim=1)
+                    prefix_att_masks = torch.cat([prefix_att_masks, query_att_masks], dim=1)
+
+                # ---- Encode prefix through backbone to get KV cache ----
+                prefix_att_2d_masks = self.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+                prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+                prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+                self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = resolve_attn_impl()
+
+                # Temporarily disable GC so use_cache works (GC forces use_cache=False)
+                with self._no_gc_on_backbone():
+                    _, past_key_values = self.paligemma_with_expert.forward(
+                        attention_mask=prefix_att_2d_masks_4d,
+                        position_ids=prefix_position_ids,
+                        past_key_values=None,
+                        inputs_embeds=[prefix_embs, None],
+                        use_cache=True,
+                    )
+
+                if past_key_values is None:
+                    raise RuntimeError(
+                        "compute_expert_loss: past_key_values is None after prefix encoding. "
+                        "This usually means use_cache was overridden by gradient checkpointing. "
+                        "Check that _no_gc_on_backbone properly disabled GC and that "
+                        "paligemma.language_model.config.use_cache is True."
+                    )
+
+                # Verify KV length matches prefix length (sanity check)
+                kv_seq_len = get_cache_seq_len(past_key_values, layer_idx=0)
+                expected_prefix_len = int(prefix_pad_masks.shape[1])
+                assert kv_seq_len == expected_prefix_len, (
+                    f"KV cache length mismatch: {kv_seq_len} vs {expected_prefix_len}"
                 )
 
-            # If truncation is disabled (ablation), include query tokens in expert prefix
-            if not self.truncate_expert_kv:
-                query_embs, query_pad_masks, query_att_masks = self._embed_query_tokens(
-                    batch_size=batch_size,
-                    device=device,
-                    target_dtype=prefix_embs.dtype,
-                )
-                prefix_embs = torch.cat([prefix_embs, query_embs], dim=1)
-                prefix_pad_masks = torch.cat([prefix_pad_masks, query_pad_masks], dim=1)
-                prefix_att_masks = torch.cat([prefix_att_masks, query_att_masks], dim=1)
-
-            # ---- Encode prefix through backbone to get KV cache ----
-            prefix_att_2d_masks = self.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-
-            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = resolve_attn_impl()
-
-            # Temporarily disable GC so use_cache works (GC forces use_cache=False)
-            with self._no_gc_on_backbone():
-                _, past_key_values = self.paligemma_with_expert.forward(
-                    attention_mask=prefix_att_2d_masks_4d,
-                    position_ids=prefix_position_ids,
-                    past_key_values=None,
-                    inputs_embeds=[prefix_embs, None],
-                    use_cache=True,
-                )
-
-            if past_key_values is None:
-                raise RuntimeError(
-                    "compute_expert_loss: past_key_values is None after prefix encoding. "
-                    "This usually means use_cache was overridden by gradient checkpointing. "
-                    "Check that _no_gc_on_backbone properly disabled GC and that "
-                    "paligemma.language_model.config.use_cache is True."
-                )
-
-            # Verify KV length matches prefix length (sanity check)
-            kv_seq_len = get_cache_seq_len(past_key_values, layer_idx=0)
-            expected_prefix_len = int(prefix_pad_masks.shape[1])
-            assert kv_seq_len == expected_prefix_len, (
-                f"KV cache length mismatch: {kv_seq_len} vs {expected_prefix_len}"
-            )
-
-            # ---- Knowledge Insulation: detach KV if enabled ----
-            # (For KI=ON we built cache under no_grad, but double-detach is harmless.)
-            if self.knowledge_insulation:
-                past_key_values = _detach_kv_cache(past_key_values)
+                # ---- Knowledge Insulation: detach KV if enabled ----
+                # (For KI=ON we built cache under no_grad, but double-detach is harmless.)
+                if self.knowledge_insulation:
+                    past_key_values = _detach_kv_cache(past_key_values)
 
         # ---- Run action expert forward with the prefix KV ----
         # NOTE: expert suffix forward runs OUTSIDE the no_grad context so we get
@@ -1199,7 +1338,8 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         Returns (query_embs, query_pad_masks, query_att_masks):
             - query_embs: [B, num_query_tokens, vlm_hidden_dim]
             - query_pad_masks: [B, num_query_tokens], all True
-            - query_att_masks: [B, num_query_tokens], bidirectional block
+            - query_att_masks: [B, num_query_tokens], first entry starts a new
+              attention block, the rest join it bidirectionally
         """
         # Step 1: query embeddings to query_to_vlm_proj weight dtype
         if isinstance(self.query_to_vlm_proj, nn.Identity):
@@ -1224,16 +1364,27 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
             batch_size, self.num_query_tokens, dtype=torch.bool, device=device
         )
 
-        # Bidirectional attention within the query block.
-        # att_masks = all zeros means "same attention block" — bidirectional.
-        # The block-causal structure comes from the cumulative mask
-        # computation in make_att_2d_masks: all tokens with the same
-        # cumulative count attend to each other, and tokens with lower
-        # cumulative count are attended to but don't attend back.
-        # All zeros = all query tokens are in the same bidirectional block.
+        # The query tokens form a single bidirectional block that the prefix
+        # must not be able to see.
+        #
+        # ``make_att_2d_masks`` compares cumulative sums: a token whose
+        # att_mask is 1 starts a new block, so preceding blocks cannot attend
+        # to it, while a token whose att_mask is 0 joins the preceding block
+        # bidirectionally. Marking only the FIRST query token therefore keeps
+        # all queries mutually visible while making the whole group invisible
+        # to every prefix position.
+        #
+        # Leaving every entry at 0 (the earlier behaviour) placed the queries
+        # in the same cumulative block as the final subtask token, which let
+        # that one token attend forward into the queries — anti-causal leakage
+        # that also prevented reusing the prefix KV between the two phases.
+        #
+        # This matches upstream openpi, whose action tokens use the identical
+        # pattern: ``ar_mask += [True] + ([False] * (action_horizon - 1))``.
         query_att_masks = torch.zeros(
             batch_size, self.num_query_tokens, dtype=torch.bool, device=device
         )
+        query_att_masks[:, 0] = True
 
         return query_embs, query_pad_masks, query_att_masks
 
