@@ -16,6 +16,7 @@ Precision variants:
 
 from pathlib import Path
 
+import openpi.models.pi05_ki_joint_fast_config as pi05_ki_joint_fast_config
 import openpi.models.pi05_ki_joint_query_config as pi05_ki_joint_query_config
 import openpi.training.optimizer as _optimizer
 from openpi.training.data_config import AssetsConfig, DataConfig, LeRobotB1KDataConfig
@@ -531,6 +532,50 @@ def _make_pi05_ki_joint_query_single_task_overfit_config(
     )
 
 
+_ACTION_REPR_TO_MODEL_NAME = {
+    "query_mse": "pi05_ki_joint_query",   # Variant B: learned queries + MSE
+    "fast_ce": "pi05_ki_joint_fast",      # Variant A: FAST tokens + CE
+}
+
+
+def _make_ki_model_config(*, action_repr: str, action_token_max_len: int = 64):
+    """Build the model config for one Knowledge Insulation variant.
+
+    Shared hyperparameters are declared once here so the A/B comparison cannot
+    drift on anything except the backbone action objective.
+    """
+    if action_repr not in _ACTION_REPR_TO_MODEL_NAME:
+        raise ValueError(
+            f"action_repr must be one of {sorted(_ACTION_REPR_TO_MODEL_NAME)}, got {action_repr!r}"
+        )
+
+    shared = {
+        "alpha": 10.0,
+        "subtask_max_len": 128,
+        "action_horizon": 32,
+        "knowledge_insulation": True,
+        "truncate_expert_kv": True,
+        "beta_text": 1.0,
+        "flow_loss_weight": 10.0,
+    }
+
+    if action_repr == "fast_ce":
+        return pi05_ki_joint_fast_config.Pi05KIJointFastConfig(
+            **shared,
+            # Inherited but unused by Variant A; kept at the Variant B value so
+            # the two configs stay diffable.
+            num_query_tokens=32,
+            beta_query=1.0,
+            beta_action=1.0,
+            action_token_max_len=action_token_max_len,
+        )
+    return pi05_ki_joint_query_config.Pi05KIJointQueryConfig(
+        **shared,
+        num_query_tokens=32,
+        beta_query=1.0,
+    )
+
+
 def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     *,
     name: str,
@@ -555,8 +600,21 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     val_num_batches: int = 20,
     log_interval: int = 10,
     streaming_anchor_stride: int = 12,
+    action_repr: str = "query_mse",
+    action_token_max_len: int = 64,
 ) -> TrainConfig:
     """Formal lean BF16 config over the full B1K task set.
+
+    ``action_repr`` selects the backbone action objective and is the ONLY
+    intended difference between the two Knowledge Insulation variants:
+
+    * ``"query_mse"`` (default) -- Variant B: learned action queries regressed
+      by mean-squared error. This is the shipping model.
+    * ``"fast_ce"`` -- Variant A: discrete FAST frequency-space action tokens
+      supervised by next-token cross-entropy, i.e. the paper-accurate recipe.
+
+    Everything else (data, schedule, batch size, flow expert, knowledge
+    insulation) is shared, so an A/B run isolates the objective.
 
     Defaults reproduce the non-Skill-Bridge Run 2 control
     (``pi05_ki_joint_query_b1k-full_task-ki_on_bf16``): three streaming stride-12
@@ -587,17 +645,10 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
         name=name,
         exp_name=name,
         project_name="pi05_ki",
-        pytorch_model_name="pi05_ki_joint_query",
-        model=pi05_ki_joint_query_config.Pi05KIJointQueryConfig(
-            alpha=10.0,
-            subtask_max_len=128,
-            action_horizon=32,
-            num_query_tokens=32,
-            knowledge_insulation=True,
-            truncate_expert_kv=True,
-            beta_text=1.0,
-            beta_query=1.0,
-            flow_loss_weight=10.0,
+        pytorch_model_name=_ACTION_REPR_TO_MODEL_NAME[action_repr],
+        model=_make_ki_model_config(
+            action_repr=action_repr,
+            action_token_max_len=action_token_max_len,
         ),
         data=_make_b1k_full_task_set_data_config(
             train_episodes_index,
@@ -766,6 +817,16 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # This is the non-Skill-Bridge control (Tracking Run 2). Left untouched.
     _make_pi05_ki_joint_query_full_task_set_bf16_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
+    ),
+    # Variant A of the same control: identical data, schedule, batch size, flow
+    # expert and knowledge insulation, with the backbone action objective
+    # switched from learned-query MSE to FAST discrete tokens + cross-entropy.
+    # Pairs with the config above as the A/B comparison the KI paper's own
+    # ablation implies (FAST > naive tokenization > continuous actions alone),
+    # which this repository has never actually run.
+    _make_pi05_ki_joint_query_full_task_set_bf16_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_bf16",
+        action_repr="fast_ce",
     ),
     # Full-B1K Skill Bridge variant (LQ, 8x8 A100, B4, 3 epochs, stride-1).
     # NOT a strict Run 2 A/B: warmstarts from the LQ base pi05 checkpoint

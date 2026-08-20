@@ -1,0 +1,271 @@
+"""Variant A (FAST discrete action tokens + CE) contract tests.
+
+These pin the invariants that make Variant A a valid A/B counterpart to the
+shipping query-MSE variant, and that keep its ground-truth action tokens from
+leaking into the flow expert.
+
+Network note: the FAST processor itself lives on HuggingFace, which is blocked
+without the corporate proxy, so tokenizer-level tests are skipped when it
+cannot be constructed rather than failing the suite.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+
+from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+
+BASE_LEN = 4
+SUBTASK_MAX = 8
+ACTION_MAX = 10
+
+
+def _build_sequence(n_subtask: int, n_action: int):
+    """Assemble the Variant A backbone layout.
+
+    Mirrors production assembly: embed_prefix emits att=0 for images and prompt
+    (one bidirectional block), _embed_conditioning_subtask emits ones_like over
+    every physical subtask slot, and _embed_action_tokens likewise emits
+    ones_like so the action segment is causal and opens its own block.
+    """
+    base_att = [0] * BASE_LEN
+    base_pad = [1] * BASE_LEN
+    sub_att = [1] * SUBTASK_MAX
+    sub_pad = [1] * n_subtask + [0] * (SUBTASK_MAX - n_subtask)
+    act_att = [1] * ACTION_MAX
+    act_pad = [1] * n_action + [0] * (ACTION_MAX - n_action)
+
+    att = torch.tensor([base_att + sub_att + act_att], dtype=torch.bool)
+    pad = torch.tensor([base_pad + sub_pad + act_pad], dtype=torch.bool)
+    return pad, att, BASE_LEN + SUBTASK_MAX
+
+
+def _ce_rows(n_valid: int, offset: int, seg_len: int) -> set[int]:
+    """Absolute indices of logit rows that actually contribute to a CE term."""
+    loss_mask = [False] + [True] * (n_valid - 1) + [False] * (seg_len - n_valid)
+    return {offset + t for t, keep in enumerate(loss_mask[1:]) if keep}
+
+
+class TestVariantAAttentionLayout:
+    @pytest.mark.parametrize(("n_subtask", "n_action"), [(3, 6), (8, 10), (5, 1), (1, 4)])
+    def test_prefix_never_attends_action_tokens(self, n_subtask, n_action):
+        """The teacher-forced action tokens must be invisible to the prefix.
+
+        This is the correctness core of Variant A: the tokens are ground truth,
+        so any backward edge into the prefix would let a supervised position see
+        its own answer.
+        """
+        pad, att, prefix_len = _build_sequence(n_subtask, n_action)
+        att_2d = make_att_2d_masks(pad, att)[0]
+        valid = pad[0]
+
+        leak = att_2d[:prefix_len, prefix_len:] & valid[:prefix_len, None]
+        assert not leak.any(), "prefix positions must not attend the action-token segment"
+
+    @pytest.mark.parametrize(("n_subtask", "n_action"), [(3, 6), (8, 10), (1, 4)])
+    def test_action_segment_is_strictly_causal(self, n_subtask, n_action):
+        """Matches the paper: FAST tokens attend autoregressively on previous ones.
+
+        This is the deliberate difference from Variant B, whose query block is
+        bidirectional because it is parallel-decoded and has no autoregressive
+        structure to respect.
+        """
+        pad, att, prefix_len = _build_sequence(n_subtask, n_action)
+        att_2d = make_att_2d_masks(pad, att)[0]
+
+        block = att_2d[prefix_len : prefix_len + n_action, prefix_len : prefix_len + n_action]
+        assert torch.equal(block, torch.tril(torch.ones_like(block))), (
+            "action tokens must be causal within their segment"
+        )
+
+    @pytest.mark.parametrize(("n_subtask", "n_action"), [(3, 6), (8, 10)])
+    def test_action_rows_see_entire_valid_prefix(self, n_subtask, n_action):
+        pad, att, prefix_len = _build_sequence(n_subtask, n_action)
+        att_2d = make_att_2d_masks(pad, att)[0]
+        valid_prefix = pad[0][:prefix_len]
+
+        seen = att_2d[prefix_len : prefix_len + n_action, :prefix_len][:, valid_prefix]
+        assert seen.all(), "action tokens must condition on the whole valid prefix"
+
+    @pytest.mark.parametrize(("n_subtask", "n_action"), [(3, 6), (8, 10), (5, 1)])
+    def test_subtask_ce_rows_untouched_by_action_segment(self, n_subtask, n_action):
+        """Appending the action segment must not perturb the subtask CE."""
+        pad, att, prefix_len = _build_sequence(n_subtask, n_action)
+        att_2d = make_att_2d_masks(pad, att)[0]
+
+        for row in sorted(_ce_rows(n_subtask, BASE_LEN, SUBTASK_MAX)):
+            assert not att_2d[row, prefix_len:].any(), (
+                f"supervised subtask row {row} must not attend the action segment"
+            )
+
+    def test_prefix_block_identical_with_and_without_action_segment(self):
+        """The expert's truncated prefix KV is unaffected by the action segment."""
+        pad, att, prefix_len = _build_sequence(SUBTASK_MAX, ACTION_MAX)
+        joint = make_att_2d_masks(pad, att)[0]
+        prefix_only = make_att_2d_masks(pad[:, :prefix_len], att[:, :prefix_len])[0]
+        assert torch.equal(joint[:prefix_len, :prefix_len], prefix_only)
+
+
+class TestVariantAConfig:
+    def test_config_registered_and_not_silently_defaulted(self):
+        """get_config() falls back to a default instead of raising on typos."""
+        from openpi.training import config as _config
+
+        name = "pi05_ki_joint_fast_b1k-full_task-ki_on_bf16"
+        resolved = _config.get_config(name)
+        assert resolved.name == name, (
+            f"config silently fell back to {resolved.name!r}; Variant A is not registered"
+        )
+        assert resolved.pytorch_model_name == "pi05_ki_joint_fast"
+
+    def test_shared_hyperparameters_match_variant_b(self):
+        """Only the backbone action objective may differ between the arms."""
+        from openpi.training import config as _config
+
+        a = _config.get_config("pi05_ki_joint_fast_b1k-full_task-ki_on_bf16")
+        b = _config.get_config("pi05_ki_joint_query_b1k-full_task-ki_on_bf16")
+
+        for field in (
+            "action_horizon",
+            "subtask_max_len",
+            "knowledge_insulation",
+            "truncate_expert_kv",
+            "beta_text",
+            "flow_loss_weight",
+            "action_dim",
+            "max_token_len",
+        ):
+            assert getattr(a.model, field) == getattr(b.model, field), f"{field} drifted"
+
+        for field in ("num_train_steps", "batch_size", "save_interval"):
+            assert getattr(a, field) == getattr(b, field), f"{field} drifted"
+
+    def test_truncate_expert_kv_false_is_rejected(self):
+        """Variant B tolerates it as an ablation; Variant A must not.
+
+        The action tokens are teacher-forced ground truth, so exposing them to
+        the flow expert leaks the target during training while they are absent
+        at inference.
+        """
+        from openpi.models.pi05_ki_joint_fast_config import Pi05KIJointFastConfig
+
+        with pytest.raises(ValueError, match="truncate_expert_kv=True"):
+            Pi05KIJointFastConfig(action_horizon=32, truncate_expert_kv=False)
+
+    def test_action_token_max_len_lower_bound(self):
+        from openpi.models.pi05_ki_joint_fast_config import Pi05KIJointFastConfig
+
+        with pytest.raises(ValueError, match="action_token_max_len must be >= 4"):
+            Pi05KIJointFastConfig(action_horizon=32, action_token_max_len=2)
+
+
+class TestVariantAModelWiring:
+    def test_variant_a_declares_no_query_parameters(self):
+        """Variant A must not carry Variant B's query-MSE parameters."""
+        from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch
+        from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
+
+        assert PI05KIJointQueryPytorch._uses_learned_query_tokens is True
+        assert PI05KIJointFastPytorch._uses_learned_query_tokens is False
+
+    def test_variant_b_code_paths_are_blocked(self):
+        """Calling a query-MSE hook on Variant A must fail loudly."""
+        from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch
+
+        for name in ("_embed_query_tokens", "_compute_query_mse_loss"):
+            with pytest.raises(NotImplementedError, match="Variant B"):
+                getattr(PI05KIJointFastPytorch, name)(object())
+
+
+class TestFastActionTokenization:
+    """Tokenizer-level contract. Skipped when the FAST processor is unreachable."""
+
+    @staticmethod
+    def _tokenizer():
+        from openpi.models.tokenizer import FASTTokenizer
+
+        try:
+            return FASTTokenizer(max_len=512)
+        except Exception as exc:  # pragma: no cover - network dependent
+            pytest.skip(f"FAST processor unavailable (needs the corporate proxy): {exc}")
+
+    @staticmethod
+    def _smooth_chunk(horizon: int = 32, action_dim: int = 23) -> np.ndarray:
+        """A temporally smooth chunk, i.e. what real robot actions look like.
+
+        Do NOT use i.i.d. noise here: FAST compresses along time, so white noise
+        is the worst case and yields ~300-500 tokens, whereas measured real B1K
+        chunks land at p50=20 / p99=47. Testing with noise would silently
+        exercise the truncation path instead of the normal contract.
+        """
+        t = np.linspace(0.0, 1.0, horizon)[:, None]
+        phase = np.arange(action_dim)[None, :]
+        return np.clip(0.5 * np.sin(2 * np.pi * t + phase), -1, 1).astype(np.float32)
+
+    def test_contract_matches_tokenize_subtask(self):
+        tk = self._tokenizer()
+        chunk = self._smooth_chunk()
+
+        tokens, mask, ar_mask, loss_mask = tk.tokenize_action_chunk(chunk, max_len=256)
+        assert tokens.shape == mask.shape == ar_mask.shape == loss_mask.shape == (256,)
+        assert tokens.dtype == np.int32
+        assert mask.dtype == np.bool_
+
+        n = int(mask.sum())
+        assert n >= 3, "expected BOS + at least one action token + EOS"
+        assert tokens[0] == tk._paligemma_tokenizer.bos_id()
+        assert tokens[n - 1] == tk._paligemma_tokenizer.eos_id()
+
+        # Row t predicts token t+1, so BOS is unsupervised and there are n-1
+        # supervised rows -- identical to tokenize_subtask.
+        assert not loss_mask[0]
+        assert int(loss_mask.sum()) == n - 1
+
+        # Padding must be inert on every channel.
+        assert not mask[n:].any()
+        assert (tokens[n:] == 0).all()
+        assert (ar_mask[n:] == 0).all()
+        assert not loss_mask[n:].any()
+
+    def test_truncation_warns_and_stays_fixed_length(self):
+        """Overflow must warn loudly, not silently corrupt the target.
+
+        FAST is byte-pair encoded over DCT coefficients, so dropping trailing
+        tokens changes the decoded chunk rather than shortening it.
+        """
+        tk = self._tokenizer()
+        rng = np.random.default_rng(0)
+        # i.i.d. noise is the pathological case that overflows any sane cap.
+        noisy = np.clip(rng.normal(0, 0.3, (32, 23)), -1, 1).astype(np.float32)
+
+        tokens, mask, ar_mask, loss_mask = tk.tokenize_action_chunk(noisy, max_len=16)
+        assert tokens.shape == (16,)
+        assert mask.all(), "a truncated segment has no padding left"
+        assert ar_mask.shape == (16,)
+        assert loss_mask.shape == (16,)
+
+    def test_rejects_wrong_rank(self):
+        tk = self._tokenizer()
+        with pytest.raises(ValueError, match=r"\[action_horizon, action_dim\]"):
+            tk.tokenize_action_chunk(np.zeros((4, 4, 4), dtype=np.float32))
+
+    def test_action_ids_avoid_the_configured_image_token(self):
+        """The mapping reaches below the <loc> range, so pin the real constraint.
+
+        FAST's vocabulary is 2048 while PaliGemma's <loc> block is only 1024
+        slots, so ``vocab_size - 1 - skip - t`` reaches into rare text ids. That
+        is the upstream pi0-FAST convention and is harmless here, but it must
+        never collide with the id the model treats as the image token.
+        """
+        tk = self._tokenizer()
+        rng = np.random.default_rng(1)
+        image_token_index = 257152  # gemma_pytorch sets this on the HF config.
+
+        for _ in range(4):
+            chunk = np.clip(rng.normal(0, 0.3, (32, 23)), -1, 1).astype(np.float32)
+            tokens, mask, _, _ = tk.tokenize_action_chunk(chunk, max_len=128)
+            ids = tokens[mask]
+            assert (ids < image_token_index).all(), "action id collided with the image token"
+            assert (ids >= 0).all()

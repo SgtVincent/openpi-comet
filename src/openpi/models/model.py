@@ -125,6 +125,23 @@ class Observation(Generic[ArrayT]):
     # Subtask AR mask (autoregressive mask for subtask tokens).
     subtask_ar_mask: at.Int[ArrayT, "*b sl"] | None = None
 
+    # pi05-ki Variant A (FAST discrete action tokens + CE) specific fields.
+    # These are the backbone's action target and are TRAINING ONLY: the flow
+    # expert produces actions at inference time, and the expert never attends
+    # to them (see truncate_expert_kv) so no ground truth leaks across.
+
+    # FAST action tokens mapped into the PaliGemma vocabulary.
+    action_tokens: at.Int[ArrayT, "*b al"] | None = None
+
+    # Which action-token positions are real rather than right padding.
+    action_token_mask: at.Bool[ArrayT, "*b al"] | None = None
+
+    # Which action-token positions contribute to the cross-entropy loss.
+    action_token_loss_mask: at.Bool[ArrayT, "*b al"] | None = None
+
+    # Autoregressive mask for the action-token segment (causal within it).
+    action_token_ar_mask: at.Int[ArrayT, "*b al"] | None = None
+
     # Point cloud.
     pcd_xyz: at.Float[ArrayT, "*b pc_s n 3"] | None = None
 
@@ -152,6 +169,10 @@ class Observation(Generic[ArrayT]):
             subtask_mask=data.get("subtask_mask"),
             subtask_loss_mask=data.get("subtask_loss_mask"),
             subtask_ar_mask=data.get("subtask_ar_mask"),
+            action_tokens=data.get("action_tokens"),
+            action_token_mask=data.get("action_token_mask"),
+            action_token_loss_mask=data.get("action_token_loss_mask"),
+            action_token_ar_mask=data.get("action_token_ar_mask"),
             pcd_xyz=data.get("pcd_xyz"),
         )
 

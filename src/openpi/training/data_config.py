@@ -264,17 +264,36 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05_SUBTASK:
                 subtask_max_len = getattr(model_config, "subtask_max_len", 128)
+                subtask_tokenizer = _tokenizer.SubtaskTokenizer(
+                    prompt_max_len=model_config.max_token_len,
+                    subtask_max_len=subtask_max_len,
+                )
+                # pi05-KI Variant A additionally needs a discrete FAST
+                # action-token target for the backbone cross-entropy. Note this
+                # runs AFTER Normalize (see data_loader: data_transforms ->
+                # Normalize -> model_transforms), which FAST requires, and
+                # BEFORE PadStatesAndActions, so the chunk is tokenized at its
+                # true action_dim instead of with zero-padded dimensions.
+                if getattr(model_config, "pi05_ki_joint_fast", False):
+                    tokenize_transform = _transforms.TokenizeSubtaskAndActionInputs(
+                        subtask_tokenizer=subtask_tokenizer,
+                        fast_tokenizer=_tokenizer.FASTTokenizer(
+                            max_len=model_config.max_token_len
+                        ),
+                        action_token_max_len=int(
+                            getattr(model_config, "action_token_max_len", 64)
+                        ),
+                    )
+                else:
+                    tokenize_transform = _transforms.TokenizeSubtaskInputs(
+                        tokenizer=subtask_tokenizer,
+                    )
                 return _transforms.Group(
                     inputs=[
                         *meta_input_transforms,
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizeSubtaskInputs(
-                            _tokenizer.SubtaskTokenizer(
-                                prompt_max_len=model_config.max_token_len,
-                                subtask_max_len=subtask_max_len,
-                            ),
-                        ),
+                        tokenize_transform,
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                     outputs=[
