@@ -166,6 +166,12 @@ def _detach_kv_cache(past_key_values: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
+    #: Whether this class creates the learned query-token parameters. The
+    #: Variant A subclass sets this False: its backbone target is discrete FAST
+    #: action tokens embedded through the existing vocabulary, so it needs no
+    #: query embeddings and no query action head.
+    _uses_learned_query_tokens: bool = True
+
     """π0.5-KI joint query training model — query-MSE variant: action query tokens + MSE + KI.
 
     Extends :class:`PI05SubtaskPytorch` with:
@@ -237,6 +243,15 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         self._action_dim = action_dim
 
         # ---- Learned query embeddings ----
+        # Guarded so the Variant A subclass (FAST discrete action tokens + CE)
+        # can inherit every shared phase without carrying dead query-MSE
+        # parameters in its state_dict or handing ZeRO gradient-free tensors.
+        # Defaults to True, so this variant is unaffected.
+        if not self._uses_learned_query_tokens:
+            self._action_dim = action_dim
+            self._log_init_summary(action_dim)
+            return
+
         # Shape: [num_query_tokens, query_emb_dim]
         # These are learned embeddings placed after subtask tokens in the
         # backbone sequence.  They contain NO ground-truth action information
@@ -262,6 +277,9 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         nn.init.zeros_(self.query_action_head.bias)
         nn.init.xavier_uniform_(self.query_action_head.weight, gain=0.01)
 
+        self._log_init_summary(action_dim)
+
+    def _log_init_summary(self, action_dim: int) -> None:
         logger.info(
             "PI05KIJointQueryPytorch initialized: KI=%s, beta_text=%.3f, beta_query=%.3f, "
             "num_query_tokens=%d, query_emb_dim=%d, action_dim=%d, truncate_kv=%s, "

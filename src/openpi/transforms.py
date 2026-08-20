@@ -448,6 +448,57 @@ class TokenizeSubtaskInputs(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeSubtaskAndActionInputs(DataTransformFn):
+    """Variant A tokenization: subtask text CE + FAST action-token CE.
+
+    Extends :class:`TokenizeSubtaskInputs` with a discrete action-token segment
+    produced by the FAST frequency-space tokenizer. This is the paper-accurate
+    Knowledge Insulation backbone objective; ``TokenizeSubtaskInputs`` keeps
+    driving the query-MSE variant.
+
+    Produces, in addition to the subtask fields:
+    - action_tokens + action_token_mask + action_token_loss_mask + action_token_ar_mask
+
+    ``actions`` is left untouched so the flow-matching expert still trains on
+    the continuous target.
+
+    IMPORTANT: this must run AFTER normalization, because FAST assumes inputs in
+    roughly ``[-1, 1]``.
+    """
+
+    subtask_tokenizer: _tokenizer.SubtaskTokenizer
+    fast_tokenizer: _tokenizer.FASTTokenizer
+    action_token_max_len: int = 64
+
+    def __call__(self, data: DataDict) -> DataDict:
+        # Reuse the subtask path verbatim so the two variants share one
+        # prompt/state/subtask contract and differ only in the action target.
+        data = TokenizeSubtaskInputs(tokenizer=self.subtask_tokenizer)(data)
+
+        actions = data.get("actions")
+        n = self.action_token_max_len
+        if actions is None:
+            # Inference: no action target exists. Emit an all-padding segment so
+            # the sequence layout stays fixed and CE is masked out entirely.
+            data["action_tokens"] = np.zeros(n, dtype=np.int32)
+            data["action_token_mask"] = np.zeros(n, dtype=bool)
+            data["action_token_ar_mask"] = np.zeros(n, dtype=np.int32)
+            data["action_token_loss_mask"] = np.zeros(n, dtype=bool)
+            return data
+
+        tokens, mask, ar_mask, loss_mask = self.fast_tokenizer.tokenize_action_chunk(
+            np.asarray(actions), max_len=n
+        )
+        return {
+            **data,
+            "action_tokens": tokens,
+            "action_token_mask": mask,
+            "action_token_ar_mask": ar_mask,
+            "action_token_loss_mask": loss_mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 

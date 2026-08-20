@@ -2767,7 +2767,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     _validate_runtime_config(config)
 
     kwargs_handlers = []
-    if config.pytorch_model_name == "pi05_ki_joint_query":
+    if config.pytorch_model_name in ("pi05_ki_joint_query", "pi05_ki_joint_fast"):
         # Each KI optimizer step uses two distinct wrapped forwards.  DDP must
         # discover the parameters unused by each phase so both reducer passes
         # complete and synchronize the correct parameter subset.
@@ -3132,7 +3132,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     use_vlm2 = config.pytorch_model_name in ("vlm2", "vlm2_subtask")
-    is_pi05_ki_joint = config.pytorch_model_name == "pi05_ki_joint_query"
+    # Both KI variants share the two-phase (backbone then expert) training loop;
+    # they differ only in the backbone action objective.
+    is_pi05_ki_joint = config.pytorch_model_name in ("pi05_ki_joint_query", "pi05_ki_joint_fast")
     if config.pytorch_model_name in ("vlm2", "vlm2_subtask"):
         import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
 
@@ -3187,10 +3189,18 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             alpha=alpha,
             action_expert_name="subtask",
         )
-    elif config.pytorch_model_name == "pi05_ki_joint_query":
-        import openpi.models_pytorch.pi05_ki_joint_query as _pi05_ki_joint_query
+    elif config.pytorch_model_name in ("pi05_ki_joint_query", "pi05_ki_joint_fast"):
+        if config.pytorch_model_name == "pi05_ki_joint_fast":
+            # Variant A: discrete FAST action tokens + cross-entropy backbone
+            # objective (paper-accurate Knowledge Insulation).
+            import openpi.models_pytorch.pi05_ki_joint_fast as _pi05_ki_joint_fast
 
-        model = _pi05_ki_joint_query.PI05KIJointQueryPytorch(model_cfg)
+            model = _pi05_ki_joint_fast.PI05KIJointFastPytorch(model_cfg)
+        else:
+            # Variant B: learned action queries + MSE backbone objective.
+            import openpi.models_pytorch.pi05_ki_joint_query as _pi05_ki_joint_query
+
+            model = _pi05_ki_joint_query.PI05KIJointQueryPytorch(model_cfg)
         if is_main:
             ki = bool(getattr(model, "knowledge_insulation", False))
             logging.info(
@@ -3231,6 +3241,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 logging.warning("Model checkpoint not found at %s. Skipping weight loading.", model_path)
         else:
             load_strict = config.pytorch_model_name not in (
+                "pi05_ki_joint_fast",
                 "vlm2",
                 "vlm2_subtask",
                 "subtask",

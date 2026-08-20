@@ -140,6 +140,83 @@ class FASTTokenizer:
             tokens = np.array(tokens)
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
 
+    def tokenize_action_chunk(
+        self, actions: np.ndarray, max_len: int = 64
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Tokenize one action chunk into a fixed-length discrete token segment.
+
+        This is the Variant A (paper-accurate Knowledge Insulation) backbone
+        target: the action chunk is compressed by the FAST frequency-space
+        tokenizer and supervised with next-token cross-entropy, instead of being
+        regressed by a continuous query head.
+
+        The returned 4-tuple deliberately matches
+        ``SubtaskTokenizer.tokenize_subtask`` exactly -- BOS-prefixed, causal
+        ar_mask, ``loss_mask = [False] + [True] * (n - 1)`` -- so the model can
+        reuse a single cross-entropy implementation for both the subtask segment
+        and the action segment.
+
+        Note the tokens land in the PaliGemma ``<loc0000..1023>`` id range
+        (``vocab_size - 1 - fast_skip_tokens - t``), which is disjoint from the
+        text vocabulary, so this objective needs NO new parameters: it reuses
+        the existing embedding table and its tied output projection.
+
+        Args:
+            actions: ``[action_horizon, action_dim]``, already normalized to
+                roughly ``[-1, 1]`` by the upstream normalization transform.
+            max_len: fixed segment length. Measured FAST lengths on real B1K
+                chunks (H=32) are p50=20 / p99=47 / max=51, so the default 64
+                leaves headroom. Do not size this from synthetic noise, which
+                produces ~500 tokens and wildly overestimates the budget.
+
+        Returns:
+            ``(tokens, mask, ar_mask, loss_mask)``, each of shape ``[max_len]``.
+        """
+        if actions.ndim != 2:
+            raise ValueError(f"actions must be [action_horizon, action_dim], got shape {actions.shape}")
+
+        fast_tokens = self._fast_tokenizer(np.asarray(actions, dtype=np.float32)[None])[0]
+        action_tokens = self._act_tokens_to_paligemma_tokens(fast_tokens).tolist()
+
+        # BOS so the FIRST real action token is supervised by next-token CE;
+        # EOS so the model learns where the chunk ends.
+        tokens = [self._paligemma_tokenizer.bos_id(), *action_tokens, self._paligemma_tokenizer.eos_id()]
+        n = len(tokens)
+        mask = [True] * n
+        ar_mask = [1] * n
+        # Row t predicts token t+1, so BOS is the first supervised row and the
+        # final row has no target.
+        loss_mask = [False] + [True] * (n - 1)
+
+        if n < max_len:
+            pad = max_len - n
+            tokens = tokens + [0] * pad
+            mask = mask + [False] * pad
+            ar_mask = ar_mask + [0] * pad
+            loss_mask = loss_mask + [False] * pad
+        else:
+            if n > max_len:
+                # Truncation is NOT benign: FAST is byte-pair encoded over DCT
+                # coefficients, so dropping trailing tokens corrupts the
+                # reconstructed chunk rather than merely shortening it.
+                logging.warning(
+                    "FAST action chunk produced %d tokens, exceeding action_token_max_len=%d; "
+                    "truncating, which corrupts the action target. Raise action_token_max_len.",
+                    n,
+                    max_len,
+                )
+            tokens = tokens[:max_len]
+            mask = mask[:max_len]
+            ar_mask = ar_mask[:max_len]
+            loss_mask = loss_mask[:max_len]
+
+        return (
+            np.asarray(tokens, dtype=np.int32),
+            np.asarray(mask, dtype=np.bool_),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask, dtype=np.bool_),
+        )
+
 
 ###########################################################################
 ## The tokenizers below are used for RoboArena baseline implementations. ##
