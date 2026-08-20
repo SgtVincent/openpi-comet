@@ -108,6 +108,21 @@ logger = logging.getLogger("openpi")
 #  KV cache helpers
 # ---------------------------------------------------------------------------
 
+def _validate_num_query_tokens(num_query_tokens: int) -> int:
+    """Validate the learned-query block size.
+
+    The query block must hold at least one token: ``_embed_query_tokens`` marks
+    its first entry to open a dedicated attention block, and ``L_query`` has no
+    meaning without a query position to supervise.
+    """
+    if num_query_tokens < 1:
+        raise ValueError(
+            f"num_query_tokens must be >= 1, got {num_query_tokens}. "
+            "Set beta_query=0.0 to disable the query objective instead."
+        )
+    return num_query_tokens
+
+
 def _detach_kv_cache(past_key_values: Any) -> Any:
     """Detach all tensors in a KV cache.
 
@@ -194,7 +209,9 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         self.truncate_expert_kv: bool = bool(getattr(config, "truncate_expert_kv", True))
         self.flow_loss_weight: float = float(getattr(config, "flow_loss_weight", alpha))
 
-        num_query_tokens = int(getattr(config, "num_query_tokens", config.action_horizon))
+        num_query_tokens = _validate_num_query_tokens(
+            int(getattr(config, "num_query_tokens", config.action_horizon))
+        )
         self.num_query_tokens: int = num_query_tokens
 
         # For first implementation, require num_query_tokens == action_horizon.
@@ -1199,7 +1216,8 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         Returns (query_embs, query_pad_masks, query_att_masks):
             - query_embs: [B, num_query_tokens, vlm_hidden_dim]
             - query_pad_masks: [B, num_query_tokens], all True
-            - query_att_masks: [B, num_query_tokens], bidirectional block
+            - query_att_masks: [B, num_query_tokens], first entry opens a new
+              attention block, the rest join it bidirectionally
         """
         # Step 1: query embeddings to query_to_vlm_proj weight dtype
         if isinstance(self.query_to_vlm_proj, nn.Identity):
@@ -1224,16 +1242,34 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
             batch_size, self.num_query_tokens, dtype=torch.bool, device=device
         )
 
-        # Bidirectional attention within the query block.
-        # att_masks = all zeros means "same attention block" — bidirectional.
-        # The block-causal structure comes from the cumulative mask
-        # computation in make_att_2d_masks: all tokens with the same
-        # cumulative count attend to each other, and tokens with lower
-        # cumulative count are attended to but don't attend back.
-        # All zeros = all query tokens are in the same bidirectional block.
+        # The query tokens form a single bidirectional block that the prefix
+        # must not be able to see.
+        #
+        # make_att_2d_masks compares cumulative sums: writing b(t) =
+        # cumsum(att_masks)[t], row i attends column j iff b(j) <= b(i) and
+        # both are valid. A token whose att_mask is 1 therefore opens a new
+        # block that preceding blocks cannot see, while a token whose att_mask
+        # is 0 joins the preceding block bidirectionally. Marking only the
+        # FIRST query token keeps every query mutually visible while making
+        # the whole group invisible to every prefix position.
+        #
+        # Leaving all entries at 0 (the earlier behaviour) gave the query block
+        # the same b(t) as the LAST PHYSICAL subtask slot, letting that row
+        # attend forward into the queries. That row is normally padding (real
+        # subtasks are far shorter than subtask_max_len) and is masked out by
+        # pad_2d_masks, and even when the segment is exactly full the row is
+        # dropped by the next-token shift in _compute_ce_loss, so the observed
+        # numerical impact was ~0. It was still a block-causal violation, and
+        # it becomes a real one that silently contaminates every supervised CE
+        # row if the subtask segment is ever conditioned bidirectionally --
+        # see the guard in SubtaskActionExpert._embed_conditioning_subtask.
+        #
+        # This matches upstream openpi, whose action tokens use the identical
+        # pattern: ar_mask += [True] + ([False] * (action_horizon - 1)).
         query_att_masks = torch.zeros(
             batch_size, self.num_query_tokens, dtype=torch.bool, device=device
         )
+        query_att_masks[:, 0] = True
 
         return query_embs, query_pad_masks, query_att_masks
 

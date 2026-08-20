@@ -48,6 +48,18 @@ class SubtaskActionExpert(ActionExpert):
         if causal:
             subtask_att = torch.ones_like(subtask_mask, dtype=prefix_att_masks.dtype)
         else:
+            # WARNING: bidirectional subtask conditioning collapses the whole
+            # subtask segment into the PRECEDING attention block. Any token
+            # group appended afterwards that does not open its own block (i.e.
+            # whose first att_mask entry is 0) then becomes visible to every
+            # supervised subtask row, silently contaminating the CE targets
+            # with information that is absent at inference time.
+            #
+            # PI05KIJointQueryPytorch._embed_query_tokens appends the learned
+            # action queries right after this segment and marks its first entry,
+            # so it is safe. Verify that invariant before appending any new
+            # segment here, and keep the corresponding regression test
+            # (tests/test_pi05_ki_joint_query.py::TestQueryAttentionMask) green.
             subtask_att = torch.zeros_like(subtask_mask, dtype=prefix_att_masks.dtype)
         prefix_att_masks = torch.cat([prefix_att_masks, subtask_att], dim=1)
         return prefix_embs, prefix_pad_masks, prefix_att_masks
