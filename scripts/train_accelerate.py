@@ -32,6 +32,7 @@ import json
 import importlib.metadata as importlib_metadata
 import logging
 import os
+import random
 import platform
 import signal
 import shutil
@@ -721,6 +722,155 @@ def build_datasets(config: _config.TrainConfig):
             time.sleep(delay_s)
 
 
+class _FixedIndexSubset(torch.utils.data.Dataset):
+    """Map-style view over an explicit index list, carrying task ids alongside.
+
+    Requires the underlying dataset to honor ``__getitem__(idx)``, i.e. it must
+    be built with ``chunk_streaming_using_keyframe=False``.
+    """
+
+    def __init__(self, base, indices, task_ids):
+        self._base = base
+        self._indices = list(indices)
+        self.task_ids = list(task_ids)
+
+    def __len__(self):
+        return len(self._indices)
+
+    def __getitem__(self, i):
+        return self._base[self._indices[i]]
+
+
+def _build_stratified_val_indices(raw_dataset, config, *, logger_=None):
+    """Build a FIXED, task-stratified index list over the validation pool.
+
+    Picks ``config.val_episodes_per_task`` episodes from EVERY task and
+    ``config.val_anchors_per_episode`` anchors inside each chosen episode,
+    with the anchors spread across the episode's PHASES (not clustered at the
+    start, which is what the streaming cursor effectively did).
+
+    Returns (indices, task_ids, coverage_dict). Deterministic given
+    ``config.val_subset_seed``.
+    """
+    inner = getattr(raw_dataset, "_dataset", raw_dataset)
+    episodes = list(getattr(inner, "episodes", []) or [])
+    edi = getattr(inner, "episode_data_index", None)
+
+    bounds: dict[int, tuple[int, int]] = {}
+    if edi is not None:
+        try:
+            frm, to = edi["from"], edi["to"]
+            for pos, ep in enumerate(episodes):
+                bounds[int(ep)] = (int(frm[pos]), int(to[pos]))
+        except Exception:  # noqa: BLE001
+            bounds = {}
+    if not bounds:
+        # Fallback: uniform partition of the flat index space.
+        per = max(1, len(raw_dataset) // max(1, len(episodes)))
+        for i, ep in enumerate(episodes):
+            bounds[int(ep)] = (i * per, min(len(raw_dataset), (i + 1) * per))
+
+    # B1K encodes task id in the episode index: episode_index // 10000
+    by_task: dict[int, list[tuple[int, int, int]]] = {}
+    for ep, (a, b) in bounds.items():
+        by_task.setdefault(ep // 10000, []).append((ep, a, b))
+
+    rng = random.Random(int(getattr(config, "val_subset_seed", 12345)))
+    n_eps = int(getattr(config, "val_episodes_per_task", 10))
+    n_anch = max(1, int(getattr(config, "val_anchors_per_episode", 1)))
+
+    indices: list[int] = []
+    task_ids: list[int] = []
+    used_eps = 0
+    for task in sorted(by_task):
+        cand = sorted(by_task[task], key=lambda x: x[0])
+        if len(cand) > n_eps:
+            cand = sorted(rng.sample(cand, n_eps), key=lambda x: x[0])
+        for ep, a, b in cand:
+            if b <= a:
+                continue
+            used_eps += 1
+            for j in range(n_anch):
+                frac = (j + 0.5) / n_anch
+                indices.append(min(b - 1, a + int((b - a) * frac)))
+                task_ids.append(int(task))
+
+    # Deterministic interleave so every batch mixes tasks (stratified batches
+    # are much lower-variance than task-homogeneous ones).
+    order = list(range(len(indices)))
+    random.Random(int(getattr(config, "val_subset_seed", 12345)) + 1).shuffle(order)
+    indices = [indices[i] for i in order]
+    task_ids = [task_ids[i] for i in order]
+
+    coverage = {
+        "n_samples": len(indices),
+        "n_tasks": len(set(task_ids)),
+        "n_episodes": used_eps,
+        "episodes_per_task": n_eps,
+        "anchors_per_episode": n_anch,
+        "seed": int(getattr(config, "val_subset_seed", 12345)),
+    }
+    if logger_ is not None:
+        logger_.info(
+            "Deterministic val subset: %d samples | %d tasks | %d episodes "
+            "(episodes_per_task=%d anchors_per_episode=%d seed=%d)",
+            coverage["n_samples"], coverage["n_tasks"], coverage["n_episodes"],
+            n_eps, n_anch, coverage["seed"],
+        )
+    return indices, task_ids, coverage
+
+
+class _DeterministicValLoader:
+    """Yields ``(Observation, actions)`` from a fixed-index val subset.
+
+    Mirrors ``data_loader.DataLoaderImpl`` (which converts the numpy output of
+    ``_collate_fn`` into tensors) but iterates a plain finite DataLoader exactly
+    ONCE per ``__iter__``, so every validation scores the same fixed sample set.
+    Also exposes ``batch_task_ids`` so validation can report per-task means.
+    """
+
+    def __init__(self, torch_loader, data_config, subset, coverage):
+        self._loader = torch_loader
+        self._data_config = data_config
+        self._subset = subset
+        self.coverage = coverage
+        self.batch_task_ids: list[list[int]] = []
+
+    def data_config(self):
+        return self._data_config
+
+    def __len__(self):
+        return len(self._loader)
+
+    @staticmethod
+    def _to_tensors(obj):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return {k: _DeterministicValLoader._to_tensors(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(_DeterministicValLoader._to_tensors(v) for v in obj)
+        if isinstance(obj, np.ndarray):
+            return torch.as_tensor(obj)
+        return obj
+
+    def __iter__(self):
+        import openpi.models.model as _model_mod
+
+        # Rank-local slice of the fixed index list, in loader order, so batch i
+        # can be mapped back to the tasks it contains.
+        sampler = getattr(self._loader, "sampler", None)
+        local = list(sampler) if sampler is not None else list(range(len(self._subset)))
+        bs = self._loader.batch_size
+        self.batch_task_ids = [
+            [self._subset.task_ids[j] for j in local[b * bs : (b + 1) * bs]]
+            for b in range(len(local) // bs)
+        ]
+        for batch in self._loader:
+            batch = self._to_tensors(batch)
+            yield _model_mod.Observation.from_dict(batch), batch["actions"]
+
+
 def build_val_datasets(config: _config.TrainConfig):
     """Build validation data loader(s) from config.val_data.
 
@@ -731,6 +881,58 @@ def build_val_datasets(config: _config.TrainConfig):
 
     if not config.val_data:
         return None, None
+
+    # ---- Opt-in: FIXED, task-stratified, reproducible validation subset ----
+    if getattr(config, "val_deterministic_subset", False):
+        original_data = config.data
+        try:
+            object.__setattr__(config, "data", config.val_data)
+            val_factory = config.val_data[0]
+            val_dc = val_factory.create(config.assets_dirs, config.model)
+            # Map-style access is REQUIRED for an explicit index list to mean
+            # anything: in streaming mode __getitem__ ignores idx.
+            val_dc = dataclasses.replace(
+                val_dc, chunk_streaming_using_keyframe=False, dataset_shuffle=False
+            )
+            raw = _data_loader.create_torch_dataset(
+                val_dc, config.model.action_horizon, config.model
+            )
+            indices, task_ids, coverage = _build_stratified_val_indices(
+                raw, config, logger_=logging.getLogger()
+            )
+            ds = _data_loader.transform_dataset(raw, val_dc, skip_norm_stats=False)
+            subset = _FixedIndexSubset(ds, indices, task_ids)
+
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            per_gpu = (
+                int(config.val_batch_size)
+                if getattr(config, "val_batch_size", None) is not None
+                else max(1, int(config.batch_size) // max(1, world_size))
+            )
+            sampler = None
+            if torch.distributed.is_initialized() and world_size > 1:
+                sampler = torch.utils.data.distributed.DistributedSampler(
+                    subset,
+                    num_replicas=world_size,
+                    rank=int(os.environ.get("RANK", "0")),
+                    shuffle=False,   # the list is already fixed + pre-interleaved
+                    drop_last=True,
+                )
+            loader = torch.utils.data.DataLoader(
+                subset,
+                batch_size=per_gpu,
+                shuffle=False,
+                sampler=sampler,
+                num_workers=int(config.num_workers),
+                collate_fn=_data_loader._collate_fn,
+                drop_last=True,
+                pin_memory=torch.cuda.is_available(),
+                **({"prefetch_factor": 2} if int(config.num_workers) > 0 else {}),
+            )
+            loader = _DeterministicValLoader(loader, val_dc, subset, coverage)
+            return loader, val_dc
+        finally:
+            object.__setattr__(config, "data", original_data)
 
     # Temporarily swap config.data → config.val_data to reuse create_data_loader.
     # We use a mutable copy approach: swap, build, swap back.
@@ -2426,6 +2628,11 @@ def run_validation(
     unwrapped.eval()
 
     batch_metrics_list: list[dict[str, float]] = []
+    per_task_metric = "flow_l1" if slow_metrics else "flow_mse"
+    per_task_enabled = bool(getattr(config, "val_log_per_task", False)) and hasattr(
+        val_loader, "batch_task_ids"
+    )
+    per_task_sums: dict[int, list] = {}
 
     try:
         with torch.no_grad():
@@ -2474,6 +2681,9 @@ def run_validation(
                             compute_flow_l1=slow_metrics,
                             num_denoise_steps=10,
                             flow_l1_seed=int(config.seed) + 9999,
+                            deterministic_flow=bool(
+                                getattr(config, "val_deterministic_flow", False)
+                            ),
                         )
                 elif use_vlm2:
                     # TODO: VLM2 validation path
@@ -2501,6 +2711,18 @@ def run_validation(
                     if isinstance(v, torch.Tensor) and v.numel() == 1
                 }
                 batch_metrics_list.append(batch_metrics)
+                # Per-task accumulation (only when the fixed stratified subset is
+                # in use, since only then do we know each batch's task ids).
+                if per_task_enabled:
+                    try:
+                        for tk in set(val_loader.batch_task_ids[batch_idx]):
+                            per_task_sums.setdefault(int(tk), [0.0, 0])
+                            per_task_sums[int(tk)][0] += batch_metrics.get(
+                                per_task_metric, float("nan")
+                            )
+                            per_task_sums[int(tk)][1] += 1
+                    except Exception:  # noqa: BLE001
+                        pass
 
     finally:
         # Restore training mode
@@ -2537,6 +2759,37 @@ def run_validation(
         stats = _gather_scalar_stats(accelerator, val_tensor)
         global_means[key] = float(stats["mean"])
 
+    # ---- Per-task reduction (fixed stratified subset only) ----
+    per_task_global: dict[int, float] = {}
+    if per_task_enabled:
+        try:
+            import torch.distributed as _dist
+
+            task_keys = sorted(per_task_sums.keys())
+            if _dist.is_available() and _dist.is_initialized():
+                # Union the task id space across ranks so every rank reduces the
+                # same fixed-size tensors in the same order.
+                n_tasks_max = 1024
+                sums = torch.zeros(n_tasks_max, device=accelerator.device)
+                cnts = torch.zeros(n_tasks_max, device=accelerator.device)
+                for tk in task_keys:
+                    if 0 <= tk < n_tasks_max:
+                        sums[tk] = per_task_sums[tk][0]
+                        cnts[tk] = per_task_sums[tk][1]
+                _dist.all_reduce(sums, op=_dist.ReduceOp.SUM)
+                _dist.all_reduce(cnts, op=_dist.ReduceOp.SUM)
+                for tk in range(n_tasks_max):
+                    c = float(cnts[tk].item())
+                    if c > 0:
+                        per_task_global[tk] = float(sums[tk].item()) / c
+            else:
+                for tk in task_keys:
+                    s, c = per_task_sums[tk]
+                    if c > 0:
+                        per_task_global[tk] = s / c
+        except Exception:  # noqa: BLE001
+            logging.warning("per-task val reduction failed; skipping", exc_info=True)
+
     if is_main:
         epoch = (global_step // steps_per_epoch) + 1 if steps_per_epoch > 0 else 1
         epoch_step = (global_step % steps_per_epoch) + 1 if steps_per_epoch > 0 else global_step
@@ -2550,6 +2803,17 @@ def run_validation(
             }
             for key in sorted(global_means.keys()):
                 val_record[f"val_{key}"] = global_means[key]
+            if per_task_global:
+                val_record["val_per_task_metric"] = per_task_metric
+                val_record["val_per_task"] = {
+                    f"task-{tk:04d}": v for tk, v in sorted(per_task_global.items())
+                }
+                vals = list(per_task_global.values())
+                val_record["val_per_task_min"] = min(vals)
+                val_record["val_per_task_max"] = max(vals)
+                val_record["val_per_task_n"] = len(vals)
+            if getattr(val_loader, "coverage", None):
+                val_record["val_subset"] = val_loader.coverage
             _metrics_buffer_write_boundary(val_record)
 
         # Log to W&B
@@ -4478,6 +4742,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     if val_loader is not None and global_step % int(config.val_log_interval) == 0 and global_step > 0:
                         # Flush training metrics so file is consistent before validation writes.
                         _metrics_buffer_flush()
+                        # `flow_l1` (Euler-integrated ACTION error) is the offline
+                        # metric that tracks real policy performance, so allow it
+                        # on a cadence instead of only at epoch end / final.
+                        _slow_every = int(getattr(config, "val_slow_metrics_every", 0) or 0)
+                        _val_idx = global_step // int(config.val_log_interval)
+                        _slow_now = _slow_every > 0 and (_val_idx % _slow_every == 0)
                         run_validation(
                             accelerator=accelerator,
                             model=model,
@@ -4490,6 +4760,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             use_autocast=use_autocast,
                             autocast_dtype=autocast_dtype,
                             metrics_file=_metrics_file,
+                            slow_metrics=_slow_now,
                         )
 
                     # ---- Epoch-end validation with slow metrics (flow_l1) ----

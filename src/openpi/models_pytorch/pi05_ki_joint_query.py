@@ -425,6 +425,8 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         actions,
         noise: Tensor | None = None,
         time: Tensor | None = None,
+        *,
+        train_preprocess: bool = True,
     ) -> dict[str, Tensor]:
         """Compute expert-side flow matching loss.
 
@@ -446,10 +448,17 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         Returns dict with:
             - ``flow_loss``: scalar, raw flow matching MSE
             - ``expert_loss``: scalar, ``flow_loss_weight * flow_loss`` (for backward)
+
+        Args:
+            train_preprocess: if True (default, training) images go through the
+                TRAIN preprocessing path, which applies random crop/photometric
+                augmentation. Validation should pass False so that the flow
+                metrics are measured on clean images and are comparable with the
+                backbone-side metrics (which always use train=False).
         """
         # ---- Preprocess observation ----
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
-            observation, train=True
+            observation, train=train_preprocess
         )
 
         subtask_tokens = getattr(observation, "subtask_tokens", None)
@@ -622,6 +631,7 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         compute_flow_l1: bool = False,
         num_denoise_steps: int = 10,
         flow_l1_seed: int = 42,
+        deterministic_flow: bool = False,
     ) -> dict[str, Tensor]:
         """Compute evaluation/validation metrics (no backward pass).
 
@@ -641,6 +651,12 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
                 noise for determinism.
             num_denoise_steps: number of Euler steps for flow_l1 (default 10)
             flow_l1_seed: seed for fixed noise in flow_l1 computation
+            deterministic_flow: if True, the flow-matching metrics are made
+                reproducible: images are preprocessed with train=False (no random
+                augmentation) and the (noise, time) pair is drawn from a fixed
+                seed instead of the global RNG. Without this, ``flow_loss`` /
+                ``expert_loss`` / ``total_loss`` carry a random component that
+                does NOT shrink as the validation subset grows.
 
         Returns dict with:
             - ``total_loss``: scalar, backbone_loss + expert_loss
@@ -669,7 +685,31 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         ) = self._compute_backbone_eval_metrics(observation, actions)
 
         # ---- Expert forward ----
-        ex_losses = self.compute_expert_loss(observation, actions)
+        if deterministic_flow:
+            # Fixed (noise, time) so repeated validations of the same weights on
+            # the same samples return identical flow metrics. RNG state is saved
+            # and restored so we do not perturb the training stream.
+            # NOTE: torch.manual_seed() reseeds BOTH the CPU and all CUDA
+            # generators, and torch.get/set_rng_state() only covers the CPU one,
+            # so the CUDA state must be saved/restored explicitly — otherwise
+            # this leaks a CUDA reseed into the training RNG stream.
+            cpu_state = torch.get_rng_state()
+            cuda_states = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            )
+            try:
+                torch.manual_seed(flow_l1_seed)
+                noise = self.sample_noise(actions.shape, actions.device)
+                time = self.sample_time(actions.shape[0], actions.device)
+            finally:
+                torch.set_rng_state(cpu_state)
+                if cuda_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_states)
+            ex_losses = self.compute_expert_loss(
+                observation, actions, noise=noise, time=time, train_preprocess=False
+            )
+        else:
+            ex_losses = self.compute_expert_loss(observation, actions)
         ex_loss = ex_losses["expert_loss"]
         flow_loss = ex_losses["flow_loss"]
 
@@ -942,12 +982,20 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         device = actions.device
 
         # Fixed-seed noise for deterministic validation
+        # NOTE: torch.manual_seed() also reseeds the CUDA generators while
+        # torch.get/set_rng_state() only restores the CPU one, so the CUDA state
+        # is saved/restored explicitly to avoid leaking a reseed into training.
         rng_state = torch.get_rng_state()
+        cuda_states = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
         try:
             torch.manual_seed(seed)
             noise = torch.randn_like(actions)
         finally:
             torch.set_rng_state(rng_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
 
         # Build prefix KV cache for expert (same as compute_expert_loss)
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(

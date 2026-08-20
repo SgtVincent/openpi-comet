@@ -129,6 +129,43 @@ class TrainConfig:
     # construction. Default 1 preserves pre-existing behavior.
     streaming_anchor_stride: int = 1
 
+    # ---- Deterministic / representative validation (opt-in) ----
+    # Default False everywhere => legacy behaviour is bit-for-bit unchanged.
+    #
+    # Why: with the streaming dataset the val loader draws `val_num_batches`
+    # batches of CONSECUTIVE frames from a persistent cursor. Consequences:
+    #   * only ~1 task / ~2 episodes are ever scored (out of 50 tasks),
+    #   * the cursor drifts between validations, so the val curve mixes
+    #     "model improved" with "different data",
+    #   * a batch of 8 consecutive frames is effectively ONE sample, so the
+    #     effective sample size is ~1/40 of the nominal one.
+    # Enabling val_deterministic_subset builds ONE fixed, stratified index list
+    # (val_episodes_per_task episodes from EVERY task, val_anchors_per_episode
+    # anchors spread across each episode's phases) and scores exactly that list
+    # every time. Measured on B1K: same cost, ~5-7x better precision, 50/50
+    # task coverage, and fully reproducible across rounds and checkpoints.
+    val_deterministic_subset: bool = False
+    val_episodes_per_task: int = 10
+    val_anchors_per_episode: int = 1
+    val_subset_seed: int = 12345
+
+    # Compute the slow, Euler-integrated action metric (`flow_l1`) every N
+    # validations (1 = every validation, 0 = never except epoch-end/final).
+    # `flow_l1` integrates the predicted velocity field into ACTUAL actions, so
+    # it is the offline metric that tracks real policy performance; the cheap
+    # `flow_mse` only probes the velocity field at one random tau.
+    val_slow_metrics_every: int = 0
+
+    # Make the flow/expert validation metrics deterministic:
+    #   * preprocess val images with train=False (no random crop/photometric),
+    #   * draw the flow-matching (noise, time) pair from a fixed seed.
+    # Without this, `flow_mse`/`expert_loss`/`total_loss` carry a random
+    # component that does not shrink with sample count.
+    val_deterministic_flow: bool = False
+
+    # Log per-task validation means (requires val_deterministic_subset).
+    val_log_per_task: bool = False
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         return (pathlib.Path(self.assets_base_dir) / self.name).resolve()
