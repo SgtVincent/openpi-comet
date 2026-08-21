@@ -1,0 +1,296 @@
+"""CPU contracts for formal 4x8 V100 FP32 π0.5-KI A/B training."""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_LAUNCHER = _REPO_ROOT / "scripts/run_pi05_ki_formal_fp32_4x8_v100.sh"
+_A_CONFIG = "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32"
+_B_CONFIG = "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32"
+
+
+def test_formal_v100_configs_are_exactly_matched_outside_objective():
+    from openpi.models.pi05_ki_joint_fast_config import Pi05KIJointFastConfig
+    from openpi.models.pi05_ki_joint_query_config import Pi05KIJointQueryConfig
+    from openpi.training.train_config import get_config
+
+    variant_a = get_config(_A_CONFIG)
+    variant_b = get_config(_B_CONFIG)
+    assert variant_a.name == _A_CONFIG
+    assert variant_b.name == _B_CONFIG
+    assert type(variant_a.model) is Pi05KIJointFastConfig
+    assert type(variant_b.model) is Pi05KIJointQueryConfig
+    assert variant_a.pytorch_model_name == "pi05_ki_joint_fast"
+    assert variant_b.pytorch_model_name == "pi05_ki_joint_query"
+
+    for config in (variant_a, variant_b):
+        assert config.pytorch_training_precision == "float32"
+        assert config.accelerate_mixed_precision == "no"
+        assert config.model.dtype == "float32"
+        assert config.batch_size_per_gpu == 1
+        assert config.gradient_accumulation_steps == 8
+        assert config.num_train_steps == 104_912
+        assert config.num_train_epochs is None
+        assert config.streaming_anchor_stride == 12
+        assert config.save_interval == 10_000
+        assert config.checkpoint_policy == "step"
+        assert config.rolling_checkpoint_interval == 10_000
+        assert config.val_log_interval == 1_000
+        assert config.val_num_batches == 20
+        assert config.lr_schedule.warmup_steps == 1_000
+        assert config.lr_schedule.peak_lr == 1e-5
+        assert config.lr_schedule.decay_steps == 104_912
+        assert config.lr_schedule.decay_lr == 0.0
+        assert config.wandb_enabled is True
+        assert config.project_name == "pi05_ki"
+        assert config.model.knowledge_insulation is True
+        assert config.model.truncate_expert_kv is True
+        assert config.data[0].base_config.skill_bridge.enabled is False
+        assert config.val_data[0].base_config.skill_bridge.enabled is False
+        assert config.data[0].base_config.tasks is None
+        assert config.data[0].base_config.episodes_index == list(range(180))
+        assert config.val_data[0].base_config.episodes_index == list(range(180, 200))
+        assert config.pytorch_weight_path.startswith("/mnt/bn/saiwenresearch/")
+        assert config.data[0].base_config.behavior_dataset_root.startswith("/mnt/bn/saiwenresearch/")
+
+    # Every TrainConfig field is identical except arm identity, model selection,
+    # and intentionally disjoint output directories.
+    exclusions = {
+        "name",
+        "exp_name",
+        "model",
+        "pytorch_model_name",
+        "assets_base_dir",
+        "checkpoint_base_dir",
+        "log_base_dir",
+    }
+    for field in dataclasses.fields(variant_a):
+        if field.name not in exclusions:
+            assert getattr(variant_a, field.name) == getattr(variant_b, field.name), field.name
+
+    assert variant_a.data == variant_b.data
+    assert variant_a.val_data == variant_b.val_data
+    assert variant_a.assets_base_dir != variant_b.assets_base_dir
+    assert variant_a.checkpoint_base_dir != variant_b.checkpoint_base_dir
+    assert variant_a.log_base_dir != variant_b.log_base_dir
+
+    a_fields = {field.name for field in dataclasses.fields(variant_a.model)}
+    b_fields = {field.name for field in dataclasses.fields(variant_b.model)}
+    assert a_fields - b_fields == {"action_token_max_len", "beta_action", "pi05_ki_joint_fast"}
+    assert b_fields - a_fields == set()
+    for field_name in a_fields & b_fields:
+        assert getattr(variant_a.model, field_name) == getattr(variant_b.model, field_name), field_name
+
+
+def test_query_arm_declares_exactly_three_query_head_tensors():
+    """The runtime-only arm delta is embeddings plus Linear weight/bias."""
+
+    source = (_REPO_ROOT / "src/openpi/models_pytorch/pi05_ki_joint_query.py").read_text()
+    assert re.search(r"self\.query_embeddings\s*=\s*nn\.Parameter\(", source)
+    assert re.search(
+        r"self\.query_action_head\s*=\s*nn\.Linear\(self\._vlm_hidden_dim, action_dim, bias=True\)",
+        source,
+    )
+    assert 'name == "query_embeddings"' in source
+    assert 'name.startswith("query_action_head.")' in source
+
+
+def test_training_loop_routes_both_ki_phases_through_single_step_controller():
+    source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
+    assert "two_phase_update.backward(bb_loss, final_phase=False)" in source
+    assert "two_phase_update.backward(ex_loss, final_phase=True)" in source
+    assert "two_phase_update.step_and_zero_grad(optimizer)" in source
+    assert "accelerator.backward(bb_loss)" not in source
+    assert "accelerator.backward(ex_loss)" not in source
+
+
+def test_formal_launcher_is_not_debug_and_locks_the_full_contract():
+    source = _LAUNCHER.read_text()
+    assert 'pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32"' in source
+    assert 'pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32"' in source
+    assert "v100_fp32_debug" not in source
+    assert "BATCH_SIZE_PER_GPU=1" in source
+    assert "GRADIENT_ACCUMULATION_STEPS=8" in source
+    assert "NUM_TRAIN_STEPS=104912" in source
+    assert "GLOBAL_BATCH_SIZE == 256" in source
+    assert "SAVE_INTERVAL=10000" in source
+    assert "VAL_LOG_INTERVAL=1000" in source
+    assert "VAL_NUM_BATCHES=20" in source
+    assert "OPENPI_EXPECTED_CODE_COMMIT" in source
+    assert "status --porcelain --untracked-files=all" in source
+    assert 'export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src' in source
+    assert "openpi.__file__" in source
+    assert "KEEPALIVE_DISABLE=0" in source
+    assert "KEEPALIVE_ON_SUCCESS=1" in source
+    assert "OPENPI_REUSE_PREFIX_KV remains HOLD" in source
+    assert "formal runtime base checkpoint is pinned" in source
+    assert "formal runtime dataset root is pinned" in source
+    assert "formal runtime assets are pinned" in source
+    assert "formal runtime norm stats are pinned" in source
+
+
+def test_formal_deepspeed_file_is_fp32_zero2_cpu_offload():
+    config = json.loads((_REPO_ROOT / "configs/deepspeed_zero2_v100_fp32.json").read_text())
+    assert config["zero_optimization"]["stage"] == 2
+    assert config["zero_optimization"]["offload_optimizer"] == {
+        "device": "cpu",
+        "pin_memory": True,
+    }
+    assert config["fp16"]["enabled"] is False
+    assert config["bf16"]["enabled"] is False
+    assert config["gradient_accumulation_steps"] == "auto"
+
+
+@pytest.fixture
+def formal_preflight_env(tmp_path):
+    base = tmp_path / "base"
+    assets = base / "assets/behavior-1k/2025-challenge-demos"
+    dataset = tmp_path / "dataset"
+    cache = tmp_path / "openpi-cache"
+    fast = tmp_path / "fast"
+    fake_modules = tmp_path / "fake-modules"
+    fake_bin = tmp_path / "fake-bin"
+    output = tmp_path / "must-not-exist"
+    markers = tmp_path / "markers"
+    expected_commit = "a" * 40
+
+    assets.mkdir(parents=True)
+    dataset.mkdir()
+    (cache / "big_vision").mkdir(parents=True)
+    fast.mkdir()
+    (fake_modules / "transformers").mkdir(parents=True)
+    fake_bin.mkdir()
+    markers.mkdir()
+    (base / "model.safetensors").write_bytes(b"fixture")
+    (assets / "norm_stats.json").write_text("{}")
+    (cache / "big_vision/paligemma_tokenizer.model").write_bytes(b"fixture")
+    (fake_modules / "transformers/__init__.py").write_text(
+        """from pathlib import Path
+class AutoProcessor:
+    @classmethod
+    def from_pretrained(cls, path, **kwargs):
+        assert kwargs == {"trust_remote_code": True, "local_files_only": True}
+        assert Path(path).is_dir()
+        return cls()
+"""
+    )
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"rev-parse HEAD"*) printf '%s\\n' {expected_commit!r} ;;
+  *"status --porcelain --untracked-files=all"*) exit 0 ;;
+  *) echo "unexpected fake git command: $*" >&2; exit 9 ;;
+esac
+"""
+    )
+    fake_git.chmod(0o755)
+
+    env = os.environ.copy()
+    for variable in (
+        "CONFIG_NAME",
+        "OPENPI_KI_ARM",
+        "OPENPI_REUSE_PREFIX_KV",
+        "PYTORCH_TRAINING_PRECISION",
+        "ACCELERATE_MIXED_PRECISION",
+        "WANDB_MODE",
+        "WANDB_DISABLED",
+    ):
+        env.pop(variable, None)
+    env.update(
+        {
+            "OPENPI_LAUNCH_PREFLIGHT_ONLY": "1",
+            "OPENPI_EXPECTED_CODE_COMMIT": expected_commit,
+            "OPENPI_PREFLIGHT_PYTHON": sys.executable,
+            "ARNOLD_WORKER_NUM": "4",
+            "ARNOLD_WORKER_GPU": "8",
+            "ARNOLD_ID": "0",
+            "ARNOLD_WORKER_0_HOST": "127.0.0.1",
+            "ARNOLD_WORKER_0_PORT": "29514",
+            "ARNOLD_WORKER_GPU_TYPE": "Tesla_V100_SXM2_32GB",
+            "BASE_PI05_CKPT": str(base),
+            "B1K_DATASET_ROOT": str(dataset),
+            "B1K_ASSETS_DIR": str(assets),
+            "NORM_STATS_PATH": str(assets / "norm_stats.json"),
+            "REPO_OPENPI_CACHE": str(cache),
+            "PALIGEMMA_TOKENIZER": str(cache / "big_vision/paligemma_tokenizer.model"),
+            "OPENPI_FAST_TOKENIZER_PATH": str(fast),
+            "PERSISTENT_OUTPUT_BASE": str(output),
+            "PYTHONPATH": os.pathsep.join([str(fake_modules), str(_REPO_ROOT), str(_REPO_ROOT / "src")]),
+            "PATH": os.pathsep.join([str(fake_bin), env.get("PATH", "")]),
+        }
+    )
+    return env, output
+
+
+def _run_formal_preflight(env, arm):
+    return subprocess.run(
+        ["bash", str(_LAUNCHER), arm],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("arm", "expected_config", "fast_expected"),
+    [
+        ("A", _A_CONFIG, True),
+        ("B", _B_CONFIG, False),
+    ],
+)
+def test_formal_launcher_cpu_preflight_is_strict_and_side_effect_free(
+    formal_preflight_env, arm, expected_config, fast_expected
+):
+    env, output = formal_preflight_env
+    if not fast_expected:
+        env.pop("OPENPI_FAST_TOKENIZER_PATH")
+    result = _run_formal_preflight(env, arm)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "FORMAL_FP32_ZERO2_PREFLIGHT_OK" in combined
+    assert f"FORMAL_CONFIG_PREFLIGHT_OK name={expected_config}" in combined
+    assert "PREFLIGHT_OK" in combined
+    assert ("FAST_OFFLINE_PROCESSOR_PREFLIGHT_OK" in combined) is fast_expected
+    assert not output.exists()
+
+
+def test_formal_launcher_rejects_debug_config_without_fallback(formal_preflight_env):
+    env, output = formal_preflight_env
+    env["CONFIG_NAME"] = "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32_debug"
+    result = _run_formal_preflight(env, "B")
+    assert result.returncode != 0
+    assert "No debug config or unknown-name fallback is permitted" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "message"),
+    [
+        ("BATCH_SIZE_PER_GPU", "8", "BATCH_SIZE_PER_GPU=1"),
+        ("GRADIENT_ACCUMULATION_STEPS", "1", "GRADIENT_ACCUMULATION_STEPS=8"),
+        ("NUM_TRAIN_STEPS", "5", "NUM_TRAIN_STEPS=104912"),
+        ("SAVE_INTERVAL", "5", "SAVE_INTERVAL=10000"),
+        ("VAL_LOG_INTERVAL", "5", "VAL_LOG_INTERVAL=1000"),
+        ("VAL_NUM_BATCHES", "1", "VAL_NUM_BATCHES=20"),
+    ],
+)
+def test_formal_launcher_rejects_runtime_contract_drift(formal_preflight_env, variable, value, message):
+    env, output = formal_preflight_env
+    env[variable] = value
+    result = _run_formal_preflight(env, "B")
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not output.exists()

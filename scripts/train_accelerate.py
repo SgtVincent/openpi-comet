@@ -128,6 +128,67 @@ if TYPE_CHECKING:
 _WANDB = None
 
 
+class _TwoPhaseUpdateController:
+    """Keep two KI graphs separate while committing one optimizer update.
+
+    Accelerate 1.13's DeepSpeed wrapper calls ``engine.step()`` from every
+    synced ``accelerator.backward()``. The KI loop has two backwards per outer
+    microbatch, so using that wrapper twice would update and clear gradients
+    after the backbone phase before the expert phase runs.
+
+    For DeepSpeed, this adapter drives the engine directly: the backbone phase
+    is never an accumulation boundary, the expert phase inherits the outer
+    ``accelerator.sync_gradients`` boundary, and ``engine.step()`` is called
+    exactly once after both graphs only at that boundary. DeepSpeed performs
+    its real optimizer step and gradient clear inside ``engine.step()``. The
+    non-DeepSpeed path deliberately retains Accelerate's normal backward and
+    optimizer semantics.
+    """
+
+    def __init__(self, accelerator) -> None:
+        self._accelerator = accelerator
+        self._is_deepspeed = accelerator.distributed_type == DistributedType.DEEPSPEED
+        self._engine = (
+            accelerator.deepspeed_engine_wrapped.engine if self._is_deepspeed else None
+        )
+
+    def backward(self, loss: torch.Tensor, *, final_phase: bool) -> None:
+        """Backpropagate one graph under the correct outer boundary."""
+
+        if not self._is_deepspeed:
+            self._accelerator.backward(loss)
+            return
+
+        boundary = bool(self._accelerator.sync_gradients) if final_phase else False
+        self._engine.set_gradient_accumulation_boundary(boundary)
+        self._engine.backward(loss)
+
+    def step_and_zero_grad(self, optimizer) -> None:
+        """Commit and clear exactly once at an outer optimizer boundary."""
+
+        if not self._accelerator.sync_gradients:
+            return
+        if self._is_deepspeed:
+            # DeepSpeed's engine step owns the real optimizer update and the
+            # single gradient clear. Its Accelerate optimizer wrapper exposes
+            # step()/zero_grad() as no-ops, so do not call those here.
+            self._engine.step()
+            return
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    def clear_gradients(self, optimizer) -> None:
+        """Discard a partial accumulation after a rejected KI microbatch."""
+
+        if self._is_deepspeed:
+            # ZeRO optimizers own partitioned gradient state; clear through the
+            # engine optimizer rather than Accelerate's no-op wrapper. Match
+            # DeepSpeed's own `_take_model_step` clearing path for ZeRO-2.
+            self._engine.optimizer.zero_grad()
+            return
+        optimizer.zero_grad(set_to_none=True)
+
+
 def _get_wandb():
     global _WANDB
     if _WANDB is None:
@@ -307,7 +368,36 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         return None
 
 
-_FORMAL_B1K_CONFIG_NAME = "pi05_ki_joint_query_b1k-full_task-ki_on_bf16"
+_FORMAL_B1K_CONFIG_CONTRACTS = {
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_bf16": {
+        "pytorch_model_name": "pi05_ki_joint_fast",
+        "batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 1,
+        "pytorch_training_precision": "bfloat16",
+        "accelerate_mixed_precision": "bf16",
+    },
+    "pi05_ki_joint_query_b1k-full_task-ki_on_bf16": {
+        "pytorch_model_name": "pi05_ki_joint_query",
+        "batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 1,
+        "pytorch_training_precision": "bfloat16",
+        "accelerate_mixed_precision": "bf16",
+    },
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32": {
+        "pytorch_model_name": "pi05_ki_joint_fast",
+        "batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": 8,
+        "pytorch_training_precision": "float32",
+        "accelerate_mixed_precision": "no",
+    },
+    "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32": {
+        "pytorch_model_name": "pi05_ki_joint_query",
+        "batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": 8,
+        "pytorch_training_precision": "float32",
+        "accelerate_mixed_precision": "no",
+    },
+}
 _FORMAL_B1K_PASS_SPECS = ((0, 34_982), (4, 34_971), (8, 34_959))
 _FORMAL_B1K_PASS_BOUNDARIES = (34_982, 69_953, 104_912)
 _FORMAL_B1K_DATASET_ENV_KEYS = (
@@ -318,7 +408,7 @@ _FORMAL_B1K_DATASET_ENV_KEYS = (
 
 
 def _is_formal_b1k_mode(config) -> bool:
-    return getattr(config, "name", None) == _FORMAL_B1K_CONFIG_NAME
+    return getattr(config, "name", None) in _FORMAL_B1K_CONFIG_CONTRACTS
 
 
 def _set_formal_b1k_pass_offset(offset: int) -> None:
@@ -410,10 +500,17 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
     if not _is_formal_b1k_mode(config):
         return
 
+    contract = _FORMAL_B1K_CONFIG_CONTRACTS[config.name]
     expected_fields = {
-        "batch_size_per_gpu": 8,
-        "gradient_accumulation_steps": 1,
+        **contract,
         "num_train_steps": 104_912,
+        "save_interval": 10_000,
+        "checkpoint_policy": "step",
+        "rolling_checkpoint_interval": 10_000,
+        "val_log_interval": 1_000,
+        "val_num_batches": 20,
+        "streaming_anchor_stride": 12,
+        "overwrite": False,
         "wandb_enabled": True,
         "project_name": "pi05_ki",
     }
@@ -431,6 +528,23 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
             "Formal B1K resume is unsupported: checkpoints are weights/evaluation artifacts, "
             "not exact data-order resume points"
         )
+    if len(config.data) != 1 or len(config.val_data) != 1:
+        raise ValueError("Formal B1K requires exactly one train and one validation data config")
+    train_data = config.data[0]
+    val_data = config.val_data[0]
+    for label, data, expected_episodes in (
+        ("train", train_data, list(range(180))),
+        ("validation", val_data, list(range(180, 200))),
+    ):
+        base_config = data.base_config
+        if base_config.tasks is not None:
+            raise ValueError(f"Formal B1K {label} data must cover all tasks (tasks=None)")
+        if base_config.episodes_index != expected_episodes:
+            raise ValueError(
+                f"Formal B1K {label} episodes must be {expected_episodes[0]}..{expected_episodes[-1]}"
+            )
+        if base_config.skill_bridge.enabled:
+            raise ValueError(f"Formal B1K {label} data requires Skill Bridge disabled")
 
     schedule = config.lr_schedule
     schedule_values = (
@@ -475,11 +589,33 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
     if accelerator is not None:
         if int(accelerator.num_processes) != 32:
             raise ValueError(f"Formal B1K requires world size 32; got {accelerator.num_processes}")
-        if int(accelerator.gradient_accumulation_steps) != 1:
+        expected_grad_accum = int(contract["gradient_accumulation_steps"])
+        if int(accelerator.gradient_accumulation_steps) != expected_grad_accum:
             raise ValueError(
-                "Formal B1K requires Accelerator gradient_accumulation_steps=1; "
+                "Formal B1K requires Accelerator "
+                f"gradient_accumulation_steps={expected_grad_accum}; "
                 f"got {accelerator.gradient_accumulation_steps}"
             )
+        effective_global_batch = (
+            int(config.batch_size_per_gpu)
+            * int(accelerator.num_processes)
+            * int(accelerator.gradient_accumulation_steps)
+        )
+        if effective_global_batch != 256:
+            raise ValueError(
+                "Formal B1K requires effective global batch 256; "
+                f"got {effective_global_batch}"
+            )
+        if contract["pytorch_training_precision"] == "float32":
+            if accelerator.distributed_type != DistributedType.DEEPSPEED:
+                raise ValueError("Formal V100 FP32 requires DeepSpeed")
+            ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
+            zero_config = ds_config.get("zero_optimization", {})
+            if zero_config.get("stage") != 2:
+                raise ValueError("Formal V100 FP32 requires DeepSpeed ZeRO stage 2")
+            offload_config = zero_config.get("offload_optimizer", {})
+            if offload_config.get("device") != "cpu":
+                raise ValueError("Formal V100 FP32 requires DeepSpeed CPU optimizer offload")
 
 
 def _init_formal_b1k_wandb(config, *, accelerator) -> None:
@@ -3458,6 +3594,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     # Prepare with Accelerator (DDP or DeepSpeed).
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+    two_phase_update = _TwoPhaseUpdateController(accelerator) if is_pi05_ki_joint else None
     # `accelerator.prepare()` may wrap/replace the model parameters (especially for DeepSpeed).
     # Keep a post-prepare view for gradient clipping/debugging; otherwise debug stats can report
     # grad_tensors=0 even when DeepSpeed computed a non-zero grad_norm.
@@ -3737,7 +3874,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         consecutive_nonfinite_losses += 1
                         total_nonfinite_loss_batches += 1
-                        optimizer.zero_grad(set_to_none=True)
+                        two_phase_update.clear_gradients(optimizer)
                         accelerator.wait_for_everyone()
                         # Flush metrics before raising / skipping on error.
                         _metrics_buffer_flush()
@@ -3756,8 +3893,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         continue
 
-                    # Backbone backward (accumulates grads on backbone params only)
-                    accelerator.backward(bb_loss)
+                    # Backbone backward accumulates into the current outer
+                    # microbatch but is never allowed to trigger a DeepSpeed
+                    # update; the expert phase owns the real outer boundary.
+                    two_phase_update.backward(bb_loss, final_phase=False)
 
                     # Capture scalar metrics only on rank 0. The old code called
                     # .item() for every component on all 64 ranks even though only
@@ -3830,7 +3969,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         consecutive_nonfinite_losses += 1
                         total_nonfinite_loss_batches += 1
-                        optimizer.zero_grad(set_to_none=True)
+                        two_phase_update.clear_gradients(optimizer)
                         accelerator.wait_for_everyone()
                         # Flush metrics before raising / skipping on error.
                         _metrics_buffer_flush()
@@ -3849,9 +3988,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         continue
 
-                    # Expert backward (accumulates grads on expert params only with KI=ON;
-                    # adds flow→backbone grads with KI=OFF)
-                    accelerator.backward(ex_loss)
+                    # Expert backward accumulates expert gradients (and
+                    # flow→backbone gradients with KI=OFF). For DeepSpeed this
+                    # phase is marked with the actual outer accumulation
+                    # boundary, but the engine update is still deferred until
+                    # both graphs have been freed below.
+                    two_phase_update.backward(ex_loss, final_phase=True)
 
                     # Capture scalar metrics only on rank 0; all other ranks keep
                     # the training path free of logging-only .item() synchronizations.
@@ -4165,7 +4307,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 )
                         else:
                             consecutive_skipped_updates += 1
-                            optimizer.zero_grad(set_to_none=True)
+                            if is_pi05_ki_joint:
+                                two_phase_update.clear_gradients(optimizer)
+                            else:
+                                optimizer.zero_grad(set_to_none=True)
                             accelerator.wait_for_everyone()
                             if is_main:
                                 logging.warning(
@@ -4236,11 +4381,15 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 logging.warning("overflow_debug loss scale collapsed to %.1f at step=%s", loss_scale, global_step)
                     if profile_memory:
                         _reset_peak_memory_stats(accelerator)
-                    optimizer.step()
+                    if is_pi05_ki_joint:
+                        two_phase_update.step_and_zero_grad(optimizer)
+                    else:
+                        optimizer.step()
                     step_was_skipped = accelerator.optimizer_step_was_skipped
                     if profile_memory:
                         log_memory_usage(accelerator, global_step, "after_optimizer_step")
-                    optimizer.zero_grad(set_to_none=True)
+                    if not is_pi05_ki_joint:
+                        optimizer.zero_grad(set_to_none=True)
 
                     if step_was_skipped:
                         consecutive_skipped_updates += 1
