@@ -175,10 +175,12 @@ class FASTTokenizer:
         Args:
             actions: ``[action_horizon, action_dim]``, already normalized to
                 roughly ``[-1, 1]`` by the upstream normalization transform.
-            max_len: fixed segment length. Measured FAST lengths on real B1K
-                chunks (H=32) are p50=20 / p99=47 / max=51, so the default 64
-                leaves headroom. Do not size this from synthetic noise, which
-                produces ~500 tokens and wildly overestimates the budget.
+            max_len: fixed segment length required by the batched data
+                contract. The formal B1K configuration uses 96: the GPU run
+                observed chunks up to 73 tokens (including BOS/EOS), so 96 is
+                the next 32-token boundary and leaves 23 tokens of headroom.
+                Dynamic per-sample sizing is unsafe because these arrays are
+                stacked before they reach the model.
 
         Returns:
             ``(tokens, mask, ar_mask, loss_mask)``, each of shape ``[max_len]``.
@@ -199,27 +201,23 @@ class FASTTokenizer:
         # final row has no target.
         loss_mask = [False] + [True] * (n - 1)
 
-        if n < max_len:
-            pad = max_len - n
-            tokens = tokens + [0] * pad
-            mask = mask + [False] * pad
-            ar_mask = ar_mask + [0] * pad
-            loss_mask = loss_mask + [False] * pad
-        else:
-            if n > max_len:
-                # Truncation is NOT benign: FAST is byte-pair encoded over DCT
-                # coefficients, so dropping trailing tokens corrupts the
-                # reconstructed chunk rather than merely shortening it.
-                logging.warning(
-                    "FAST action chunk produced %d tokens, exceeding action_token_max_len=%d; "
-                    "truncating, which corrupts the action target. Raise action_token_max_len.",
-                    n,
-                    max_len,
-                )
-            tokens = tokens[:max_len]
-            mask = mask[:max_len]
-            ar_mask = ar_mask[:max_len]
-            loss_mask = loss_mask[:max_len]
+        if n > max_len:
+            # Truncation is NOT benign: FAST is byte-pair encoded over DCT
+            # coefficients, so dropping trailing tokens corrupts the
+            # reconstructed chunk rather than merely shortening it. A fixed
+            # segment is still required for batching, therefore fail before
+            # returning any partial target.
+            raise ValueError(
+                f"FAST action chunk produced {n} tokens, exceeding "
+                f"action_token_max_len={max_len}. Refusing to truncate a corrupted "
+                "action target; raise action_token_max_len for this data contract."
+            )
+
+        pad = max_len - n
+        tokens = tokens + [0] * pad
+        mask = mask + [False] * pad
+        ar_mask = ar_mask + [0] * pad
+        loss_mask = loss_mask + [False] * pad
 
         return (
             np.asarray(tokens, dtype=np.int32),

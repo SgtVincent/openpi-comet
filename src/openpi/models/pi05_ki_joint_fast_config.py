@@ -29,10 +29,10 @@ class Pi05KIJointFastConfig(Pi05KIJointQueryConfig):
     beta_action: float = 1.0
 
     # ===== Action-token segment =====
-    # Measured FAST lengths on real B1K chunks (H=32, action_dim=23) are
-    # p50=20 / p90=29 / p99=47 / max=51, so 64 leaves headroom while adding only
-    # ~5% to the ~1000-token prefix. Do NOT size this from synthetic noise, which
-    # yields ~500 tokens and grossly overestimates the budget.
+    # This generic default is intentionally conservative. Formal configurations
+    # must size it from their observed data contract (the V100 formal FAST config
+    # uses 96 for an observed maximum of 73). Any overflow fails instead of
+    # silently truncating and corrupting the target.
     action_token_max_len: int = 64
 
     # ===== Architecture flags =====

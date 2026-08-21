@@ -491,6 +491,30 @@ class TestFastActionTokenization:
             pytest.skip(f"FAST processor unavailable (needs the corporate proxy): {exc}")
 
     @staticmethod
+    def _tokenizer_with_action_length(action_length: int):
+        """Build a deterministic tokenizer without external processor access."""
+        from openpi.models.tokenizer import FASTTokenizer
+
+        class _FakePaliGemmaTokenizer:
+            @staticmethod
+            def bos_id():
+                return 1
+
+            @staticmethod
+            def eos_id():
+                return 2
+
+            @staticmethod
+            def vocab_size():
+                return 257_152
+
+        tokenizer = FASTTokenizer.__new__(FASTTokenizer)
+        tokenizer._fast_tokenizer = lambda batch: [np.arange(action_length, dtype=np.int32)]
+        tokenizer._paligemma_tokenizer = _FakePaliGemmaTokenizer()
+        tokenizer._fast_skip_tokens = 128
+        return tokenizer
+
+    @staticmethod
     def _smooth_chunk(horizon: int = 32, action_dim: int = 23) -> np.ndarray:
         """A temporally smooth chunk, i.e. what real robot actions look like.
 
@@ -528,22 +552,30 @@ class TestFastActionTokenization:
         assert (ar_mask[n:] == 0).all()
         assert not loss_mask[n:].any()
 
-    def test_truncation_warns_and_stays_fixed_length(self):
-        """Overflow must warn loudly, not silently corrupt the target.
+    def test_formal_capacity_preserves_observed_73_token_target(self):
+        """The observed maximum includes BOS/EOS and must remain complete."""
+        tk = self._tokenizer_with_action_length(71)
+        chunk = np.zeros((32, 23), dtype=np.float32)
 
-        FAST is byte-pair encoded over DCT coefficients, so dropping trailing
-        tokens changes the decoded chunk rather than shortening it.
-        """
-        tk = self._tokenizer()
-        rng = np.random.default_rng(0)
-        # i.i.d. noise is the pathological case that overflows any sane cap.
-        noisy = np.clip(rng.normal(0, 0.3, (32, 23)), -1, 1).astype(np.float32)
+        tokens, mask, ar_mask, loss_mask = tk.tokenize_action_chunk(chunk, max_len=96)
 
-        tokens, mask, ar_mask, loss_mask = tk.tokenize_action_chunk(noisy, max_len=16)
-        assert tokens.shape == (16,)
-        assert mask.all(), "a truncated segment has no padding left"
-        assert ar_mask.shape == (16,)
-        assert loss_mask.shape == (16,)
+        assert tokens.shape == mask.shape == ar_mask.shape == loss_mask.shape == (96,)
+        assert int(mask.sum()) == 73
+        assert tokens[0] == tk._paligemma_tokenizer.bos_id()
+        assert tokens[72] == tk._paligemma_tokenizer.eos_id()
+        assert int(loss_mask.sum()) == 72
+        assert not mask[73:].any()
+
+    def test_over_limit_action_target_fails_instead_of_truncating(self):
+        """An unexpected longer chunk must never return a partial target."""
+        tk = self._tokenizer_with_action_length(95)  # 97 including BOS/EOS.
+        chunk = np.zeros((32, 23), dtype=np.float32)
+
+        with pytest.raises(
+            ValueError,
+            match=r"produced 97 tokens.*action_token_max_len=96.*Refusing to truncate",
+        ):
+            tk.tokenize_action_chunk(chunk, max_len=96)
 
     def test_rejects_wrong_rank(self):
         tk = self._tokenizer()
@@ -564,7 +596,7 @@ class TestFastActionTokenization:
 
         for _ in range(4):
             chunk = np.clip(rng.normal(0, 0.3, (32, 23)), -1, 1).astype(np.float32)
-            tokens, mask, _, _ = tk.tokenize_action_chunk(chunk, max_len=128)
+            tokens, mask, _, _ = tk.tokenize_action_chunk(chunk, max_len=1024)
             ids = tokens[mask]
             assert (ids < image_token_index).all(), "action id collided with the image token"
             assert (ids >= 0).all()
