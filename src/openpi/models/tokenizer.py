@@ -48,7 +48,7 @@ class PaligemmaTokenizer:
 
 
 class FASTTokenizer:
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(self, max_len: int = 256, fast_tokenizer_path: str | None = None):
         self._max_len = max_len
 
         # Import transformers lazily so non-FAST code paths do not pay its startup cost.
@@ -59,8 +59,19 @@ class FASTTokenizer:
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-        # Instantiate FAST tokenizer
-        self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        # Variant A launchers can point directly at a pre-cached processor tree.
+        # In offline mode, force local-only resolution so a missing cache fails
+        # immediately instead of hanging every distributed rank on network I/O.
+        fast_tokenizer_path = (
+            fast_tokenizer_path or os.environ.get("OPENPI_FAST_TOKENIZER_PATH") or "physical-intelligence/fast"
+        )
+        processor_kwargs = {"trust_remote_code": True}
+        if os.environ.get("OPENPI_OFFLINE") == "1":
+            processor_kwargs["local_files_only"] = True
+        self._fast_tokenizer = AutoProcessor.from_pretrained(
+            fast_tokenizer_path,
+            **processor_kwargs,
+        )
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
 
     def tokenize(

@@ -12,6 +12,7 @@ Precision variants:
 - ``*_smoke``: fp16 (intended production precision, unstable on V100)
 - ``*_smoke_fp32``: float32 (V100 smoke test, numerically stable but slower)
 - ``*_bf16``: bfloat16 (formal HL/Arnold training precision)
+- ``*_v100_fp32_debug``: matched full-task Variant A/B smoke configs for 4x8 V100
 """
 
 from pathlib import Path
@@ -538,7 +539,9 @@ _ACTION_REPR_TO_MODEL_NAME = {
 }
 
 
-def _make_ki_model_config(*, action_repr: str, action_token_max_len: int = 64):
+def _make_ki_model_config(
+    *, action_repr: str, action_token_max_len: int = 64, dtype: str = "bfloat16"
+):
     """Build the model config for one Knowledge Insulation variant.
 
     Shared hyperparameters are declared once here so the A/B comparison cannot
@@ -550,6 +553,7 @@ def _make_ki_model_config(*, action_repr: str, action_token_max_len: int = 64):
         )
 
     shared = {
+        "dtype": dtype,
         "alpha": 10.0,
         "subtask_max_len": 128,
         "action_horizon": 32,
@@ -576,7 +580,7 @@ def _make_ki_model_config(*, action_repr: str, action_token_max_len: int = 64):
     )
 
 
-def _make_pi05_ki_joint_query_full_task_set_bf16_config(
+def _make_pi05_ki_joint_full_task_set_config(
     *,
     name: str,
     train_episodes: int = 180,
@@ -602,8 +606,9 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     streaming_anchor_stride: int = 12,
     action_repr: str = "query_mse",
     action_token_max_len: int = 64,
+    precision: str = "bfloat16",
 ) -> TrainConfig:
-    """Formal lean BF16 config over the full B1K task set.
+    """Build a matched KI Variant A/B config over the full B1K task set.
 
     ``action_repr`` selects the backbone action objective and is the ONLY
     intended difference between the two Knowledge Insulation variants:
@@ -611,10 +616,11 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     * ``"query_mse"`` (default) -- Variant B: learned action queries regressed
       by mean-squared error. This is the shipping model.
     * ``"fast_ce"`` -- Variant A: discrete FAST frequency-space action tokens
-      supervised by next-token cross-entropy, i.e. the paper-accurate recipe.
+      supervised by next-token cross-entropy.
 
     Everything else (data, schedule, batch size, flow expert, knowledge
-    insulation) is shared, so an A/B run isolates the objective.
+    insulation) is shared, so an A/B run isolates the objective implemented by
+    these two branch-local variants; this does not assert broader paper equivalence.
 
     Defaults reproduce the non-Skill-Bridge Run 2 control
     (``pi05_ki_joint_query_b1k-full_task-ki_on_bf16``): three streaming stride-12
@@ -637,6 +643,18 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
     so validation metrics are computed on the full-resolution data regardless
     of the training stride.
     """
+    precision_settings = {
+        "bfloat16": ("bfloat16", "bf16"),
+        "float16": ("float16", "fp16"),
+        "float32": ("float32", "no"),
+    }
+    try:
+        pytorch_precision, accelerate_precision = precision_settings[precision]
+    except KeyError as exc:
+        raise ValueError(
+            f"precision must be one of {sorted(precision_settings)}, got {precision!r}"
+        ) from exc
+
     train_episodes_index = list(range(train_episodes))
     val_episodes_index = list(range(val_episodes_start, val_episodes_end))
     output_root = f"./outputs/{name}"
@@ -649,6 +667,7 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
         model=_make_ki_model_config(
             action_repr=action_repr,
             action_token_max_len=action_token_max_len,
+            dtype=pytorch_precision,
         ),
         data=_make_b1k_full_task_set_data_config(
             train_episodes_index,
@@ -675,8 +694,8 @@ def _make_pi05_ki_joint_query_full_task_set_bf16_config(
             decay_steps=decay_steps,
             decay_lr=decay_lr,
         ),
-        pytorch_training_precision="bfloat16",
-        accelerate_mixed_precision="bf16",
+        pytorch_training_precision=pytorch_precision,
+        accelerate_mixed_precision=accelerate_precision,
         ema_decay=None,
         wandb_enabled=True,
         assets_base_dir=f"{output_root}/assets",
@@ -815,7 +834,7 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # Formal lean B8/W32 run: three stride-12 offsets provide approximate
     # quarter exposure; the exact fixed optimizer-step budget is 104,912.
     # This is the non-Skill-Bridge control (Tracking Run 2). Left untouched.
-    _make_pi05_ki_joint_query_full_task_set_bf16_config(
+    _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
     ),
     # Variant A of the same control: identical data, schedule, batch size, flow
@@ -824,9 +843,52 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # Pairs with the config above as the A/B comparison the KI paper's own
     # ablation implies (FAST > naive tokenization > continuous actions alone),
     # which this repository has never actually run.
-    _make_pi05_ki_joint_query_full_task_set_bf16_config(
+    _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_fast_b1k-full_task-ki_on_bf16",
         action_repr="fast_ce",
+    ),
+    # Matched 4x8 V100 FP32 debug pair. These deliberately use B1 and a five-
+    # step budget: the goal is to validate end-to-end wiring and memory safety,
+    # not to approximate the formal B8/104,912-step experiment.
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32_debug",
+        behavior_dataset_root=_B1K_DATA_ROOT,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        num_train_steps=5,
+        num_train_epochs=None,
+        warmup_steps=1,
+        peak_lr=1e-5,
+        decay_steps=5,
+        decay_lr=0.0,
+        batch_size_per_gpu=1,
+        save_interval=5,
+        val_log_interval=5,
+        val_num_batches=1,
+        log_interval=1,
+        streaming_anchor_stride=1,
+        action_repr="fast_ce",
+        precision="float32",
+    ),
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32_debug",
+        behavior_dataset_root=_B1K_DATA_ROOT,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        num_train_steps=5,
+        num_train_epochs=None,
+        warmup_steps=1,
+        peak_lr=1e-5,
+        decay_steps=5,
+        decay_lr=0.0,
+        batch_size_per_gpu=1,
+        save_interval=5,
+        val_log_interval=5,
+        val_num_batches=1,
+        log_interval=1,
+        streaming_anchor_stride=1,
+        action_repr="query_mse",
+        precision="float32",
     ),
     # Full-B1K Skill Bridge variant (LQ, 8x8 A100, B4, 3 epochs, stride-1).
     # NOT a strict Run 2 A/B: warmstarts from the LQ base pi05 checkpoint
@@ -835,7 +897,7 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # fixed 104,912-step three stride-12 passes, and B4 on 64 GPUs for the same
     # global batch 256. The only intended algorithmic A/B difference vs the
     # control above is skill_bridge.enabled=True.
-    _make_pi05_ki_joint_query_full_task_set_bf16_config(
+    _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_skillbridge_bf16",
         behavior_dataset_root=_B1K_DATA_ROOT,
         skill_bridge_enabled=True,
