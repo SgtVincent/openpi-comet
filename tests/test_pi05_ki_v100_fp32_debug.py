@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -88,15 +89,76 @@ def test_fp32_debug_configs_are_registered_matched_and_isolated():
     assert variant_a.assets_base_dir != variant_b.assets_base_dir
 
 
-def test_fp32_accelerate_and_deepspeed_files_disable_mixed_precision():
+def test_fp32_accelerate_omits_duplicate_precision_and_deepspeed_enforces_fp32():
     accelerate_text = _FP32_ACCELERATE.read_text()
-    assert 'mixed_precision: "no"' in accelerate_text
+    assert not any(line.startswith("mixed_precision:") for line in accelerate_text.splitlines())
     assert "deepspeed_config_file: configs/deepspeed_zero2_v100_fp32.json" in accelerate_text
 
     deepspeed = json.loads(_FP32_DEEPSPEED.read_text())
     assert deepspeed["fp16"]["enabled"] is False
     assert deepspeed["bf16"]["enabled"] is False
     assert deepspeed["torch_autocast"] == {"enabled": False, "dtype": "float32"}
+
+
+def _parse_deepspeed_plugin_from_accelerate_config(config_path: Path):
+    """Exercise the Accelerate launch-to-plugin path without starting workers."""
+    from accelerate.commands import launch as accelerate_launch
+    from accelerate.utils import DeepSpeedPlugin
+    from accelerate.utils.launch import prepare_deepspeed_cmd_env
+
+    args = accelerate_launch.launch_command_parser().parse_args(
+        [
+            "--config_file",
+            str(config_path),
+            "--num_processes",
+            "1",
+            "--num_machines",
+            "1",
+            "--machine_rank",
+            "0",
+            "--main_process_ip",
+            "127.0.0.1",
+            "--main_process_port",
+            "0",
+            "--same_network",
+            str(_REPO_ROOT / "scripts/train_accelerate.py"),
+        ]
+    )
+    result = {}
+
+    def parse_plugin_without_launching(launch_args):
+        _command, launch_env = prepare_deepspeed_cmd_env(launch_args)
+        with mock.patch.dict(os.environ, launch_env, clear=True):
+            plugin = DeepSpeedPlugin(hf_ds_config=launch_env["ACCELERATE_DEEPSPEED_CONFIG_FILE"])
+        result.update(plugin=plugin, launch_env=launch_env)
+
+    with mock.patch.object(accelerate_launch, "deepspeed_launcher", parse_plugin_without_launching):
+        accelerate_launch.launch_command(args)
+    return result["plugin"], result["launch_env"]
+
+
+def test_installed_accelerate_plugin_rejects_old_duplicate_and_accepts_fixed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(_REPO_ROOT)
+    old_config = tmp_path / "old-accelerate-v100-fp32.yaml"
+    old_config.write_text(
+        _FP32_ACCELERATE.read_text().replace(
+            "main_training_function: main\n",
+            'main_training_function: main\nmixed_precision: "no"\n',
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"When using `deepspeed_config_file`"):
+        _parse_deepspeed_plugin_from_accelerate_config(old_config)
+
+    plugin, launch_env = _parse_deepspeed_plugin_from_accelerate_config(_FP32_ACCELERATE)
+    config_fields = launch_env["ACCELERATE_CONFIG_DS_FIELDS"].split(",")
+    assert "mixed_precision" not in config_fields
+    assert launch_env["ACCELERATE_MIXED_PRECISION"] == "no"
+    assert plugin.deepspeed_config["fp16"]["enabled"] is False
+    assert plugin.deepspeed_config["bf16"]["enabled"] is False
+    assert plugin.deepspeed_config["torch_autocast"] == {"enabled": False, "dtype": "float32"}
 
 
 def test_fast_tokenizer_uses_explicit_offline_processor_cache(tmp_path, monkeypatch):
@@ -374,14 +436,19 @@ def test_preflight_rejects_non_v100_model_when_platform_reports_it(launcher_fixt
     assert "V100-only" in result.stderr
 
 
-def test_preflight_rejects_accelerate_file_without_explicit_no_mixed_precision(launcher_fixture, tmp_path):
+def test_preflight_rejects_accelerate_file_with_duplicate_mixed_precision(launcher_fixture, tmp_path):
     bad_accelerate = tmp_path / "bad-accelerate.yaml"
-    bad_accelerate.write_text(_FP32_ACCELERATE.read_text().replace('mixed_precision: "no"', "mixed_precision: bf16"))
+    bad_accelerate.write_text(
+        _FP32_ACCELERATE.read_text().replace(
+            "main_training_function: main\n",
+            'main_training_function: main\nmixed_precision: "no"\n',
+        )
+    )
     env = launcher_fixture["env"].copy()
     env["ACCEL_CONFIG"] = str(bad_accelerate)
     result = _run_launcher(env, "B")
     assert result.returncode != 0
-    assert "must set mixed_precision: no" in result.stderr
+    assert "must not define top-level mixed_precision" in result.stderr
 
 
 def test_variant_a_requires_actionable_offline_fast_cache(launcher_fixture):

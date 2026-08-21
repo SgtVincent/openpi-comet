@@ -168,7 +168,9 @@ OPENPI_PREFLIGHT_PYTHON="${OPENPI_PREFLIGHT_PYTHON:-/mnt/bn/saiwenresearch/mlx/u
 [[ "${OPENPI_PREFLIGHT_PYTHON}" == /* && -x "${OPENPI_PREFLIGHT_PYTHON}" ]] \
   || die "OPENPI_PREFLIGHT_PYTHON must be an absolute executable path: ${OPENPI_PREFLIGHT_PYTHON}"
 
-# Check the file-level precision contract without importing Accelerate.
+# With an external deepspeed_config_file, Accelerate 1.13 rejects precision
+# fields duplicated at the top level. FP32 is enforced by DeepSpeed here and
+# by the TrainConfig validation below, not by the Accelerate YAML.
 "${OPENPI_PREFLIGHT_PYTHON}" - "${ACCEL_CONFIG}" "${DEEPSPEED_CONFIG}" <<'PY'
 import json
 from pathlib import Path
@@ -179,8 +181,11 @@ accelerate_path = Path(sys.argv[1])
 deepspeed_path = Path(sys.argv[2])
 accelerate_text = accelerate_path.read_text()
 
-if not re.search(r'^mixed_precision:\s*["\']?no["\']?\s*$', accelerate_text, re.MULTILINE):
-    raise SystemExit(f"ERROR: {accelerate_path} must set mixed_precision: no")
+if re.search(r'^mixed_precision\s*:', accelerate_text, re.MULTILINE):
+    raise SystemExit(
+        f"ERROR: {accelerate_path} must not define top-level mixed_precision "
+        "when deepspeed_config_file is used"
+    )
 if "deepspeed_config_file: configs/deepspeed_zero2_v100_fp32.json" not in accelerate_text:
     raise SystemExit(f"ERROR: {accelerate_path} does not reference the FP32 DeepSpeed config")
 
@@ -194,7 +199,7 @@ checks = {
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     raise SystemExit(f"ERROR: {deepspeed_path} violates FP32-only settings: {', '.join(failed)}")
-print("FP32_DISTRIBUTED_CONFIG_PREFLIGHT_OK")
+print("FP32_DISTRIBUTED_CONFIG_PREFLIGHT_OK accelerate_mixed_precision_key=absent")
 PY
 
 # get_config() silently returns pi05_b1k-base for unknown names. Compare the
