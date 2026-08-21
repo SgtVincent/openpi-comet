@@ -106,13 +106,21 @@ def test_query_arm_declares_exactly_three_query_head_tensors():
 
 def test_training_loop_routes_both_ki_phases_through_single_step_controller():
     source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
-    assert "two_phase_update.backward(bb_loss, final_phase=False)" in source
-    assert "two_phase_update.backward(ex_loss, final_phase=True)" in source
+    assert "two_phase_update.backward(bb_loss)" in source
+    assert "two_phase_update.backward(ex_loss)" in source
+    assert "boundary = bool(self._accelerator.sync_gradients)" in source
     assert "post_step_grad_norm = two_phase_update.step_and_zero_grad(optimizer)" in source
     assert "grad_norm_value = _grad_norm_to_float(post_step_grad_norm)" in source
     assert "deepspeed_two_phase_update" in source
     assert "accelerator.backward(bb_loss)" not in source
     assert "accelerator.backward(ex_loss)" not in source
+
+
+def test_model_loaded_banner_is_arm_correct():
+    source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
+    assert 'variant_label = "FAST action-token CE variant"' in source
+    assert 'variant_label = "query-MSE variant"' in source
+    assert "joint query query-MSE variant model loaded" not in source
 
 
 def test_formal_launcher_is_not_debug_and_locks_the_full_contract():

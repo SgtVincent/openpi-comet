@@ -136,9 +136,9 @@ class _TwoPhaseUpdateController:
     microbatch, so using that wrapper twice would update and clear gradients
     after the backbone phase before the expert phase runs.
 
-    For DeepSpeed, this adapter drives the engine directly: the backbone phase
-    is never an accumulation boundary, the expert phase inherits the outer
-    ``accelerator.sync_gradients`` boundary, and ``engine.step()`` is called
+    For DeepSpeed, this adapter drives the engine directly: both disjoint phase
+    backwards inherit the outer ``accelerator.sync_gradients`` boundary so
+    ZeRO-2 finalizes both parameter groups, while ``engine.step()`` is called
     exactly once after both graphs only at that boundary. DeepSpeed performs
     its real optimizer step and gradient clear inside ``engine.step()``. The
     non-DeepSpeed path deliberately retains Accelerate's normal backward and
@@ -156,14 +156,18 @@ class _TwoPhaseUpdateController:
     def is_deepspeed(self) -> bool:
         return self._is_deepspeed
 
-    def backward(self, loss: torch.Tensor, *, final_phase: bool) -> None:
-        """Backpropagate one graph under the correct outer boundary."""
+    def backward(self, loss: torch.Tensor) -> None:
+        """Backpropagate one phase under the outer accumulation boundary."""
 
         if not self._is_deepspeed:
             self._accelerator.backward(loss)
             return
 
-        boundary = bool(self._accelerator.sync_gradients) if final_phase else False
+        # ZeRO-2 finalizes only parameters participating in a boundary
+        # backward. The two KI phases own disjoint groups, so both must inherit
+        # the outer boundary on the final accumulation microbatch. The update
+        # remains deferred until the single engine.step after both phases.
+        boundary = bool(self._accelerator.sync_gradients)
         self._engine.set_gradient_accumulation_boundary(boundary)
         self._engine.backward(loss)
 
@@ -3403,18 +3407,24 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             import openpi.models_pytorch.pi05_ki_joint_fast as _pi05_ki_joint_fast
 
             model = _pi05_ki_joint_fast.PI05KIJointFastPytorch(model_cfg)
+            variant_label = "FAST action-token CE variant"
+            objective_weight_name = "beta_action"
         else:
             # Variant B: learned action queries + MSE backbone objective.
             import openpi.models_pytorch.pi05_ki_joint_query as _pi05_ki_joint_query
 
             model = _pi05_ki_joint_query.PI05KIJointQueryPytorch(model_cfg)
+            variant_label = "query-MSE variant"
+            objective_weight_name = "beta_query"
         if is_main:
             ki = bool(getattr(model, "knowledge_insulation", False))
             logging.info(
-                "π0.5-KI joint query query-MSE variant model loaded (knowledge_insulation=%s, beta_text=%.3f, beta_query=%.3f)",
+                "π0.5-KI joint %s model loaded (knowledge_insulation=%s, beta_text=%.3f, %s=%.3f)",
+                variant_label,
                 ki,
                 getattr(model, "beta_text", 1.0),
-                getattr(model, "beta_query", 1.0),
+                objective_weight_name,
+                getattr(model, objective_weight_name, 1.0),
             )
     else:
         import openpi.models_pytorch.pi0_pytorch as _pi0_pytorch
@@ -3917,10 +3927,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         continue
 
-                    # Backbone backward accumulates into the current outer
-                    # microbatch but is never allowed to trigger a DeepSpeed
-                    # update; the expert phase owns the real outer boundary.
-                    two_phase_update.backward(bb_loss, final_phase=False)
+                    # Backbone backward inherits the outer boundary so ZeRO-2
+                    # finalizes the backbone group, but no update happens yet.
+                    two_phase_update.backward(bb_loss)
 
                     # Capture scalar metrics only on rank 0. The old code called
                     # .item() for every component on all 64 ranks even though only
@@ -4017,7 +4026,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     # phase is marked with the actual outer accumulation
                     # boundary, but the engine update is still deferred until
                     # both graphs have been freed below.
-                    two_phase_update.backward(ex_loss, final_phase=True)
+                    two_phase_update.backward(ex_loss)
 
                     # Capture scalar metrics only on rank 0; all other ranks keep
                     # the training path free of logging-only .item() synchronizations.
