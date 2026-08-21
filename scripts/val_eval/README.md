@@ -28,6 +28,13 @@ not be used for checkpoint selection. The fix builds one fixed, stratified
 index list (episodes from every task, anchors spread across each episode's
 phases) with streaming disabled so `idx` is honored.
 
+This is **on by default** (`TrainConfig.val_deterministic_subset`,
+`val_deterministic_flow`, `val_slow_metrics_every`, `val_log_per_task`), so
+individual train configs do not need to opt in. If a val dataset does not
+expose per-episode index bounds, the trainer logs a warning and falls back to
+the legacy streaming loader. Set `val_deterministic_subset=False` only to
+reproduce a historical run's exact val numbers.
+
 ## Scripts
 
 | Script | Purpose |

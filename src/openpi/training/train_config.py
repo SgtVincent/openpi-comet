@@ -139,12 +139,20 @@ class TrainConfig:
     #     "model improved" with "different data",
     #   * a batch of 8 consecutive frames is effectively ONE sample, so the
     #     effective sample size is ~1/40 of the nominal one.
-    # Enabling val_deterministic_subset builds ONE fixed, stratified index list
+    # val_deterministic_subset builds ONE fixed, stratified index list
     # (val_episodes_per_task episodes from EVERY task, val_anchors_per_episode
     # anchors spread across each episode's phases) and scores exactly that list
     # every time. Measured on B1K: same cost, ~5-7x better precision, 50/50
     # task coverage, and fully reproducible across rounds and checkpoints.
-    val_deterministic_subset: bool = False
+    #
+    # ON by default: the streaming behaviour above is a measurement bug, not a
+    # tuning choice, so individual configs should not have to opt in. Set to
+    # False only to reproduce a historical run's exact val numbers.
+    # If the val dataset does not expose per-episode index bounds (i.e. it is
+    # not a BEHAVIOR-1K style dataset), the trainer logs a warning and falls
+    # back to the legacy streaming loader, so this default is safe for any
+    # dataset.
+    val_deterministic_subset: bool = True
     val_episodes_per_task: int = 10
     val_anchors_per_episode: int = 1
     val_subset_seed: int = 12345
@@ -154,17 +162,28 @@ class TrainConfig:
     # `flow_l1` integrates the predicted velocity field into ACTUAL actions, so
     # it is the offline metric that tracks real policy performance; the cheap
     # `flow_mse` only probes the velocity field at one random tau.
-    val_slow_metrics_every: int = 0
+    #
+    # Every validation by default: on the recommended subset size this costs
+    # ~0.2s/batch of extra Euler integration, which is negligible next to the
+    # value of having the one metric that correlates with task success.
+    val_slow_metrics_every: int = 1
 
     # Make the flow/expert validation metrics deterministic:
     #   * preprocess val images with train=False (no random crop/photometric),
     #   * draw the flow-matching (noise, time) pair from a fixed seed.
     # Without this, `flow_mse`/`expert_loss`/`total_loss` carry a random
     # component that does not shrink with sample count.
-    val_deterministic_flow: bool = False
+    #
+    # ON by default for the same reason as val_deterministic_subset: a val
+    # metric that changes when the weights did not is a bug. NOTE this shifts
+    # the absolute scale of the flow metrics (clean vs augmented images, fixed
+    # vs random tau), so numbers are not comparable with runs that predate it.
+    val_deterministic_flow: bool = True
 
-    # Log per-task validation means (requires val_deterministic_subset).
-    val_log_per_task: bool = False
+    # Log per-task validation means. Requires val_deterministic_subset (the
+    # legacy streaming loader cannot attribute a batch to a task); silently
+    # inactive otherwise.
+    val_log_per_task: bool = True
 
     @property
     def assets_dirs(self) -> pathlib.Path:

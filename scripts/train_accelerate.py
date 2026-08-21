@@ -722,6 +722,14 @@ def build_datasets(config: _config.TrainConfig):
             time.sleep(delay_s)
 
 
+class _StratifiedValUnavailable(Exception):
+    """Raised internally when a stratified val subset cannot be built.
+
+    Used to unwind to the legacy streaming val loader instead of validating on
+    an empty subset.
+    """
+
+
 class _FixedIndexSubset(torch.utils.data.Dataset):
     """Map-style view over an explicit index list, carrying task ids alongside.
 
@@ -882,8 +890,8 @@ def build_val_datasets(config: _config.TrainConfig):
     if not config.val_data:
         return None, None
 
-    # ---- Opt-in: FIXED, task-stratified, reproducible validation subset ----
-    if getattr(config, "val_deterministic_subset", False):
+    # ---- FIXED, task-stratified, reproducible validation subset (default ON) ----
+    if getattr(config, "val_deterministic_subset", True):
         original_data = config.data
         try:
             object.__setattr__(config, "data", config.val_data)
@@ -900,6 +908,18 @@ def build_val_datasets(config: _config.TrainConfig):
             indices, task_ids, coverage = _build_stratified_val_indices(
                 raw, config, logger_=logging.getLogger()
             )
+            if not indices:
+                # The dataset did not expose per-episode index bounds, so no
+                # stratified list could be built (e.g. a non-BEHAVIOR-1K val
+                # dataset). Fall back to the legacy loader rather than running
+                # validation on an empty subset.
+                logging.warning(
+                    "val_deterministic_subset is enabled but no stratified index list "
+                    "could be built from this val dataset (no per-episode bounds). "
+                    "Falling back to the legacy streaming val loader; val metrics will "
+                    "NOT be reproducible or task-stratified for this run."
+                )
+                raise _StratifiedValUnavailable
             ds = _data_loader.transform_dataset(raw, val_dc, skip_norm_stats=False)
             subset = _FixedIndexSubset(ds, indices, task_ids)
 
@@ -931,6 +951,8 @@ def build_val_datasets(config: _config.TrainConfig):
             )
             loader = _DeterministicValLoader(loader, val_dc, subset, coverage)
             return loader, val_dc
+        except _StratifiedValUnavailable:
+            pass  # fall through to the legacy streaming loader below
         finally:
             object.__setattr__(config, "data", original_data)
 
