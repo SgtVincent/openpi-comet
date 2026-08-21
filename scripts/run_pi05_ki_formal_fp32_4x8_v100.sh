@@ -13,9 +13,16 @@
 #   OPENPI_EXPECTED_CODE_COMMIT=$(git rev-parse HEAD) \
 #   bash scripts/run_pi05_ki_formal_fp32_4x8_v100.sh
 #
-# The normal path delegates to the keepalive-on-failure wrapper. The wrapper
-# must remain alive after training success or failure; this launcher therefore
-# forces KEEPALIVE_DISABLE=0 and KEEPALIVE_ON_SUCCESS=1.
+# FORMAL MERLIN ENTRYPOINT (required; do not point Merlin at this file):
+#   OPENPI_KI_TRAINING_INNER=1 \
+#   LAUNCHER=<repo>/scripts/run_pi05_ki_formal_fp32_4x8_v100.sh \
+#   KEEPALIVE_DISABLE=0 KEEPALIVE_ON_SUCCESS=1 STRICT_GPU_COUNT=0 \
+#   bash <repo>/scripts/run_pi05_skillbridge_lq_keepalive_on_failure.sh
+#
+# The keepalive wrapper must be the outermost process so it captures launcher
+# preflight failures as the training rc and keeps holding the allocation. This
+# launcher refuses a normal run without OPENPI_KI_TRAINING_INNER=1, preventing
+# the old nested-wrapper path where a preflight exit could release the job.
 
 set -euo pipefail
 
@@ -36,7 +43,6 @@ fi
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${SCRIPT_PATH}")/.." && pwd)}"
-KEEPALIVE_WRAPPER="${KEEPALIVE_WRAPPER:-${REPO_ROOT}/scripts/run_pi05_skillbridge_lq_keepalive_on_failure.sh}"
 TRAINER="${TRAINER:-${REPO_ROOT}/scripts/train_accelerate.py}"
 ACCEL_CONFIG="${ACCEL_CONFIG:-${REPO_ROOT}/configs/accelerate_ds_zero2_v100_fp32.yaml}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${REPO_ROOT}/configs/deepspeed_zero2_v100_fp32.json}"
@@ -46,7 +52,6 @@ OPENPI_PREFLIGHT_PYTHON="${OPENPI_PREFLIGHT_PYTHON:-/mnt/bn/saiwenresearch/mlx/u
 [[ -f "${TRAINER}" ]] || die "trainer not found: ${TRAINER}"
 [[ -f "${ACCEL_CONFIG}" ]] || die "FP32 Accelerate config not found: ${ACCEL_CONFIG}"
 [[ -f "${DEEPSPEED_CONFIG}" ]] || die "FP32 DeepSpeed config not found: ${DEEPSPEED_CONFIG}"
-[[ -f "${KEEPALIVE_WRAPPER}" ]] || die "keepalive wrapper not found: ${KEEPALIVE_WRAPPER}"
 [[ "${OPENPI_PREFLIGHT_PYTHON}" == /* && -x "${OPENPI_PREFLIGHT_PYTHON}" ]] \
   || die "OPENPI_PREFLIGHT_PYTHON must be an absolute executable path: ${OPENPI_PREFLIGHT_PYTHON}"
 
@@ -291,6 +296,16 @@ if [[ "${OPENPI_LAUNCH_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
+[[ "${OPENPI_KI_TRAINING_INNER:-0}" == "1" ]] \
+  || die "formal Merlin entrypoint must be the outer keepalive wrapper" \
+      "Set OPENPI_KI_TRAINING_INNER=1 and LAUNCHER=${SCRIPT_PATH} on the wrapper."
+[[ "${KEEPALIVE_DISABLE:-}" == "0" ]] \
+  || die "outer keepalive wrapper requires KEEPALIVE_DISABLE=0"
+[[ "${KEEPALIVE_ON_SUCCESS:-}" == "1" ]] \
+  || die "outer keepalive wrapper requires KEEPALIVE_ON_SUCCESS=1"
+[[ "${STRICT_GPU_COUNT:-}" == "0" ]] \
+  || die "outer keepalive wrapper requires STRICT_GPU_COUNT=0"
+
 # The formal configs embed these verified LQ paths. Runtime path substitution is
 # intentionally rejected until it can update every coupled data/assets field;
 # accepting a partial override would silently break A/B input identity.
@@ -319,30 +334,6 @@ export SAVE_INTERVAL VAL_LOG_INTERVAL VAL_NUM_BATCHES
 export BASE_PI05_CKPT B1K_DATASET_ROOT B1K_ASSETS_DIR NORM_STATS_PATH REPO_OPENPI_CACHE
 export PERSISTENT_OUTPUT_ROOT EXP_NAME ASSETS_BASE_DIR CHECKPOINT_BASE_DIR LOG_BASE_DIR
 export ACCEL_CONFIG DEEPSPEED_CONFIG TRAINER REPO_ROOT
-
-if [[ "${OPENPI_KI_TRAINING_INNER:-0}" != "1" ]]; then
-  mkdir -p "${PERSISTENT_OUTPUT_ROOT}"
-  export OPENPI_KI_TRAINING_INNER=1
-  export LAUNCHER="${SCRIPT_PATH}"
-  export KEEPALIVE_STATE_DIR="${PERSISTENT_OUTPUT_ROOT}/keepalive"
-  export OCCUPY_RUNTIME_DIR="${OCCUPY_RUNTIME_DIR:-/tmp/pi05_ki_formal_${ARM_LABEL}_gpu_occupy}"
-  export EXPECTED_GPUS_PER_NODE=8
-  if [[ "${KEEPALIVE_DISABLE:-0}" != "0" ]]; then
-    info "WARN: overriding KEEPALIVE_DISABLE=${KEEPALIVE_DISABLE} to preserve the held allocation."
-  fi
-  if [[ "${KEEPALIVE_ON_SUCCESS:-1}" != "1" ]]; then
-    info "WARN: overriding KEEPALIVE_ON_SUCCESS=${KEEPALIVE_ON_SUCCESS} to preserve the held allocation."
-  fi
-  if [[ "${STRICT_GPU_COUNT:-0}" != "0" ]]; then
-    info "WARN: overriding STRICT_GPU_COUNT=${STRICT_GPU_COUNT}; keepalive wrappers must not fail-fast."
-  fi
-  export KEEPALIVE_DISABLE=0
-  export KEEPALIVE_ON_SUCCESS=1
-  export STRICT_GPU_COUNT=0
-  unset TRAIN_COMMAND
-  info "handing formal training to keepalive wrapper: ${KEEPALIVE_WRAPPER}"
-  exec bash "${KEEPALIVE_WRAPPER}"
-fi
 
 CONDA_ROOT="${CONDA_ROOT:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/miniconda3}"
 CONDA_ENV="${CONDA_ENV:-openpi-comet-nas}"

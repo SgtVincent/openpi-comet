@@ -153,6 +153,10 @@ class _TwoPhaseUpdateController:
             accelerator.deepspeed_engine_wrapped.engine if self._is_deepspeed else None
         )
 
+    @property
+    def is_deepspeed(self) -> bool:
+        return self._is_deepspeed
+
     def backward(self, loss: torch.Tensor, *, final_phase: bool) -> None:
         """Backpropagate one graph under the correct outer boundary."""
 
@@ -164,19 +168,29 @@ class _TwoPhaseUpdateController:
         self._engine.set_gradient_accumulation_boundary(boundary)
         self._engine.backward(loss)
 
-    def step_and_zero_grad(self, optimizer) -> None:
-        """Commit and clear exactly once at an outer optimizer boundary."""
+    def clip_grad_norm_before_step(self, parameters, *, max_norm: float):
+        """Clip before a non-DeepSpeed update; DS clips inside ``engine.step``."""
+
+        if self._is_deepspeed:
+            # Before the first engine step, DeepSpeed's cached global norm is
+            # None. Reading it through Accelerate's clip_grad_norm_ would not
+            # clip anything and would later crash when converted to float.
+            return None
+        return self._accelerator.clip_grad_norm_(parameters, max_norm=max_norm)
+
+    def step_and_zero_grad(self, optimizer):
+        """Commit once and return DeepSpeed's post-step cached grad norm."""
 
         if not self._accelerator.sync_gradients:
-            return
+            return None
         if self._is_deepspeed:
-            # DeepSpeed's engine step owns the real optimizer update and the
-            # single gradient clear. Its Accelerate optimizer wrapper exposes
-            # step()/zero_grad() as no-ops, so do not call those here.
+            # DeepSpeed computes/clips the real norm inside `_take_model_step`,
+            # caches it on the engine, then owns the single gradient clear.
             self._engine.step()
-            return
+            return self._engine.get_global_grad_norm()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        return None
 
     def clear_gradients(self, optimizer) -> None:
         """Discard a partial accumulation after a rejected KI microbatch."""
@@ -188,6 +202,16 @@ class _TwoPhaseUpdateController:
             self._engine.optimizer.zero_grad()
             return
         optimizer.zero_grad(set_to_none=True)
+
+
+def _grad_norm_to_float(grad_norm) -> float:
+    """Convert a reported norm for logging without ever calling ``float(None)``."""
+
+    if grad_norm is None:
+        return float("nan")
+    if isinstance(grad_norm, torch.Tensor):
+        return float(grad_norm.item())
+    return float(grad_norm)
 
 
 def _get_wandb():
@@ -4615,12 +4639,23 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     clip_threshold = float(
                         default_clip_threshold if clip_threshold_override is None else clip_threshold_override
                     )
-                    if _debug_overflow_enabled(config):
+                    deepspeed_two_phase_update = is_pi05_ki_joint and two_phase_update.is_deepspeed
+                    if _debug_overflow_enabled(config) and not deepspeed_two_phase_update:
                         grad_stats_pre = _collect_grad_debug_stats(optim_params, accelerator)
 
-                    grad_norm = accelerator.clip_grad_norm_(optim_params, max_norm=clip_threshold)
-                    grad_norm_value = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
-                    if not np.isfinite(grad_norm_value):
+                    # DeepSpeed's cached global norm is unavailable before the
+                    # first engine step. For two-phase KI, clipping and norm
+                    # computation are owned by the single engine.step below.
+                    if deepspeed_two_phase_update:
+                        grad_norm = None
+                    elif is_pi05_ki_joint:
+                        grad_norm = two_phase_update.clip_grad_norm_before_step(
+                            optim_params, max_norm=clip_threshold
+                        )
+                    else:
+                        grad_norm = accelerator.clip_grad_norm_(optim_params, max_norm=clip_threshold)
+                    grad_norm_value = _grad_norm_to_float(grad_norm)
+                    if not deepspeed_two_phase_update and not np.isfinite(grad_norm_value):
                         total_nonfinite_grad_updates += 1
                         if accelerator.distributed_type == DistributedType.DEEPSPEED and let_deepspeed_handle_nonfinite_grad:
                             if is_main:
@@ -4659,7 +4694,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 )
                             continue
 
-                    if _debug_overflow_enabled(config):
+                    if _debug_overflow_enabled(config) and not deepspeed_two_phase_update:
                         grad_stats_post = _collect_grad_debug_stats(optim_params, accelerator)
                         if is_main:
                             clipping_triggered = grad_norm_value > clip_threshold
@@ -4710,7 +4745,24 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     if profile_memory:
                         _reset_peak_memory_stats(accelerator)
                     if is_pi05_ki_joint:
-                        two_phase_update.step_and_zero_grad(optimizer)
+                        post_step_grad_norm = two_phase_update.step_and_zero_grad(optimizer)
+                        if deepspeed_two_phase_update:
+                            # DeepSpeed populates this cache inside
+                            # `_take_model_step`, after its clipping/optimizer
+                            # logic and before it clears the partitioned grads.
+                            grad_norm_value = _grad_norm_to_float(post_step_grad_norm)
+                            if not np.isfinite(grad_norm_value):
+                                total_nonfinite_grad_updates += 1
+                                if is_main:
+                                    logging.warning(
+                                        "DeepSpeed reported a non-finite or unavailable post-step grad_norm at "
+                                        "global_step=%s loss=%.6f grad_norm=%s; the engine already handled "
+                                        "clipping/overflow. total_nonfinite_grad_updates=%s",
+                                        global_step,
+                                        loss_for_log,
+                                        grad_norm_value,
+                                        total_nonfinite_grad_updates,
+                                    )
                     else:
                         optimizer.step()
                     step_was_skipped = accelerator.optimizer_step_was_skipped
