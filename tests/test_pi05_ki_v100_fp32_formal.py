@@ -1,3 +1,4 @@
+# ruff: noqa: SLF001 - contract tests intentionally inspect private checkpoint state.
 """CPU contracts for formal 4x8 V100 FP32 π0.5-KI A/B training."""
 
 from __future__ import annotations
@@ -9,8 +10,10 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _LAUNCHER = _REPO_ROOT / "scripts/run_pi05_ki_formal_fp32_4x8_v100.sh"
@@ -83,6 +86,11 @@ def test_formal_v100_configs_are_exactly_matched_outside_objective():
     assert variant_a.checkpoint_base_dir != variant_b.checkpoint_base_dir
     assert variant_a.log_base_dir != variant_b.log_base_dir
 
+    # The formal FAST segment uses the next 32-token boundary above the observed
+    # 73-token maximum. Variant B has no FAST target and remains unchanged.
+    assert variant_a.model.action_token_max_len == 96
+    assert not hasattr(variant_b.model, "action_token_max_len")
+
     a_fields = {field.name for field in dataclasses.fields(variant_a.model)}
     b_fields = {field.name for field in dataclasses.fields(variant_b.model)}
     assert a_fields - b_fields == {"action_token_max_len", "beta_action", "pi05_ki_joint_fast"}
@@ -111,9 +119,125 @@ def test_training_loop_routes_both_ki_phases_through_single_step_controller():
     assert "boundary = bool(self._accelerator.sync_gradients)" in source
     assert "post_step_grad_norm = two_phase_update.step_and_zero_grad(optimizer)" in source
     assert "grad_norm_value = _grad_norm_to_float(post_step_grad_norm)" in source
+    assert "model.gradient_checkpointing_enable()" in source
     assert "deepspeed_two_phase_update" in source
     assert "accelerator.backward(bb_loss)" not in source
     assert "accelerator.backward(ex_loss)" not in source
+
+
+def test_recursive_gradient_checkpointing_reaches_decoder_layers_and_recomputes():
+    """Formal GC must checkpoint real Gemma layers and preserve KV-cache handling."""
+    from openpi.models import gemma as _gemma
+    from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+    from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+    from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
+
+    tiny = _gemma.Config(
+        width=128,
+        depth=2,
+        mlp_dim=256,
+        num_heads=8,
+        num_kv_heads=1,
+        head_dim=16,
+    )
+    joint = PaliGemmaWithExpertModel(tiny, tiny, precision="float32")
+    wrapper = SimpleNamespace(
+        paligemma_with_expert=joint,
+        gradient_checkpointing_enabled=False,
+    )
+
+    PI0Pytorch.gradient_checkpointing_enable(wrapper)
+    backbone = joint.paligemma.language_model
+    expert = joint.gemma_expert.model
+    assert wrapper.gradient_checkpointing_enabled is True
+    assert backbone.is_gradient_checkpointing
+    assert expert.is_gradient_checkpointing
+    assert all(layer.gradient_checkpointing for layer in backbone.layers)
+    assert all(layer.gradient_checkpointing for layer in expert.layers)
+    assert all(hasattr(layer, "_gradient_checkpointing_func") for layer in backbone.layers)
+
+    # The phase-2 prefix pass needs a cache. Its context must recursively disable
+    # only backbone decoder checkpointing, then restore the exact policy.
+    query_model = PI05KIJointQueryPytorch.__new__(PI05KIJointQueryPytorch)
+    torch.nn.Module.__init__(query_model)
+    query_model.paligemma_with_expert = joint
+    old_use_cache = backbone.config.use_cache
+    backbone_gc_modules = [
+        module for module in backbone.modules() if hasattr(module, "gradient_checkpointing")
+    ]
+    backbone_flags = [module.gradient_checkpointing for module in backbone_gc_modules]
+    backbone_checkpoint_funcs = [
+        module._gradient_checkpointing_func for module in backbone_gc_modules
+    ]
+    expert_flags = [
+        module.gradient_checkpointing
+        for module in expert.modules()
+        if hasattr(module, "gradient_checkpointing")
+    ]
+    cache_inputs = torch.randn(1, 4, tiny.width)
+    cache_positions = torch.arange(4).unsqueeze(0)
+    _, active_gc_cache = joint.forward(
+        position_ids=cache_positions,
+        inputs_embeds=[cache_inputs, None],
+        use_cache=True,
+    )
+    assert active_gc_cache is None, "HF disables cache while decoder checkpointing is active"
+
+    def _probe_context_then_raise():
+        with query_model._no_gc_on_backbone():
+            assert not backbone.is_gradient_checkpointing
+            assert not any(layer.gradient_checkpointing for layer in backbone.layers)
+            assert expert.is_gradient_checkpointing
+            assert backbone.config.use_cache is True
+            _, prefix_cache = joint.forward(
+                position_ids=cache_positions,
+                inputs_embeds=[cache_inputs, None],
+                use_cache=True,
+            )
+            assert prefix_cache is not None
+            assert prefix_cache.get_seq_length() == 4
+            raise RuntimeError("cache probe")
+
+    with pytest.raises(RuntimeError, match="cache probe"):
+        _probe_context_then_raise()
+    assert [module.gradient_checkpointing for module in backbone_gc_modules] == backbone_flags
+    assert [module._gradient_checkpointing_func for module in backbone_gc_modules] == backbone_checkpoint_funcs
+    assert [
+        module.gradient_checkpointing
+        for module in expert.modules()
+        if hasattr(module, "gradient_checkpointing")
+    ] == expert_flags
+    assert backbone.is_gradient_checkpointing
+    assert all(layer.gradient_checkpointing for layer in backbone.layers)
+    assert expert.is_gradient_checkpointing
+    assert backbone.config.use_cache is old_use_cache
+
+    # Count a real projection call in each decoder. Activation checkpointing
+    # runs it once in forward and once again during backward recomputation.
+    joint.train()
+    call_counts = [0 for _ in backbone.layers]
+    hooks = []
+    for index, layer in enumerate(backbone.layers):
+        def _count_call(_module, _inputs, _output, *, index=index):
+            call_counts[index] += 1
+
+        hooks.append(layer.self_attn.q_proj.register_forward_hook(_count_call))
+    try:
+        inputs = torch.randn(1, 4, tiny.width, requires_grad=True)
+        positions = torch.arange(4).unsqueeze(0)
+        (output, _), cache = joint.forward(
+            position_ids=positions,
+            inputs_embeds=[inputs, None],
+            use_cache=False,
+        )
+        assert cache is None
+        assert call_counts == [1, 1]
+        output.sum().backward()
+        assert call_counts == [2, 2]
+        assert inputs.grad is not None
+    finally:
+        for hook in hooks:
+            hook.remove()
 
 
 def test_model_loaded_banner_is_arm_correct():
@@ -148,6 +272,8 @@ def test_formal_launcher_is_not_debug_and_locks_the_full_contract():
     assert "formal runtime dataset root is pinned" in source
     assert "formal runtime assets are pinned" in source
     assert "formal runtime norm stats are pinned" in source
+    assert 'FORMAL_CUDA_ALLOC_CONF="expandable_segments:True"' in source
+    assert "formal V100 requires PYTORCH_CUDA_ALLOC_CONF=" in source
 
 
 def test_formal_deepspeed_file_is_fp32_zero2_cpu_offload():
@@ -216,6 +342,7 @@ esac
         "ACCELERATE_MIXED_PRECISION",
         "WANDB_MODE",
         "WANDB_DISABLED",
+        "PYTORCH_CUDA_ALLOC_CONF",
     ):
         env.pop(variable, None)
     env.update(
@@ -276,6 +403,15 @@ def test_formal_launcher_cpu_preflight_is_strict_and_side_effect_free(
     assert f"FORMAL_CONFIG_PREFLIGHT_OK name={expected_config}" in combined
     assert "PREFLIGHT_OK" in combined
     assert ("FAST_OFFLINE_PROCESSOR_PREFLIGHT_OK" in combined) is fast_expected
+    assert not output.exists()
+
+
+def test_formal_launcher_rejects_incompatible_allocator_contract(formal_preflight_env):
+    env, output = formal_preflight_env
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    result = _run_formal_preflight(env, "B")
+    assert result.returncode != 0
+    assert "formal V100 requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in result.stderr
     assert not output.exists()
 
 

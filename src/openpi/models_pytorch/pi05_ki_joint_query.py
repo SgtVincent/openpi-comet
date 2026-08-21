@@ -415,26 +415,40 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
 
     @contextlib.contextmanager
     def _no_gc_on_backbone(self):
-        """Temporarily disable gradient checkpointing on the backbone language model.
+        """Temporarily disable recursive backbone GC while building the KV cache.
 
-        PaliGemmaWithExpertModel.forward() forces gradient checkpointing ON
-        in training mode (gemma_pytorch.py), which disables ``use_cache`` and
-        returns ``past_key_values=None``.  We need KV cache for the expert's
-        cross-attention, so we temporarily disable GC during prefix encoding.
-
-        Also saves/restores ``config.use_cache`` for robustness.
+        Decoder layers, not only ``GemmaModel``, own the checkpointing hooks in
+        Transformers 4.53. A top-level boolean therefore cannot make
+        ``use_cache=True`` safe after recursive checkpointing is enabled. Snapshot
+        every backbone checkpoint flag and function, disable them for this
+        prefix-only cache pass, then restore the exact per-module state even on
+        exceptions. The expert checkpointing state is deliberately untouched.
         """
         lm = self.paligemma_with_expert.paligemma.language_model
-        old_gc = getattr(lm, "gradient_checkpointing", False)
+        missing = object()
+        gc_states = [
+            (
+                module,
+                module.gradient_checkpointing,
+                getattr(module, "_gradient_checkpointing_func", missing),
+            )
+            for module in lm.modules()
+            if hasattr(module, "gradient_checkpointing")
+        ]
         old_use_cache = getattr(lm.config, "use_cache", True)
         try:
-            if old_gc:
-                lm.gradient_checkpointing = False
+            for module, _enabled, _checkpoint_func in gc_states:
+                module.gradient_checkpointing = False
             lm.config.use_cache = True
             yield
         finally:
-            if old_gc:
-                lm.gradient_checkpointing = old_gc
+            for module, enabled, checkpoint_func in gc_states:
+                module.gradient_checkpointing = enabled
+                if checkpoint_func is missing:
+                    if hasattr(module, "_gradient_checkpointing_func"):
+                        delattr(module, "_gradient_checkpointing_func")
+                else:
+                    module._gradient_checkpointing_func = checkpoint_func
             lm.config.use_cache = old_use_cache
 
     def compute_expert_loss(

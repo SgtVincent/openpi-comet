@@ -861,6 +861,9 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         batch_size_per_gpu=1,
         gradient_accumulation_steps=8,
         action_repr="fast_ce",
+        # GPU data contract: observed maximum is 73 including BOS/EOS. The next
+        # 32-token boundary leaves 23 tokens (31.5%) of measured headroom.
+        action_token_max_len=96,
         precision="float32",
     ),
     _make_pi05_ki_joint_full_task_set_config(

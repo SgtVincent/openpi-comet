@@ -48,6 +48,16 @@ ACCEL_CONFIG="${ACCEL_CONFIG:-${REPO_ROOT}/configs/accelerate_ds_zero2_v100_fp32
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${REPO_ROOT}/configs/deepspeed_zero2_v100_fp32.json}"
 OPENPI_PREFLIGHT_PYTHON="${OPENPI_PREFLIGHT_PYTHON:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python}"
 
+# This must be exported before any Python process imports torch. It supplements
+# recursive activation checkpointing by reducing allocator fragmentation; it is
+# not the primary OOM fix. Reject inherited alternatives so the formal runtime
+# cannot silently drift to a configuration that lacks expandable segments.
+FORMAL_CUDA_ALLOC_CONF="expandable_segments:True"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-${FORMAL_CUDA_ALLOC_CONF}}"
+[[ "${PYTORCH_CUDA_ALLOC_CONF}" == "${FORMAL_CUDA_ALLOC_CONF}" ]] \
+  || die "formal V100 requires PYTORCH_CUDA_ALLOC_CONF=${FORMAL_CUDA_ALLOC_CONF}, got '${PYTORCH_CUDA_ALLOC_CONF}'"
+export PYTORCH_CUDA_ALLOC_CONF
+
 [[ -d "${REPO_ROOT}/.git" || -f "${REPO_ROOT}/.git" ]] || die "REPO_ROOT is not a git worktree: ${REPO_ROOT}"
 [[ -f "${TRAINER}" ]] || die "trainer not found: ${TRAINER}"
 [[ -f "${ACCEL_CONFIG}" ]] || die "FP32 Accelerate config not found: ${ACCEL_CONFIG}"
@@ -244,6 +254,10 @@ checks = {
     "decay0": config.lr_schedule.decay_lr == 0.0,
     "online W&B": config.wandb_enabled is True and config.project_name == "pi05_ki",
 }
+if expected_model == "pi05_ki_joint_fast":
+    checks["FAST action capacity 96"] = config.model.action_token_max_len == 96
+else:
+    checks["query arm has no FAST target"] = not hasattr(config.model, "action_token_max_len")
 failed = [label for label, ok in checks.items() if not ok]
 if failed:
     raise SystemExit(f"ERROR: formal config {name!r} failed: " + "; ".join(failed))

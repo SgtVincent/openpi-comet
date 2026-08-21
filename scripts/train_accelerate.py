@@ -3772,9 +3772,18 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+        # A formal launcher may set this before Python imports torch, which is
+        # when the allocator configuration must take effect. Never overwrite an
+        # explicitly validated launch contract after CUDA/model initialization.
+        os.environ.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True"
+        )
         if is_main:
-            logging.info("Enabled memory optimizations for 8+ GPU training")
+            logging.info(
+                "Enabled memory optimizations for 8+ GPU training "
+                "(PYTORCH_CUDA_ALLOC_CONF=%s)",
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"],
+            )
 
     # Weight loading for fine-tuning.
     if config.pytorch_weight_path is not None:
