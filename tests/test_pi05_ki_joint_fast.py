@@ -11,6 +11,8 @@ cannot be constructed rather than failing the suite.
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 import torch
@@ -20,6 +22,26 @@ from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 BASE_LEN = 4
 SUBTASK_MAX = 8
 ACTION_MAX = 10
+ACTION_TOKEN_FIELDS = (
+    "action_tokens",
+    "action_token_mask",
+    "action_token_loss_mask",
+    "action_token_ar_mask",
+)
+
+
+def _make_action_token_observation():
+    from openpi.models.model import Observation
+
+    return Observation(
+        images={"base_0_rgb": torch.zeros(1, 2, 2, 3)},
+        image_masks={"base_0_rgb": torch.ones(1, dtype=torch.bool)},
+        state=torch.zeros(1, 7),
+        action_tokens=torch.arange(4, dtype=torch.int32).reshape(1, 4),
+        action_token_mask=torch.ones(1, 4, dtype=torch.bool),
+        action_token_loss_mask=torch.tensor([[False, True, True, True]]),
+        action_token_ar_mask=torch.ones(1, 4, dtype=torch.int32),
+    )
 
 
 def _build_sequence(n_subtask: int, n_action: int):
@@ -106,6 +128,68 @@ class TestVariantAAttentionLayout:
         joint = make_att_2d_masks(pad, att)[0]
         prefix_only = make_att_2d_masks(pad[:, :prefix_len], att[:, :prefix_len])[0]
         assert torch.equal(joint[:prefix_len, :prefix_len], prefix_only)
+
+
+class TestVariantADeviceRouting:
+    def test_action_token_fields_move_together_and_preserve_none(self):
+        """CPU-safe regression for the step-0 multi-GPU device mismatch."""
+        from scripts import train_accelerate
+
+        observation = _make_action_token_observation()
+        moved = train_accelerate._move_observation_to_device(observation, torch.device("meta"))
+
+        for field in ACTION_TOKEN_FIELDS:
+            assert getattr(moved, field).device.type == "meta", field
+
+        without_action_targets = observation.replace(**{field: None for field in ACTION_TOKEN_FIELDS})
+        moved_without_targets = train_accelerate._move_observation_to_device(
+            without_action_targets, torch.device("meta")
+        )
+        for field in ACTION_TOKEN_FIELDS:
+            assert getattr(moved_without_targets, field) is None, field
+
+    def test_train_and_validation_share_action_token_transfer_helper(self):
+        """Both explicit Observation.replace paths must use the tested helper."""
+        from scripts import train_accelerate
+
+        for function in (train_accelerate.train_loop, train_accelerate.run_validation):
+            source = inspect.getsource(function)
+            assert source.count("_move_observation_to_device(observation, accelerator.device)") == 1, (
+                function.__name__
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+    def test_cuda_embedding_receives_cuda_action_indices(self):
+        """Exercise the original CPU-index/GPU-weight failure boundary on CUDA."""
+        from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch
+        from scripts import train_accelerate
+
+        class _FakePaliGemmaWithExpert:
+            def __init__(self):
+                self.embedding = torch.nn.Embedding(8, 4, device="cuda")
+                self.seen_tokens = None
+
+            def embed_language_tokens(self, tokens):
+                self.seen_tokens = tokens
+                return self.embedding(tokens)
+
+        fake_paligemma = _FakePaliGemmaWithExpert()
+        fake_model = type("FakeModel", (), {"paligemma_with_expert": fake_paligemma})()
+        observation = train_accelerate._move_observation_to_device(
+            _make_action_token_observation(), torch.device("cuda")
+        )
+
+        embeddings, pad_masks, attention_masks = PI05KIJointFastPytorch._embed_action_tokens(
+            fake_model,
+            action_tokens=observation.action_tokens,
+            action_token_mask=observation.action_token_mask,
+            target_dtype=torch.float32,
+        )
+
+        assert fake_paligemma.seen_tokens.device.type == "cuda"
+        assert embeddings.device.type == "cuda"
+        assert pad_masks.device.type == "cuda"
+        assert attention_masks.device.type == "cuda"
 
 
 class TestVariantAConfig:

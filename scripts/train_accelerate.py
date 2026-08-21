@@ -2368,6 +2368,37 @@ def _atomic_write_checkpoint_dir(tmp_dir: Path, final_dir: Path) -> None:
     tmp_dir.rename(final_dir)
 
 
+def _move_observation_to_device(observation, device: torch.device):
+    """Move every tensor in an Observation, including Variant A targets."""
+
+    def _maybe_to(x: torch.Tensor | None) -> torch.Tensor | None:
+        if x is None:
+            return None
+        return x.to(device, non_blocking=True)
+
+    # Observation is a flax.struct.dataclass, not a dm-tree container, so its
+    # optional fields must be routed explicitly. Keep this list centralized for
+    # both training and validation to prevent newly added fields from drifting.
+    return observation.replace(
+        images={k: v.to(device, non_blocking=True) for k, v in observation.images.items()},
+        image_masks={k: v.to(device, non_blocking=True) for k, v in observation.image_masks.items()},
+        state=observation.state.to(device, non_blocking=True),
+        tokenized_prompt=_maybe_to(observation.tokenized_prompt),
+        tokenized_prompt_mask=_maybe_to(observation.tokenized_prompt_mask),
+        token_ar_mask=_maybe_to(observation.token_ar_mask),
+        token_loss_mask=_maybe_to(observation.token_loss_mask),
+        subtask_tokens=_maybe_to(observation.subtask_tokens),
+        subtask_mask=_maybe_to(observation.subtask_mask),
+        subtask_loss_mask=_maybe_to(observation.subtask_loss_mask),
+        subtask_ar_mask=_maybe_to(observation.subtask_ar_mask),
+        action_tokens=_maybe_to(observation.action_tokens),
+        action_token_mask=_maybe_to(observation.action_token_mask),
+        action_token_loss_mask=_maybe_to(observation.action_token_loss_mask),
+        action_token_ar_mask=_maybe_to(observation.action_token_ar_mask),
+        pcd_xyz=_maybe_to(observation.pcd_xyz),
+    )
+
+
 def run_validation(
     *,
     accelerator: Accelerator,
@@ -2435,27 +2466,7 @@ def run_validation(
 
                 # Move data to device
                 if _model is not None and isinstance(observation, _model.Observation):
-                    device = accelerator.device
-
-                    def _maybe_to_val(x, *, target_device=device):
-                        if x is None:
-                            return None
-                        return x.to(target_device, non_blocking=True)
-
-                    observation = observation.replace(
-                        images={k: v.to(device, non_blocking=True) for k, v in observation.images.items()},
-                        image_masks={k: v.to(device, non_blocking=True) for k, v in observation.image_masks.items()},
-                        state=observation.state.to(device, non_blocking=True),
-                        tokenized_prompt=_maybe_to_val(observation.tokenized_prompt),
-                        tokenized_prompt_mask=_maybe_to_val(observation.tokenized_prompt_mask),
-                        token_ar_mask=_maybe_to_val(observation.token_ar_mask),
-                        token_loss_mask=_maybe_to_val(observation.token_loss_mask),
-                        subtask_tokens=_maybe_to_val(observation.subtask_tokens),
-                        subtask_mask=_maybe_to_val(observation.subtask_mask),
-                        subtask_loss_mask=_maybe_to_val(observation.subtask_loss_mask),
-                        subtask_ar_mask=_maybe_to_val(observation.subtask_ar_mask),
-                        pcd_xyz=_maybe_to_val(observation.pcd_xyz),
-                    )
+                    observation = _move_observation_to_device(observation, accelerator.device)
                 else:
                     observation = tree.map_structure(
                         lambda x: x.to(accelerator.device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
@@ -3571,31 +3582,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             # NOTE: Observation is a flax.struct.dataclass, which is *not* a dm-tree container.
             # tree.map_structure would treat it as a leaf and leave nested tensors on CPU.
             if _model is not None and isinstance(observation, _model.Observation):
-                device = accelerator.device
-
-                def _maybe_to(
-                    x: torch.Tensor | None,
-                    *,
-                    target_device: torch.device = device,
-                ) -> torch.Tensor | None:
-                    if x is None:
-                        return None
-                    return x.to(target_device, non_blocking=True)
-
-                observation = observation.replace(
-                    images={k: v.to(device, non_blocking=True) for k, v in observation.images.items()},
-                    image_masks={k: v.to(device, non_blocking=True) for k, v in observation.image_masks.items()},
-                    state=observation.state.to(device, non_blocking=True),
-                    tokenized_prompt=_maybe_to(observation.tokenized_prompt),
-                    tokenized_prompt_mask=_maybe_to(observation.tokenized_prompt_mask),
-                    token_ar_mask=_maybe_to(observation.token_ar_mask),
-                    token_loss_mask=_maybe_to(observation.token_loss_mask),
-                    subtask_tokens=_maybe_to(observation.subtask_tokens),
-                    subtask_mask=_maybe_to(observation.subtask_mask),
-                    subtask_loss_mask=_maybe_to(observation.subtask_loss_mask),
-                    subtask_ar_mask=_maybe_to(observation.subtask_ar_mask),
-                    pcd_xyz=_maybe_to(observation.pcd_xyz),
-                )
+                observation = _move_observation_to_device(observation, accelerator.device)
             else:
                 observation = tree.map_structure(
                     lambda x: x.to(accelerator.device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
