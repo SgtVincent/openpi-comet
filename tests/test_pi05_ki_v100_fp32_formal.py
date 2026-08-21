@@ -108,7 +108,9 @@ def test_training_loop_routes_both_ki_phases_through_single_step_controller():
     source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
     assert "two_phase_update.backward(bb_loss, final_phase=False)" in source
     assert "two_phase_update.backward(ex_loss, final_phase=True)" in source
-    assert "two_phase_update.step_and_zero_grad(optimizer)" in source
+    assert "post_step_grad_norm = two_phase_update.step_and_zero_grad(optimizer)" in source
+    assert "grad_norm_value = _grad_norm_to_float(post_step_grad_norm)" in source
+    assert "deepspeed_two_phase_update" in source
     assert "accelerator.backward(bb_loss)" not in source
     assert "accelerator.backward(ex_loss)" not in source
 
@@ -129,8 +131,10 @@ def test_formal_launcher_is_not_debug_and_locks_the_full_contract():
     assert "status --porcelain --untracked-files=all" in source
     assert 'export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src' in source
     assert "openpi.__file__" in source
-    assert "KEEPALIVE_DISABLE=0" in source
-    assert "KEEPALIVE_ON_SUCCESS=1" in source
+    assert "KEEPALIVE_DISABLE=0 KEEPALIVE_ON_SUCCESS=1 STRICT_GPU_COUNT=0" in source
+    assert "formal Merlin entrypoint must be the outer keepalive wrapper" in source
+    assert 'OPENPI_KI_TRAINING_INNER:-0}" == "1"' in source
+    assert 'exec bash "${KEEPALIVE_WRAPPER}"' not in source
     assert "OPENPI_REUSE_PREFIX_KV remains HOLD" in source
     assert "formal runtime base checkpoint is pinned" in source
     assert "formal runtime dataset root is pinned" in source
@@ -264,6 +268,15 @@ def test_formal_launcher_cpu_preflight_is_strict_and_side_effect_free(
     assert f"FORMAL_CONFIG_PREFLIGHT_OK name={expected_config}" in combined
     assert "PREFLIGHT_OK" in combined
     assert ("FAST_OFFLINE_PROCESSOR_PREFLIGHT_OK" in combined) is fast_expected
+    assert not output.exists()
+
+
+def test_formal_launcher_normal_run_rejects_missing_outer_wrapper_contract(formal_preflight_env):
+    env, output = formal_preflight_env
+    env["OPENPI_LAUNCH_PREFLIGHT_ONLY"] = "0"
+    result = _run_formal_preflight(env, "B")
+    assert result.returncode != 0
+    assert "formal Merlin entrypoint must be the outer keepalive wrapper" in result.stderr
     assert not output.exists()
 
 

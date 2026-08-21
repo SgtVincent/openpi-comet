@@ -351,6 +351,7 @@ class _FakeDeepSpeedEngine:
         self.step_calls = 0
         self.optimizer = _FakeDeepSpeedOptimizer(self)
         self._boundary = None
+        self._global_grad_norm = None
 
     def set_gradient_accumulation_boundary(self, boundary):
         self._boundary = bool(boundary)
@@ -364,7 +365,11 @@ class _FakeDeepSpeedEngine:
         assert self._boundary is True
         self.step_calls += 1
         self.step_gradients.append(dict(self.gradients))
+        self._global_grad_norm = torch.tensor(12.5)
         self.optimizer.zero_grad()
+
+    def get_global_grad_norm(self):
+        return self._global_grad_norm
 
 
 class _FakeOptimizer:
@@ -382,10 +387,15 @@ class _FakeOptimizer:
 
 def _deepspeed_controller(trainer):
     engine = _FakeDeepSpeedEngine()
+
+    def fail_pre_step_clip(*_args, **_kwargs):
+        pytest.fail("DeepSpeed KI must not read the pre-step cached grad norm")
+
     accelerator = SimpleNamespace(
         distributed_type=trainer.DistributedType.DEEPSPEED,
         sync_gradients=False,
         deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+        clip_grad_norm_=fail_pre_step_clip,
     )
     return trainer._TwoPhaseUpdateController(accelerator), accelerator, engine
 
@@ -401,12 +411,15 @@ def test_two_phase_deepspeed_updates_once_after_both_phases(trainer, grad_accum)
         assert engine.boundaries[-1] is False
         controller.backward("expert", final_phase=True)
         assert engine.boundaries[-1] is accelerator.sync_gradients
-        controller.step_and_zero_grad(optimizer_wrapper)
+        reported_grad_norm = controller.step_and_zero_grad(optimizer_wrapper)
 
         if microbatch < grad_accum:
+            assert reported_grad_norm is None
             assert engine.step_calls == 0
             assert engine.optimizer.zero_grad_calls == 0
             assert engine.gradients == {"backbone": microbatch, "expert": microbatch}
+        else:
+            assert trainer._grad_norm_to_float(reported_grad_norm) == pytest.approx(12.5)
 
     assert engine.backward_phases == ["backbone", "expert"] * grad_accum
     assert engine.boundaries == [False, False] * (grad_accum - 1) + [False, True]
@@ -416,15 +429,45 @@ def test_two_phase_deepspeed_updates_once_after_both_phases(trainer, grad_accum)
     assert engine.gradients == {"backbone": 0, "expert": 0}
 
 
+def test_deepspeed_grad_norm_is_read_only_after_single_engine_step(trainer):
+    controller, accelerator, engine = _deepspeed_controller(trainer)
+    optimizer_wrapper = SimpleNamespace()
+
+    assert engine.get_global_grad_norm() is None
+    assert controller.clip_grad_norm_before_step([], max_norm=1.0) is None
+    assert engine.step_calls == 0
+
+    accelerator.sync_gradients = True
+    controller.backward("backbone", final_phase=False)
+    controller.backward("expert", final_phase=True)
+    reported_grad_norm = controller.step_and_zero_grad(optimizer_wrapper)
+
+    assert engine.step_calls == 1
+    assert engine.optimizer.zero_grad_calls == 1
+    assert trainer._grad_norm_to_float(reported_grad_norm) == pytest.approx(12.5)
+
+
 def test_two_phase_non_deepspeed_retains_standard_optimizer_semantics(trainer):
     backward_calls = []
+    clip_calls = []
+
+    def clip_grad_norm(parameters, *, max_norm):
+        clip_calls.append((parameters, max_norm))
+        return torch.tensor(3.25)
+
     accelerator = SimpleNamespace(
         distributed_type="NO",
         sync_gradients=False,
         backward=backward_calls.append,
+        clip_grad_norm_=clip_grad_norm,
     )
     controller = trainer._TwoPhaseUpdateController(accelerator)
     optimizer = _FakeOptimizer()
+    parameters = [object()]
+    assert trainer._grad_norm_to_float(
+        controller.clip_grad_norm_before_step(parameters, max_norm=1.0)
+    ) == pytest.approx(3.25)
+    assert clip_calls == [(parameters, 1.0)]
 
     for microbatch in range(1, 9):
         accelerator.sync_gradients = microbatch == 8
