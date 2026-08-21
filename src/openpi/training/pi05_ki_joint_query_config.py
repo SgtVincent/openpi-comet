@@ -13,6 +13,7 @@ Precision variants:
 - ``*_smoke_fp32``: float32 (V100 smoke test, numerically stable but slower)
 - ``*_bf16``: bfloat16 (formal HL/Arnold training precision)
 - ``*_v100_fp32_debug``: matched full-task Variant A/B smoke configs for 4x8 V100
+- ``*_v100_fp32``: formal B1/GPU, GA8, global-batch-256 Variant A/B configs
 """
 
 from pathlib import Path
@@ -599,6 +600,7 @@ def _make_pi05_ki_joint_full_task_set_config(
     decay_steps: int = 104_912,
     decay_lr: float = 0.0,
     batch_size_per_gpu: int = 8,
+    gradient_accumulation_steps: int = 1,
     save_interval: int = 10_000,
     val_log_interval: int = 1_000,
     val_num_batches: int = 20,
@@ -703,7 +705,7 @@ def _make_pi05_ki_joint_full_task_set_config(
         log_base_dir=f"{output_root}/logs",
         num_workers=2,
         batch_size_per_gpu=batch_size_per_gpu,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         save_interval=save_interval,
         checkpoint_policy="step",
         rolling_checkpoint_interval=10_000,
@@ -846,6 +848,30 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_fast_b1k-full_task-ki_on_bf16",
         action_repr="fast_ce",
+    ),
+    # Formal 4x8 V100 FP32 pair. B1/GPU x world32 x GA8 preserves the formal
+    # global batch 256, optimizer-step budget, pass boundaries and exposure.
+    # LQ-compatible data/checkpoint inputs are explicit; launcher-level path
+    # overrides must pass the same strict formal contract before training.
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32",
+        behavior_dataset_root=_B1K_DATA_ROOT,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        batch_size_per_gpu=1,
+        gradient_accumulation_steps=8,
+        action_repr="fast_ce",
+        precision="float32",
+    ),
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32",
+        behavior_dataset_root=_B1K_DATA_ROOT,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        batch_size_per_gpu=1,
+        gradient_accumulation_steps=8,
+        action_repr="query_mse",
+        precision="float32",
     ),
     # Matched 4x8 V100 FP32 debug pair. These deliberately use B1 and a five-
     # step budget: the goal is to validate end-to-end wiring and memory safety,

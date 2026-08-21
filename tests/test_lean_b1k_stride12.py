@@ -284,13 +284,41 @@ def trainer():
     return _load_train_accelerate()
 
 
-def _formal_config_stub(*, resume=False, prepare_only=False):
+def _formal_config_stub(
+    *,
+    name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
+    resume=False,
+    prepare_only=False,
+):
+    is_v100 = name.endswith("_v100_fp32")
+
+    def data_config(episodes):
+        return SimpleNamespace(
+            base_config=SimpleNamespace(
+                tasks=None,
+                episodes_index=episodes,
+                skill_bridge=SimpleNamespace(enabled=False),
+            )
+        )
+
     return SimpleNamespace(
-        name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
-        batch_size_per_gpu=8,
-        gradient_accumulation_steps=1,
+        name=name,
+        pytorch_model_name=("pi05_ki_joint_fast" if "joint_fast" in name else "pi05_ki_joint_query"),
+        data=[data_config(list(range(180)))],
+        val_data=[data_config(list(range(180, 200)))],
+        batch_size_per_gpu=1 if is_v100 else 8,
+        gradient_accumulation_steps=8 if is_v100 else 1,
+        pytorch_training_precision="float32" if is_v100 else "bfloat16",
+        accelerate_mixed_precision="no" if is_v100 else "bf16",
         num_train_steps=104_912,
         num_train_epochs=None,
+        save_interval=10_000,
+        checkpoint_policy="step",
+        rolling_checkpoint_interval=10_000,
+        val_log_interval=1_000,
+        val_num_batches=20,
+        streaming_anchor_stride=12,
+        overwrite=False,
         wandb_enabled=True,
         project_name="pi05_ki",
         resume=resume,
@@ -302,6 +330,192 @@ def _formal_config_stub(*, resume=False, prepare_only=False):
             decay_lr=0.0,
         ),
     )
+
+
+class _FakeDeepSpeedOptimizer:
+    def __init__(self, engine):
+        self.engine = engine
+        self.zero_grad_calls = 0
+
+    def zero_grad(self):
+        self.zero_grad_calls += 1
+        self.engine.gradients = {"backbone": 0, "expert": 0}
+
+
+class _FakeDeepSpeedEngine:
+    def __init__(self):
+        self.boundaries = []
+        self.backward_phases = []
+        self.gradients = {"backbone": 0, "expert": 0}
+        self.step_gradients = []
+        self.step_calls = 0
+        self.optimizer = _FakeDeepSpeedOptimizer(self)
+        self._boundary = None
+
+    def set_gradient_accumulation_boundary(self, boundary):
+        self._boundary = bool(boundary)
+        self.boundaries.append(self._boundary)
+
+    def backward(self, phase):
+        self.backward_phases.append(phase)
+        self.gradients[phase] += 1
+
+    def step(self):
+        assert self._boundary is True
+        self.step_calls += 1
+        self.step_gradients.append(dict(self.gradients))
+        self.optimizer.zero_grad()
+
+
+class _FakeOptimizer:
+    def __init__(self):
+        self.step_calls = 0
+        self.zero_grad_calls = 0
+
+    def step(self):
+        self.step_calls += 1
+
+    def zero_grad(self, *, set_to_none):
+        assert set_to_none is True
+        self.zero_grad_calls += 1
+
+
+def _deepspeed_controller(trainer):
+    engine = _FakeDeepSpeedEngine()
+    accelerator = SimpleNamespace(
+        distributed_type=trainer.DistributedType.DEEPSPEED,
+        sync_gradients=False,
+        deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+    )
+    return trainer._TwoPhaseUpdateController(accelerator), accelerator, engine
+
+
+@pytest.mark.parametrize("grad_accum", [1, 8])
+def test_two_phase_deepspeed_updates_once_after_both_phases(trainer, grad_accum):
+    controller, accelerator, engine = _deepspeed_controller(trainer)
+    optimizer_wrapper = SimpleNamespace()
+
+    for microbatch in range(1, grad_accum + 1):
+        accelerator.sync_gradients = microbatch == grad_accum
+        controller.backward("backbone", final_phase=False)
+        assert engine.boundaries[-1] is False
+        controller.backward("expert", final_phase=True)
+        assert engine.boundaries[-1] is accelerator.sync_gradients
+        controller.step_and_zero_grad(optimizer_wrapper)
+
+        if microbatch < grad_accum:
+            assert engine.step_calls == 0
+            assert engine.optimizer.zero_grad_calls == 0
+            assert engine.gradients == {"backbone": microbatch, "expert": microbatch}
+
+    assert engine.backward_phases == ["backbone", "expert"] * grad_accum
+    assert engine.boundaries == [False, False] * (grad_accum - 1) + [False, True]
+    assert engine.step_calls == 1
+    assert engine.step_gradients == [{"backbone": grad_accum, "expert": grad_accum}]
+    assert engine.optimizer.zero_grad_calls == 1
+    assert engine.gradients == {"backbone": 0, "expert": 0}
+
+
+def test_two_phase_non_deepspeed_retains_standard_optimizer_semantics(trainer):
+    backward_calls = []
+    accelerator = SimpleNamespace(
+        distributed_type="NO",
+        sync_gradients=False,
+        backward=backward_calls.append,
+    )
+    controller = trainer._TwoPhaseUpdateController(accelerator)
+    optimizer = _FakeOptimizer()
+
+    for microbatch in range(1, 9):
+        accelerator.sync_gradients = microbatch == 8
+        controller.backward("backbone", final_phase=False)
+        controller.backward("expert", final_phase=True)
+        controller.step_and_zero_grad(optimizer)
+        if microbatch < 8:
+            assert optimizer.step_calls == 0
+            assert optimizer.zero_grad_calls == 0
+
+    assert backward_calls == ["backbone", "expert"] * 8
+    assert optimizer.step_calls == 1
+    assert optimizer.zero_grad_calls == 1
+
+
+def test_all_formal_ab_names_share_pass_wandb_and_resume_guards(trainer, monkeypatch):
+    names = tuple(trainer._FORMAL_B1K_CONFIG_CONTRACTS)
+    assert names == (
+        "pi05_ki_joint_fast_b1k-full_task-ki_on_bf16",
+        "pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
+        "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32",
+        "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32",
+    )
+    for name in names:
+        config = _formal_config_stub(name=name)
+        accelerator = SimpleNamespace(
+            num_processes=32,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            distributed_type=trainer.DistributedType.DEEPSPEED if name.endswith("_v100_fp32") else "NO",
+            state=SimpleNamespace(
+                deepspeed_plugin=SimpleNamespace(
+                    deepspeed_config={
+                        "zero_optimization": {
+                            "stage": 2,
+                            "offload_optimizer": {"device": "cpu"},
+                        }
+                    }
+                )
+            ),
+        )
+        for key in (
+            *_STREAMING_ENV_KEYS,
+            "FRAME_ANCHOR_STRIDE",
+            "FRAME_ANCHOR_OFFSETS",
+            "OPENPI_PERSISTENT_WORKERS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        trainer._validate_formal_b1k_contract(config, accelerator=accelerator)
+        assert trainer._is_formal_b1k_mode(config)
+
+        config.resume = True
+        with pytest.raises(ValueError, match="resume is unsupported"):
+            trainer._validate_formal_b1k_contract(config)
+
+
+@pytest.mark.parametrize(
+    ("distributed_type", "zero_stage", "offload_device", "message"),
+    [
+        ("NO", 2, "cpu", "requires DeepSpeed"),
+        ("DEEPSPEED", 3, "cpu", "ZeRO stage 2"),
+        ("DEEPSPEED", 2, "none", "CPU optimizer offload"),
+    ],
+)
+def test_formal_v100_rejects_deepspeed_contract_drift(
+    trainer, monkeypatch, distributed_type, zero_stage, offload_device, message
+):
+    config = _formal_config_stub(name="pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32")
+    for key in (
+        *_STREAMING_ENV_KEYS,
+        "FRAME_ANCHOR_STRIDE",
+        "FRAME_ANCHOR_OFFSETS",
+        "OPENPI_PERSISTENT_WORKERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    accelerator = SimpleNamespace(
+        num_processes=32,
+        gradient_accumulation_steps=8,
+        distributed_type=(trainer.DistributedType.DEEPSPEED if distributed_type == "DEEPSPEED" else distributed_type),
+        state=SimpleNamespace(
+            deepspeed_plugin=SimpleNamespace(
+                deepspeed_config={
+                    "zero_optimization": {
+                        "stage": zero_stage,
+                        "offload_optimizer": {"device": offload_device},
+                    }
+                }
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match=message):
+        trainer._validate_formal_b1k_contract(config, accelerator=accelerator)
 
 
 def test_formal_validation_sets_exact_dataset_contract(trainer, monkeypatch):
