@@ -324,6 +324,36 @@ class TestVariantAEvalMetrics:
         )
         return model
 
+    def test_fast_train_reports_only_action_ce_objective(self):
+        """FAST train metrics must use the same arm-correct naming as validation."""
+        from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch
+
+        torch.manual_seed(0)
+        model = self._make_fast_eval_model()
+
+        def _preprocess_observation(self, observation, *, train):
+            del self, observation
+            assert train is True
+            return None, None, None, None, None
+
+        model._preprocess_observation = MethodType(_preprocess_observation, model)
+        observation = SimpleNamespace(
+            action_tokens=torch.tensor([[1, 2, 3, 4]], dtype=torch.int32),
+            action_token_mask=torch.ones(1, 4, dtype=torch.bool),
+            action_token_loss_mask=torch.tensor([[False, True, True, True]]),
+        )
+
+        metrics = PI05KIJointFastPytorch.compute_backbone_losses(
+            model, observation, torch.zeros(1, 2, 2)
+        )
+
+        assert set(metrics) == {"backbone_loss", "ce_loss", "action_ce_loss"}
+        assert "query_mse_loss" not in metrics
+        assert metrics["backbone_loss"].requires_grad
+        assert not metrics["action_ce_loss"].requires_grad
+        expected_backbone = model.beta_text * metrics["ce_loss"] + model.beta_action * metrics["action_ce_loss"]
+        assert torch.allclose(metrics["backbone_loss"].detach(), expected_backbone)
+
     def test_fast_eval_uses_action_tokens_and_reports_arm_correct_metrics(self):
         """FAST validation must never dispatch through learned-query hooks."""
         from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch
@@ -410,6 +440,42 @@ class TestVariantAEvalMetrics:
         assert metrics["query_mse_loss"].item() == pytest.approx(1.5)
         assert metrics["query_l1"].item() == pytest.approx(0.25)
         assert metrics["total_loss"].item() == pytest.approx(5.0)
+
+
+class TestArmAwareTrainLogging:
+    def test_structured_metrics_keep_fast_and_query_objectives_separate(self):
+        from scripts import train_accelerate
+
+        fast_metrics = {"ce_loss": 0.5, "action_ce_loss": 8.0}
+        train_accelerate._add_pi05_ki_structured_backbone_metrics(fast_metrics, 9.0)
+        assert fast_metrics["loss_action_ce"] == pytest.approx(8.0)
+        assert "query_mse_loss" not in fast_metrics
+        assert "loss_query_mse" not in fast_metrics
+
+        query_metrics = {"ce_loss": 0.5, "query_mse_loss": 0.25}
+        train_accelerate._add_pi05_ki_structured_backbone_metrics(query_metrics, 1.0)
+        assert query_metrics["loss_query_mse"] == pytest.approx(0.25)
+        assert "action_ce_loss" not in query_metrics
+        assert "loss_action_ce" not in query_metrics
+
+    def test_wandb_mapping_uses_only_the_active_arm_objective(self):
+        from scripts import train_accelerate
+
+        fast_payload = {}
+        train_accelerate._update_pi05_ki_wandb_loss_metrics(
+            fast_payload,
+            [{"loss_backbone": 9.0, "loss_ce": 0.5, "loss_action_ce": 8.0}],
+        )
+        assert fast_payload["loss/action_ce"] == pytest.approx(8.0)
+        assert "loss/query_mse" not in fast_payload
+
+        query_payload = {}
+        train_accelerate._update_pi05_ki_wandb_loss_metrics(
+            query_payload,
+            [{"loss_backbone": 1.0, "loss_ce": 0.5, "loss_query_mse": 0.25}],
+        )
+        assert query_payload["loss/query_mse"] == pytest.approx(0.25)
+        assert "loss/action_ce" not in query_payload
 
 
 class TestFastActionTokenization:

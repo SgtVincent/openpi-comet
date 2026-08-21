@@ -1456,6 +1456,42 @@ def _loss_tensor_debug_metrics(losses: object, actions: torch.Tensor) -> dict[st
     return metrics
 
 
+_PI05_KI_LOSS_WANDB_KEYS = (
+    ("loss_backbone", "loss/backbone"),
+    ("loss_ce", "loss/ce"),
+    ("loss_action_ce", "loss/action_ce"),
+    ("loss_query_mse", "loss/query_mse"),
+    ("loss_expert", "loss/expert"),
+    ("loss_flow_raw", "loss/flow_raw"),
+    ("expert_loss_fraction", "loss/expert_fraction"),
+)
+
+
+def _add_pi05_ki_structured_backbone_metrics(extra_metrics: dict[str, float], backbone_loss: float) -> None:
+    """Add arm-correct structured keys without aliasing CE as query MSE."""
+    has_action_ce = "action_ce_loss" in extra_metrics
+    has_query_mse = "query_mse_loss" in extra_metrics
+    if has_action_ce and has_query_mse:
+        raise ValueError("π0.5-KI backbone metrics cannot contain both action CE and query MSE")
+
+    extra_metrics["loss_backbone"] = backbone_loss
+    extra_metrics["loss_ce"] = extra_metrics.get("ce_loss", float("nan"))
+    if has_action_ce:
+        extra_metrics["loss_action_ce"] = extra_metrics["action_ce_loss"]
+    elif has_query_mse:
+        extra_metrics["loss_query_mse"] = extra_metrics["query_mse_loss"]
+
+
+def _update_pi05_ki_wandb_loss_metrics(
+    log_payload: dict[str, float], infos: list[dict[str, float]]
+) -> None:
+    """Map only metrics present for the active π0.5-KI objective to W&B."""
+    for metric_key, wandb_key in _PI05_KI_LOSS_WANDB_KEYS:
+        vals = [info[metric_key] for info in infos if metric_key in info and np.isfinite(info[metric_key])]
+        if vals:
+            log_payload[wandb_key] = sum(vals) / len(vals)
+
+
 # =====================================================================
 # Buffered metrics.jsonl writer: reduce I/O overhead on the hot path by
 # batching metrics.jsonl writes and flushing only at boundaries.
@@ -3733,13 +3769,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             for k, v in bb_losses.items()
                             if k != "backbone_loss" and isinstance(v, torch.Tensor) and v.numel() == 1
                         }
-                        # Structured loss component keys for π0.5-KI joint query training
-                        # loss_backbone = total backbone loss (CE + query MSE, weighted)
-                        # loss_ce = raw CE loss (detached)
-                        # loss_query_mse = raw query MSE loss (detached)
-                        extra_metrics["loss_backbone"] = bb_loss_val
-                        extra_metrics["loss_ce"] = extra_metrics.get("ce_loss", float("nan"))
-                        extra_metrics["loss_query_mse"] = extra_metrics.get("query_mse_loss", float("nan"))
+                        # Structured loss keys are arm-specific: Variant A reports
+                        # action-token CE, while Variant B reports query MSE.
+                        _add_pi05_ki_structured_backbone_metrics(extra_metrics, bb_loss_val)
                     else:
                         bb_loss_val = float("nan")
                     del bb_losses, bb_loss
@@ -3828,7 +3860,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         for k, v in ex_losses.items():
                             if k != "expert_loss" and isinstance(v, torch.Tensor) and v.numel() == 1:
                                 extra_metrics[k] = float(v.detach().float().item())
-                        # Structured loss component keys for π0.5-KI joint query training
+                        # Structured expert loss keys shared by both π0.5-KI arms.
                         # loss_expert = weighted expert loss (alpha * flow_loss)
                         # loss_flow_raw = raw flow matching loss (pre-alpha weighting)
                         extra_metrics["loss_expert"] = ex_loss_val
@@ -4378,20 +4410,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                         }
                                     )
 
-                                # --- π0.5-KI joint query structured metrics ---
+                                # --- π0.5-KI structured metrics ---
                                 if is_pi05_ki_joint:
-                                    # Loss components
-                                    for metric_key, wandb_key in [
-                                        ("loss_backbone", "loss/backbone"),
-                                        ("loss_ce", "loss/ce"),
-                                        ("loss_query_mse", "loss/query_mse"),
-                                        ("loss_expert", "loss/expert"),
-                                        ("loss_flow_raw", "loss/flow_raw"),
-                                        ("expert_loss_fraction", "loss/expert_fraction"),
-                                    ]:
-                                        vals = [info[metric_key] for info in infos if metric_key in info and np.isfinite(info[metric_key])]
-                                        if vals:
-                                            log_payload[wandb_key] = sum(vals) / len(vals)
+                                    # Loss components use arm-correct objective names.
+                                    _update_pi05_ki_wandb_loss_metrics(log_payload, infos)
 
                                     # Per-param-group LRs
                                     for pg_name in ("backbone", "expert"):

@@ -326,10 +326,6 @@ class PI05KIJointFastPytorch(PI05KIJointQueryPytorch):
             "backbone_loss": backbone_loss,
             "ce_loss": ce_loss.detach(),
             "action_ce_loss": action_ce_loss.detach(),
-            # Keep the Variant B metric key present so the shared trainer's
-            # logging and the A/B dashboards do not need a branch. It is the
-            # action objective's value, just measured in nats instead of MSE.
-            "query_mse_loss": action_ce_loss.detach(),
         }
 
     # ------------------------------------------------------------------
