@@ -12,6 +12,9 @@ cannot be constructed rather than failing the suite.
 from __future__ import annotations
 
 import inspect
+from types import MethodType
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -261,6 +264,152 @@ class TestVariantAModelWiring:
         for name in ("_embed_query_tokens", "_compute_query_mse_loss"):
             with pytest.raises(NotImplementedError, match="Variant B"):
                 getattr(PI05KIJointFastPytorch, name)(object())
+
+
+class TestVariantAEvalMetrics:
+    @staticmethod
+    def _make_fast_eval_model():
+        from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch
+
+        class _FakeLanguageModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(16, 6)
+                self.config = SimpleNamespace(_attn_implementation=None)
+
+        class _FakePaliGemma(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = _FakeLanguageModel()
+
+        class _FakePaliGemmaWithExpert(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.paligemma = _FakePaliGemma()
+
+            def embed_language_tokens(self, tokens):
+                return self.paligemma.language_model.embed_tokens(tokens)
+
+            def forward(self, *, inputs_embeds, **kwargs):
+                del kwargs
+                return (inputs_embeds[0], None), None
+
+        model = PI05KIJointFastPytorch.__new__(PI05KIJointFastPytorch)
+        torch.nn.Module.__init__(model)
+        model.beta_text = 1.5
+        model.beta_action = 2.0
+        model.paligemma_with_expert = _FakePaliGemmaWithExpert()
+
+        def _preprocess_observation(self, observation, *, train):
+            del self, observation
+            assert train is False
+            return None, None, None, None, None
+
+        def _embed_prefix(self, images, img_masks, lang_tokens, lang_masks):
+            del images, img_masks, lang_tokens, lang_masks
+            base = torch.zeros(1, 2, 6)
+            pad = torch.ones(1, 2, dtype=torch.bool)
+            att = torch.zeros(1, 2, dtype=torch.bool)
+            return base, pad, att
+
+        model._preprocess_observation = MethodType(_preprocess_observation, model)
+        model.embed_prefix = MethodType(_embed_prefix, model)
+        model._prepare_attention_masks_4d = MethodType(lambda self, mask: mask, model)
+        model.compute_expert_loss = MethodType(
+            lambda self, observation, actions: {
+                "expert_loss": torch.tensor(3.0, requires_grad=True),
+                "flow_loss": torch.tensor(0.25, requires_grad=True),
+            },
+            model,
+        )
+        return model
+
+    def test_fast_eval_uses_action_tokens_and_reports_arm_correct_metrics(self):
+        """FAST validation must never dispatch through learned-query hooks."""
+        from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch
+
+        torch.manual_seed(0)
+        model = self._make_fast_eval_model()
+        learned_query_hook = mock.Mock(side_effect=AssertionError("learned-query path reached"))
+        model._embed_query_tokens = learned_query_hook
+        observation = SimpleNamespace(
+            action_tokens=torch.tensor([[1, 2, 3, 4]], dtype=torch.int32),
+            action_token_mask=torch.ones(1, 4, dtype=torch.bool),
+            action_token_loss_mask=torch.tensor([[False, True, True, True]]),
+        )
+        actions = torch.zeros(1, 2, 2)
+
+        metrics = PI05KIJointFastPytorch.compute_eval_metrics(model, observation, actions)
+
+        assert set(metrics) == {
+            "total_loss",
+            "backbone_loss",
+            "expert_loss",
+            "ce_loss",
+            "action_ce_loss",
+            "flow_loss",
+            "subtask_accuracy",
+            "action_token_accuracy",
+            "flow_mse",
+        }
+        assert "query_mse_loss" not in metrics
+        assert "query_l1" not in metrics
+        learned_query_hook.assert_not_called()
+
+        for name, value in metrics.items():
+            assert value.numel() == 1, name
+            assert torch.isfinite(value), name
+            assert not value.requires_grad, name
+
+        expected_backbone = model.beta_text * metrics["ce_loss"] + model.beta_action * metrics["action_ce_loss"]
+        assert torch.allclose(metrics["backbone_loss"], expected_backbone)
+        assert torch.allclose(
+            metrics["total_loss"], metrics["backbone_loss"] + metrics["expert_loss"]
+        )
+        assert torch.equal(metrics["flow_mse"], metrics["flow_loss"])
+        assert 0.0 <= metrics["action_token_accuracy"].item() <= 1.0
+
+    def test_variant_b_eval_metric_contract_is_unchanged(self):
+        from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
+
+        model = PI05KIJointQueryPytorch.__new__(PI05KIJointQueryPytorch)
+        torch.nn.Module.__init__(model)
+        model._compute_backbone_eval_metrics = MethodType(
+            lambda self, observation, actions: (
+                torch.tensor(2.0, requires_grad=True),
+                torch.tensor(0.5),
+                torch.tensor(1.5),
+                torch.tensor(0.75),
+                torch.tensor(0.25),
+            ),
+            model,
+        )
+        model.compute_expert_loss = MethodType(
+            lambda self, observation, actions: {
+                "expert_loss": torch.tensor(3.0, requires_grad=True),
+                "flow_loss": torch.tensor(0.3, requires_grad=True),
+            },
+            model,
+        )
+
+        metrics = PI05KIJointQueryPytorch.compute_eval_metrics(model, object(), object())
+
+        assert set(metrics) == {
+            "total_loss",
+            "backbone_loss",
+            "expert_loss",
+            "ce_loss",
+            "query_mse_loss",
+            "flow_loss",
+            "subtask_accuracy",
+            "query_l1",
+            "flow_mse",
+        }
+        assert "action_ce_loss" not in metrics
+        assert "action_token_accuracy" not in metrics
+        assert metrics["query_mse_loss"].item() == pytest.approx(1.5)
+        assert metrics["query_l1"].item() == pytest.approx(0.25)
+        assert metrics["total_loss"].item() == pytest.approx(5.0)
 
 
 class TestFastActionTokenization:
