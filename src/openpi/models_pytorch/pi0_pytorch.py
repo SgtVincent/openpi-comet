@@ -157,7 +157,9 @@ class PI0Pytorch(nn.Module):
         recursive API and non-reentrant checkpointing, which supports the tensor
         structures used by the two KI forwards.
         """
-        checkpoint_kwargs = {"use_reentrant": False, "preserve_rng_state": False}
+        # Recompute must replay the same stochastic path without advancing the
+        # global RNG stream before the separate expert phase samples noise/time.
+        checkpoint_kwargs = {"use_reentrant": False, "preserve_rng_state": True}
         self.paligemma_with_expert.paligemma.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=checkpoint_kwargs
         )
@@ -184,7 +186,7 @@ class PI0Pytorch(nn.Module):
         """Helper method to apply gradient checkpointing if enabled."""
         if self.gradient_checkpointing_enabled and self.training:
             return torch.utils.checkpoint.checkpoint(
-                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
+                func, *args, use_reentrant=False, preserve_rng_state=True, **kwargs
             )
         return func(*args, **kwargs)
 

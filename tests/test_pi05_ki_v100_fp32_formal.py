@@ -240,6 +240,81 @@ def test_recursive_gradient_checkpointing_reaches_decoder_layers_and_recomputes(
             hook.remove()
 
 
+def test_checkpointed_stochastic_probe_preserves_rng_and_downstream_draws():
+    """Backward recomputation must not perturb the following expert RNG stream."""
+    from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+
+    class _FakeHFModel:
+        def __init__(self):
+            self.checkpoint_kwargs = None
+
+        def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs):
+            self.checkpoint_kwargs = gradient_checkpointing_kwargs
+
+    paligemma = _FakeHFModel()
+    expert = _FakeHFModel()
+    wrapper = SimpleNamespace(
+        paligemma_with_expert=SimpleNamespace(paligemma=paligemma, gemma_expert=expert),
+        gradient_checkpointing_enabled=False,
+    )
+    PI0Pytorch.gradient_checkpointing_enable(wrapper)
+    assert paligemma.checkpoint_kwargs == expert.checkpoint_kwargs
+    checkpoint_kwargs = paligemma.checkpoint_kwargs
+    assert checkpoint_kwargs == {"use_reentrant": False, "preserve_rng_state": True}
+
+    class _StochasticDecoderProbe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(8, 8, bias=False)
+            self.forward_calls = 0
+            self.draws = []
+
+        def forward(self, inputs):
+            self.forward_calls += 1
+            output = self.proj(inputs)
+            output = torch.nn.functional.dropout(output, p=0.5, training=True)
+            self.draws.append(output.detach().clone())
+            return output.tanh()
+
+    def _run(*, checkpointed):
+        torch.manual_seed(1234)
+        probe = _StochasticDecoderProbe()
+        inputs = torch.linspace(-1.0, 1.0, 16).reshape(2, 8).requires_grad_()
+        torch.manual_seed(5678)
+        if checkpointed:
+            checkpoint_owner = SimpleNamespace(
+                gradient_checkpointing_enabled=True,
+                training=True,
+            )
+            output = PI0Pytorch._apply_checkpoint(checkpoint_owner, probe, inputs)
+        else:
+            output = probe(inputs)
+        output.square().sum().backward()
+        rng_state = torch.random.get_rng_state().clone()
+        downstream_draws = torch.rand(16)
+        return SimpleNamespace(
+            output=output.detach(),
+            input_grad=inputs.grad.detach(),
+            weight_grad=probe.proj.weight.grad.detach(),
+            forward_calls=probe.forward_calls,
+            recompute_draws=probe.draws,
+            rng_state=rng_state,
+            downstream_draws=downstream_draws,
+        )
+
+    baseline = _run(checkpointed=False)
+    recomputed = _run(checkpointed=True)
+
+    assert baseline.forward_calls == 1
+    assert recomputed.forward_calls == 2
+    assert torch.equal(recomputed.recompute_draws[0], recomputed.recompute_draws[1])
+    assert torch.equal(recomputed.output, baseline.output)
+    assert torch.equal(recomputed.input_grad, baseline.input_grad)
+    assert torch.equal(recomputed.weight_grad, baseline.weight_grad)
+    assert torch.equal(recomputed.rng_state, baseline.rng_state)
+    assert torch.equal(recomputed.downstream_draws, baseline.downstream_draws)
+
+
 def test_model_loaded_banner_is_arm_correct():
     source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
     assert 'variant_label = "FAST action-token CE variant"' in source
