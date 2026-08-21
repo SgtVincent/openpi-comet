@@ -165,6 +165,51 @@ class PI05KIJointFastPytorch(PI05KIJointQueryPytorch):
         Mirrors ``_compute_ce_loss`` exactly (tied embedding transpose, shift by
         one, masked mean) so the subtask and action objectives stay comparable.
         """
+        shift_logits, shift_targets, shift_loss_mask = self._action_token_predictions(
+            prefix_out=prefix_out,
+            action_segment_start=action_segment_start,
+            action_tokens=action_tokens,
+            action_token_loss_mask=action_token_loss_mask,
+        )
+
+        per_token = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_targets.view(-1),
+            reduction="none",
+        ).view(shift_logits.shape[0], -1)
+
+        total = (per_token * shift_loss_mask).sum()
+        denom = shift_loss_mask.sum().clamp(min=1)
+        return total / denom
+
+    def _compute_action_token_accuracy_from_hidden(
+        self,
+        *,
+        prefix_out: Tensor,
+        action_segment_start: int,
+        action_tokens: Tensor,
+        action_token_loss_mask: Tensor,
+    ) -> Tensor:
+        """Compute masked next-token accuracy for the FAST action segment."""
+        shift_logits, shift_targets, shift_loss_mask = self._action_token_predictions(
+            prefix_out=prefix_out,
+            action_segment_start=action_segment_start,
+            action_tokens=action_tokens,
+            action_token_loss_mask=action_token_loss_mask,
+        )
+        correct = (shift_logits.argmax(dim=-1) == shift_targets).float()
+        total_valid = shift_loss_mask.sum().clamp(min=1)
+        return (correct * shift_loss_mask).sum() / total_valid
+
+    def _action_token_predictions(
+        self,
+        *,
+        prefix_out: Tensor,
+        action_segment_start: int,
+        action_tokens: Tensor,
+        action_token_loss_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return shifted FAST logits, targets, and mask shared by eval metrics."""
         seg_len = action_tokens.shape[1]
         hidden = prefix_out[:, action_segment_start : action_segment_start + seg_len]
 
@@ -176,16 +221,7 @@ class PI05KIJointFastPytorch(PI05KIJointQueryPytorch):
         shift_logits = logits[:, :-1].contiguous()
         shift_targets = action_tokens[:, 1:].contiguous().to(dtype=torch.long)
         shift_loss_mask = action_token_loss_mask[:, 1:].contiguous().float()
-
-        per_token = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_targets.view(-1),
-            reduction="none",
-        ).view(shift_logits.shape[0], -1)
-
-        total = (per_token * shift_loss_mask).sum()
-        denom = shift_loss_mask.sum().clamp(min=1)
-        return total / denom
+        return shift_logits, shift_targets, shift_loss_mask
 
     # ------------------------------------------------------------------
     #  Phase 1: backbone losses (subtask CE + action-token CE)
@@ -295,3 +331,160 @@ class PI05KIJointFastPytorch(PI05KIJointQueryPytorch):
             # action objective's value, just measured in nats instead of MSE.
             "query_mse_loss": action_ce_loss.detach(),
         }
+
+    # ------------------------------------------------------------------
+    #  Evaluation: FAST-specific backbone metrics + shared expert metrics
+    # ------------------------------------------------------------------
+
+    def compute_eval_metrics(
+        self,
+        observation,
+        actions,
+        *,
+        compute_flow_l1: bool = False,
+        num_denoise_steps: int = 10,
+        flow_l1_seed: int = 42,
+    ) -> dict[str, Tensor]:
+        """Compute validation metrics without entering learned-query code.
+
+        Variant A reports its discrete action objective as ``action_ce_loss``
+        and ``action_token_accuracy``. It deliberately does not emit Variant B's
+        ``query_mse_loss`` or ``query_l1`` keys: FAST has neither learned query
+        tokens nor a query action head, so either name would misstate the metric.
+        """
+        (
+            backbone_loss,
+            ce_loss,
+            action_ce_loss,
+            subtask_accuracy,
+            action_token_accuracy,
+        ) = self._compute_backbone_eval_metrics(observation, actions)
+
+        expert_losses = self.compute_expert_loss(observation, actions)
+        expert_loss = expert_losses["expert_loss"]
+        flow_loss = expert_losses["flow_loss"]
+
+        result = {
+            "total_loss": backbone_loss.detach() + expert_loss.detach(),
+            "backbone_loss": backbone_loss.detach(),
+            "expert_loss": expert_loss.detach(),
+            "ce_loss": ce_loss.detach(),
+            "action_ce_loss": action_ce_loss.detach(),
+            "flow_loss": flow_loss.detach(),
+            "subtask_accuracy": subtask_accuracy.detach(),
+            "action_token_accuracy": action_token_accuracy.detach(),
+            "flow_mse": flow_loss.detach(),
+        }
+
+        if compute_flow_l1:
+            result["flow_l1"] = self._compute_flow_l1_euler(
+                observation=observation,
+                actions=actions,
+                num_steps=num_denoise_steps,
+                seed=flow_l1_seed,
+            ).detach()
+
+        return result
+
+    def _compute_backbone_eval_metrics(
+        self, observation, actions
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Run one FAST backbone pass for loss and accuracy metrics."""
+        assert actions.dim() == 3, f"actions must be [B, T, D], got shape {actions.shape}"
+
+        images, img_masks, lang_tokens, lang_masks, _state = self._preprocess_observation(
+            observation, train=False
+        )
+
+        subtask_tokens = getattr(observation, "subtask_tokens", None)
+        subtask_mask = getattr(observation, "subtask_mask", None)
+        subtask_loss_mask = getattr(observation, "subtask_loss_mask", None)
+        has_subtask = (
+            subtask_tokens is not None
+            and subtask_mask is not None
+            and subtask_loss_mask is not None
+            and subtask_loss_mask.any()
+        )
+
+        action_tokens, action_token_mask, action_token_loss_mask = self._extract_action_token_fields(
+            observation
+        )
+        if action_tokens is None or action_token_mask is None or action_token_loss_mask is None:
+            raise ValueError(
+                "PI05KIJointFastPytorch requires action_tokens / action_token_mask / "
+                "action_token_loss_mask on the observation. Use "
+                "transforms.TokenizeSubtaskAndActionInputs in the data pipeline."
+            )
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_base_len = prefix_embs.shape[1]
+
+        if has_subtask:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = (
+                self.action_expert._embed_conditioning_subtask(  # noqa: SLF001
+                    model=self,
+                    prefix_embs=prefix_embs,
+                    prefix_pad_masks=prefix_pad_masks,
+                    prefix_att_masks=prefix_att_masks,
+                    subtask_tokens=subtask_tokens,
+                    subtask_mask=subtask_mask,
+                    causal=True,
+                )
+            )
+        action_segment_start = prefix_embs.shape[1]
+
+        action_embs, action_pad_masks, action_att_masks = self._embed_action_tokens(
+            action_tokens=action_tokens,
+            action_token_mask=action_token_mask,
+            target_dtype=prefix_embs.dtype,
+        )
+        full_embs = torch.cat([prefix_embs, action_embs], dim=1)
+        full_pad_masks = torch.cat([prefix_pad_masks, action_pad_masks], dim=1)
+        full_att_masks = torch.cat([prefix_att_masks, action_att_masks], dim=1)
+
+        full_att_2d = self.make_att_2d_masks(full_pad_masks, full_att_masks)
+        full_position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+        full_att_2d_4d = self._prepare_attention_masks_4d(full_att_2d)
+
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = (  # noqa: SLF001
+            resolve_attn_impl()
+        )
+        (prefix_out, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=full_att_2d_4d,
+            position_ids=full_position_ids,
+            past_key_values=None,
+            inputs_embeds=[full_embs, None],
+            use_cache=False,
+        )
+
+        ce_loss = self._compute_ce_loss(
+            prefix_out=prefix_out,
+            prefix_base_len=prefix_base_len,
+            subtask_tokens=subtask_tokens,
+            subtask_loss_mask=subtask_loss_mask,
+            has_subtask=has_subtask,
+        )
+        subtask_accuracy = self._compute_subtask_accuracy_from_hidden(
+            prefix_out=prefix_out,
+            prefix_base_len=prefix_base_len,
+            subtask_tokens=subtask_tokens,
+            subtask_loss_mask=subtask_loss_mask,
+            has_subtask=has_subtask,
+        )
+        action_ce_loss = self._compute_action_ce_loss(
+            prefix_out=prefix_out,
+            action_segment_start=action_segment_start,
+            action_tokens=action_tokens,
+            action_token_loss_mask=action_token_loss_mask,
+        )
+        action_token_accuracy = self._compute_action_token_accuracy_from_hidden(
+            prefix_out=prefix_out,
+            action_segment_start=action_segment_start,
+            action_tokens=action_tokens,
+            action_token_loss_mask=action_token_loss_mask,
+        )
+        backbone_loss = self.beta_text * ce_loss + self.beta_action * action_ce_loss
+
+        return backbone_loss, ce_loss, action_ce_loss, subtask_accuracy, action_token_accuracy
