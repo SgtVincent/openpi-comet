@@ -49,8 +49,10 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         check_timestamp_sync=False,
         delta_timestamps={key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys},
         episodes=data_config.episodes_index,
-        chunk_streaming_using_keyframe=True,
-        shuffle=True,
+        chunk_streaming_using_keyframe=getattr(
+            data_config, "chunk_streaming_using_keyframe", True
+        ),
+        shuffle=getattr(data_config, "dataset_shuffle", True),
         fine_grained_level=data_config.fine_grained_level,
         return_seg_instance=data_config.return_seg_instance,
         train_rgb_type=data_config.train_rgb_type,
