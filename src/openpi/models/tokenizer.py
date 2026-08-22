@@ -167,10 +167,23 @@ class FASTTokenizer:
         reuse a single cross-entropy implementation for both the subtask segment
         and the action segment.
 
-        Note the tokens land in the PaliGemma ``<loc0000..1023>`` id range
-        (``vocab_size - 1 - fast_skip_tokens - t``), which is disjoint from the
-        text vocabulary, so this objective needs NO new parameters: it reuses
-        the existing embedding table and its tied output projection.
+        Action ids are mapped by ``vocab_size - 1 - fast_skip_tokens - t``,
+        counting down from the top of the PaliGemma vocabulary (below the final
+        ``fast_skip_tokens`` special ids). This objective needs NO new
+        parameters: it reuses the existing embedding table and its tied output
+        projection.
+
+        This range is NOT disjoint from the text vocabulary. FAST's vocabulary
+        is 2048 entries while PaliGemma's ``<loc>`` block provides only 1024
+        slots, so the mapping necessarily extends about 1024 ids past that
+        block and reaches into rare text ids. That is the upstream pi0-FAST
+        convention and is retained deliberately for checkpoint compatibility;
+        the ids are effectively repurposed for actions during this training.
+        The invariant that actually matters is therefore not disjointness but
+        that action ids never collide with the id the model treats as the image
+        token -- see
+        ``tests/test_pi05_ki_joint_fast.py::TestFastActionTokenization::
+        test_action_ids_avoid_the_configured_image_token``, which pins it.
 
         Args:
             actions: ``[action_horizon, action_dim]``, already normalized to
