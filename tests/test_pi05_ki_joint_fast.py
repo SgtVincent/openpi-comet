@@ -552,30 +552,30 @@ class TestFastActionTokenization:
         assert (ar_mask[n:] == 0).all()
         assert not loss_mask[n:].any()
 
-    def test_formal_capacity_preserves_observed_73_token_target(self):
-        """The observed maximum includes BOS/EOS and must remain complete."""
-        tk = self._tokenizer_with_action_length(71)
+    def test_formal_capacity_preserves_exhaustive_199_token_maximum(self):
+        """The exhaustive maximum includes BOS/EOS and must remain complete."""
+        tk = self._tokenizer_with_action_length(197)
         chunk = np.zeros((32, 23), dtype=np.float32)
 
-        tokens, mask, ar_mask, loss_mask = tk.tokenize_action_chunk(chunk, max_len=96)
+        tokens, mask, ar_mask, loss_mask = tk.tokenize_action_chunk(chunk, max_len=208)
 
-        assert tokens.shape == mask.shape == ar_mask.shape == loss_mask.shape == (96,)
-        assert int(mask.sum()) == 73
+        assert tokens.shape == mask.shape == ar_mask.shape == loss_mask.shape == (208,)
+        assert int(mask.sum()) == 199
         assert tokens[0] == tk._paligemma_tokenizer.bos_id()
-        assert tokens[72] == tk._paligemma_tokenizer.eos_id()
-        assert int(loss_mask.sum()) == 72
-        assert not mask[73:].any()
+        assert tokens[198] == tk._paligemma_tokenizer.eos_id()
+        assert int(loss_mask.sum()) == 198
+        assert not mask[199:].any()
 
-    def test_over_limit_action_target_fails_instead_of_truncating(self):
-        """An unexpected longer chunk must never return a partial target."""
-        tk = self._tokenizer_with_action_length(95)  # 97 including BOS/EOS.
+    def test_over_formal_cap_fails_instead_of_truncating(self):
+        """Minimal headroom is safe only while unexpected overflow fails closed."""
+        tk = self._tokenizer_with_action_length(207)  # 209 including BOS/EOS.
         chunk = np.zeros((32, 23), dtype=np.float32)
 
         with pytest.raises(
             ValueError,
-            match=r"produced 97 tokens.*action_token_max_len=96.*Refusing to truncate",
+            match=r"produced 209 tokens.*action_token_max_len=208.*Refusing to truncate",
         ):
-            tk.tokenize_action_chunk(chunk, max_len=96)
+            tk.tokenize_action_chunk(chunk, max_len=208)
 
     def test_rejects_wrong_rank(self):
         tk = self._tokenizer()

@@ -31,7 +31,7 @@ class Pi05KIJointFastConfig(Pi05KIJointQueryConfig):
     # ===== Action-token segment =====
     # This generic default is intentionally conservative. Formal configurations
     # must size it from their observed data contract (the V100 formal FAST config
-    # uses 96 for an observed maximum of 73). Any overflow fails instead of
+    # uses 208 for an exhaustive maximum of 199). Any overflow fails instead of
     # silently truncating and corrupting the target.
     action_token_max_len: int = 64
 

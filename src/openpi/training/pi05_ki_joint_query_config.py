@@ -861,9 +861,16 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         batch_size_per_gpu=1,
         gradient_accumulation_steps=8,
         action_repr="fast_ce",
-        # GPU data contract: observed maximum is 73 including BOS/EOS. The next
-        # 32-token boundary leaves 23 tokens (31.5%) of measured headroom.
-        action_token_max_len=96,
+        # Exhaustive formal train population: 26,857,712 chunks, max 199 tokens
+        # including BOS/EOS, p99.9=99, and 30,554 chunks >96. Cap 208 is the
+        # smallest 16-aligned value >=199 (+9 tokens, 4.52% headroom); any input
+        # identity change requires a rescan rather than relying on this margin.
+        # Tail attribution found ep12780's eight >=160-token windows are
+        # overlapping views of one local dynamics burst, not independent samples.
+        # Provenance: run_id=0bb9280746094702c226099205ba0c84b0d44aa4f976d2ad3f4a3f1400a6d760
+        # manifest=ef4cb52d59023664a3ddc2edfbb0dc2edeece7ee001d1bc3931e6661c6578f0e
+        # aggregate=51250f1571edc47bf8f0b6bbfffa1b718ab36cd616a94ff05f756bea23a2b25e
+        action_token_max_len=208,
         precision="float32",
     ),
     _make_pi05_ki_joint_full_task_set_config(
@@ -897,6 +904,9 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         log_interval=1,
         streaming_anchor_stride=1,
         action_repr="fast_ce",
+        # Keep debug and formal FAST capacity identical so smoke tests exercise
+        # the same fail-closed data contract instead of masking formal overflows.
+        action_token_max_len=208,
         precision="float32",
     ),
     _make_pi05_ki_joint_full_task_set_config(
