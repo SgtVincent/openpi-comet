@@ -4188,6 +4188,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 break
             if formal_b1k_mode and global_step >= formal_pass_end:
                 break
+            if epoch_anchor_index is not None and global_step >= (epoch_anchor_index + 1) * steps_per_epoch:
+                break
 
             profile_memory = is_main and _should_profile_memory_step(global_step)
 
