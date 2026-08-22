@@ -84,6 +84,10 @@ def test_fp32_debug_configs_are_registered_matched_and_isolated():
     for field_name in common_model_fields - objective_fields:
         assert getattr(variant_a.model, field_name) == getattr(variant_b.model, field_name), field_name
 
+    # Debug must exercise the same fail-closed FAST capacity as formal.
+    assert variant_a.model.action_token_max_len == 208
+    assert not hasattr(variant_b.model, "action_token_max_len")
+
     assert variant_a.checkpoint_base_dir != variant_b.checkpoint_base_dir
     assert variant_a.log_base_dir != variant_b.log_base_dir
     assert variant_a.assets_base_dir != variant_b.assets_base_dir

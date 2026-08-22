@@ -255,7 +255,7 @@ checks = {
     "online W&B": config.wandb_enabled is True and config.project_name == "pi05_ki",
 }
 if expected_model == "pi05_ki_joint_fast":
-    checks["FAST action capacity 96"] = config.model.action_token_max_len == 96
+    checks["FAST action capacity 208"] = config.model.action_token_max_len == 208
 else:
     checks["query arm has no FAST target"] = not hasattr(config.model, "action_token_max_len")
 failed = [label for label, ok in checks.items() if not ok]

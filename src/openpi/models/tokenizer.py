@@ -176,11 +176,11 @@ class FASTTokenizer:
             actions: ``[action_horizon, action_dim]``, already normalized to
                 roughly ``[-1, 1]`` by the upstream normalization transform.
             max_len: fixed segment length required by the batched data
-                contract. The formal B1K configuration uses 96: the GPU run
-                observed chunks up to 73 tokens (including BOS/EOS), so 96 is
-                the next 32-token boundary and leaves 23 tokens of headroom.
-                Dynamic per-sample sizing is unsafe because these arrays are
-                stacked before they reach the model.
+                contract. The formal B1K configuration uses 208: an exhaustive
+                scan found chunks up to 199 tokens (including BOS/EOS), and 208
+                is the smallest 16-aligned cap with headroom. Dynamic per-sample
+                sizing is unsafe because these arrays are stacked before they
+                reach the model.
 
         Returns:
             ``(tokens, mask, ar_mask, loss_mask)``, each of shape ``[max_len]``.

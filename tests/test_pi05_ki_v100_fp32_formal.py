@@ -86,9 +86,9 @@ def test_formal_v100_configs_are_exactly_matched_outside_objective():
     assert variant_a.checkpoint_base_dir != variant_b.checkpoint_base_dir
     assert variant_a.log_base_dir != variant_b.log_base_dir
 
-    # The formal FAST segment uses the next 32-token boundary above the observed
-    # 73-token maximum. Variant B has no FAST target and remains unchanged.
-    assert variant_a.model.action_token_max_len == 96
+    # Exhaustive formal data measurement found a 199-token maximum. The smallest
+    # 16-aligned cap leaves nine tokens (4.52%) of headroom. Variant B is unchanged.
+    assert variant_a.model.action_token_max_len == 208
     assert not hasattr(variant_b.model, "action_token_max_len")
 
     a_fields = {field.name for field in dataclasses.fields(variant_a.model)}
@@ -331,6 +331,7 @@ def test_formal_launcher_is_not_debug_and_locks_the_full_contract():
     assert "GRADIENT_ACCUMULATION_STEPS=8" in source
     assert "NUM_TRAIN_STEPS=104912" in source
     assert "GLOBAL_BATCH_SIZE == 256" in source
+    assert 'checks["FAST action capacity 208"] = config.model.action_token_max_len == 208' in source
     assert "SAVE_INTERVAL=10000" in source
     assert "VAL_LOG_INTERVAL=1000" in source
     assert "VAL_NUM_BATCHES=20" in source
