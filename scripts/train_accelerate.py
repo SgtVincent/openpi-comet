@@ -488,6 +488,32 @@ def _train_b1k_anchor_stride_env(stride: int):
             os.environ[env_key] = saved
 
 
+@contextmanager
+def _train_b1k_anchor_env(stride: int, offset: int = 0):
+    """Pin both ``OPENPI_B1K_ANCHOR_STRIDE`` and ``..._OFFSET`` for a loader build.
+
+    Used for per-epoch rebuilds when ``config.epoch_anchor_offsets`` rotates
+    the offset between epochs. The dataset captures these at construction, so
+    rebuilding the dataset under a new offset is the only way to make a later
+    epoch consume different anchor positions.
+    """
+
+    stride_key = "OPENPI_B1K_ANCHOR_STRIDE"
+    offset_key = "OPENPI_B1K_ANCHOR_OFFSET"
+    saved_stride = os.environ.get(stride_key)
+    saved_offset = os.environ.get(offset_key)
+    try:
+        os.environ[stride_key] = str(int(stride))
+        os.environ[offset_key] = str(int(offset))
+        yield
+    finally:
+        for key, saved in ((stride_key, saved_stride), (offset_key, saved_offset)):
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
+
+
 def _formal_b1k_pass_for_step(global_step: int) -> tuple[int, int, int, int, int]:
     if not 0 <= global_step < _FORMAL_B1K_PASS_BOUNDARIES[-1]:
         raise ValueError(f"Formal B1K global_step out of range: {global_step}")
@@ -3462,8 +3488,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     # Build the training loader under the config's streaming anchor stride.
     # The formal B1K pass loop overrides this per-pass via
     # _set_formal_b1k_pass_offset; for all other configs the stride comes from
-    # config.streaming_anchor_stride.
-    with _train_b1k_anchor_stride_env(getattr(config, "streaming_anchor_stride", 1)):
+    # config.streaming_anchor_stride. Epoch-anchor-offset configs build the
+    # first epoch with offset[0] and rebuild at each epoch boundary.
+    epoch_offsets = getattr(config, "epoch_anchor_offsets", None)
+    initial_offset = int(epoch_offsets[0]) if epoch_offsets else 0
+    with _train_b1k_anchor_env(
+        getattr(config, "streaming_anchor_stride", 1),
+        initial_offset,
+    ):
         loader, data_config = build_datasets(config)
 
     # Build validation data loader (if val_data is configured)
@@ -3543,6 +3575,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     if config.num_train_epochs is not None:
         if config.num_train_epochs <= 0:
             raise ValueError("--num_train_epochs must be a positive integer when provided.")
+        if epoch_offsets is not None and len(epoch_offsets) != int(config.num_train_epochs):
+            raise ValueError(
+                f"epoch_anchor_offsets length ({len(epoch_offsets)}) must equal "
+                f"num_train_epochs ({config.num_train_epochs}); got offsets={epoch_offsets}"
+            )
         computed_steps = int(config.num_train_epochs) * steps_per_epoch
         provided_steps = int(config.num_train_steps)
         target_steps = computed_steps if provided_steps <= 0 else min(provided_steps, computed_steps)
@@ -4082,6 +4119,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     formal_pass_start = 0
     formal_pass_end = int(config.num_train_steps)
     train_iterator = None
+    epoch_anchor_index = 0 if (epoch_offsets is not None and not formal_b1k_mode) else None
     while global_step < int(config.num_train_steps):
         if formal_b1k_mode:
             next_pass_index, next_offset, pass_steps, pass_start, pass_end = _formal_b1k_pass_for_step(global_step)
@@ -4112,6 +4150,37 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         formal_pass_end,
                     )
         else:
+            # Epoch-anchor-offset mode: rebuild the loader when a new epoch
+            # starts so the dataset captures the next offset from the env.
+            # The streaming dataset reads OPENPI_B1K_ANCHOR_OFFSET at
+            # construction time; merely calling iter(loader) would replay the
+            # same offset for every epoch. Formal B1K mode uses its own
+            # explicit multi-pass rebuild above and never enters this branch.
+            if epoch_offsets is not None and not formal_b1k_mode:
+                current_epoch = global_step // steps_per_epoch
+                if current_epoch != epoch_anchor_index:
+                    if current_epoch >= len(epoch_offsets):
+                        break
+                    accelerator.wait_for_everyone()
+                    _close_training_iterator(train_iterator)
+                    train_iterator = None
+                    del loader
+                    gc.collect()
+                    next_offset = int(epoch_offsets[current_epoch])
+                    with _train_b1k_anchor_env(
+                        int(getattr(config, "streaming_anchor_stride", 1)),
+                        next_offset,
+                    ):
+                        loader, _ = build_datasets(config)
+                    loader = accelerator.prepare(loader)
+                    epoch_anchor_index = current_epoch
+                    if is_main:
+                        logging.info(
+                            "Epoch anchor offset rotated: epoch=%s offset=%s stride=%s",
+                            current_epoch + 1,
+                            next_offset,
+                            getattr(config, "streaming_anchor_stride", 1),
+                        )
             train_iterator = iter(loader)
 
         for observation, actions in train_iterator:

@@ -138,6 +138,22 @@ class TrainConfig:
     # construction. Default 1 preserves pre-existing behavior.
     streaming_anchor_stride: int = 1
 
+    # Per-epoch anchor offsets for streaming-anchor training. When set, the
+    # trainer rebuilds the training dataloader at each epoch boundary with
+    # ``OPENPI_B1K_ANCHOR_OFFSET`` set to the corresponding entry. The list
+    # length must equal ``num_train_epochs`` (when that is not None) and each
+    # value must satisfy ``0 <= offset < streaming_anchor_stride``.
+    #
+    # Rationale: the streaming dataset captures the anchor offset from the
+    # environment *at construction time* (``_read_streaming_anchor_env`` in
+    # ``behavior/learning/datas/dataset.py``). Simply calling ``iter(loader)``
+    # at an epoch boundary does NOT change the offset — the same dataset
+    # instance with its construction-time offset is replayed. To actually
+    # rotate offsets the dataset and loader must be rebuilt.
+    #
+    # Default None preserves legacy single-offset / fixed-step behavior.
+    epoch_anchor_offsets: list[int] | None = None
+
     # ---- Deterministic / representative validation (opt-in) ----
     # Default False everywhere => legacy behaviour is bit-for-bit unchanged.
     #
@@ -238,6 +254,19 @@ class TrainConfig:
             raise ValueError(
                 f"--streaming_anchor_stride must be a positive integer, got {self.streaming_anchor_stride}."
             )
+
+        if self.epoch_anchor_offsets is not None:
+            if not isinstance(self.epoch_anchor_offsets, (list, tuple)) or len(self.epoch_anchor_offsets) == 0:
+                raise ValueError(
+                    "epoch_anchor_offsets must be a non-empty list when set; "
+                    f"got {self.epoch_anchor_offsets!r}"
+                )
+            for offset in self.epoch_anchor_offsets:
+                if not isinstance(offset, int) or not 0 <= offset < self.streaming_anchor_stride:
+                    raise ValueError(
+                        f"epoch_anchor_offsets entry {offset!r} must be an integer in "
+                        f"[0, {self.streaming_anchor_stride}); got list {self.epoch_anchor_offsets!r}"
+                    )
 
 
 def eps_index_fn(*indexs):
