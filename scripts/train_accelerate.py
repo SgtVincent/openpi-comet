@@ -921,7 +921,6 @@ def build_val_datasets(config: _config.TrainConfig):
                 )
                 raise _StratifiedValUnavailable
             ds = _data_loader.transform_dataset(raw, val_dc, skip_norm_stats=False)
-            subset = _FixedIndexSubset(ds, indices, task_ids)
 
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
             per_gpu = (
@@ -929,6 +928,49 @@ def build_val_datasets(config: _config.TrainConfig):
                 if getattr(config, "val_batch_size", None) is not None
                 else max(1, int(config.batch_size) // max(1, world_size))
             )
+
+            # Pad the index list to a whole number of global batches.
+            #
+            # Both DistributedSampler and the DataLoader below use
+            # drop_last=True (needed so every rank runs the same number of
+            # iterations), which means WITHOUT padding the number of scored
+            # anchors silently depends on world_size:
+            #   500 anchors,  8 ranks, bs 8 -> 62/rank -> 7 batches -> 448 (90%)
+            #   500 anchors, 32 ranks, bs 8 -> 15/rank -> 1 batch   -> 256 (51%)
+            #   100 anchors, 32 ranks, bs 8 ->  3/rank -> 0 batches ->   0 (!)
+            # That would defeat the whole point of a fixed subset (the scored
+            # set must not change with the cluster shape) and in the last case
+            # validation would silently score nothing.
+            # Padding by repeating the head of the list is deterministic, keeps
+            # every rank's iteration count equal, and guarantees every anchor is
+            # scored; the few duplicated anchors are counted twice, which is
+            # recorded in `coverage` so it is visible in metrics.jsonl.
+            stride = max(1, per_gpu * max(1, world_size))
+            remainder = len(indices) % stride
+            if remainder:
+                pad = stride - remainder
+                indices = indices + indices[:pad]
+                task_ids = task_ids + task_ids[:pad]
+                coverage["n_padded"] = len(indices)
+                coverage["n_duplicated"] = pad
+                logging.info(
+                    "Val subset padded %d -> %d anchors (%d duplicated) so that "
+                    "world_size=%d x batch=%d divides it evenly and no anchor is dropped.",
+                    coverage["n_samples"], len(indices), pad, world_size, per_gpu,
+                )
+                if pad > 0.25 * coverage["n_samples"]:
+                    logging.warning(
+                        "Val subset padding duplicates %d of %d anchors (%.0f%%): the "
+                        "subset is small relative to world_size x batch (%d). Raise "
+                        "val_episodes_per_task (or lower val_batch_size) so the subset "
+                        "is a near-multiple of %d, otherwise a few anchors dominate the "
+                        "reported metrics.",
+                        pad, coverage["n_samples"],
+                        100.0 * pad / coverage["n_samples"], stride, stride,
+                    )
+
+            subset = _FixedIndexSubset(ds, indices, task_ids)
+
             sampler = None
             if torch.distributed.is_initialized() and world_size > 1:
                 sampler = torch.utils.data.distributed.DistributedSampler(

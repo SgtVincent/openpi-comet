@@ -40,6 +40,7 @@ reproduce a historical run's exact val numbers.
 | Script | Purpose |
 |---|---|
 | `verify_val_subset.py` | Regression check for the val patch. Calls the real `build_val_datasets()` and asserts (P1) the subset covers all tasks, (P2) two independent iterations score byte-identical samples, (P3) `deterministic_flow=True` gives bit-identical flow metrics while the default path stays stochastic. Set `VAL_VERIFY_CKPT=/path/to/ckpt_dir` to enable P3. |
+| `verify_val_multirank.py` | Multi-rank regression check for the cross-rank reduction (run under `torch.distributed.run`). Asserts the per-rank shards of the fixed subset are disjoint, and that `run_validation()`'s per-task `all_reduce` matches an independently all_gathered recomputation. Uses a stub model so the aggregation is checked against known ground truth. |
 | `eval_multi_ckpt.py` | Evaluate several checkpoints on ONE fixed stratified subset. Materializes the batches once and reuses them, so every checkpoint sees byte-identical tensors and a **paired** comparison is valid. |
 | `bench_val_variance.py` | Measure true independent-sample variance on the stratified subset and derive the subset size `K` needed for a target SEM, plus a per-task breakdown. |
 | `run_val_eval.sh` | Env wrapper reproducing the training-time environment (conda env, offline HF, node-local caches, baseline stride contract). |
@@ -63,6 +64,10 @@ CUDA_VISIBLE_DEVICES=0 scripts/val_eval/run_val_eval.sh \
 CUDA_VISIBLE_DEVICES=0 scripts/val_eval/run_val_eval.sh \
     scripts/val_eval/bench_val_variance.py \
     --ckpt /path/to/ckpt --label mymodel --flow-l1
+
+# 4. verify the cross-rank reduction (needs >1 GPU)
+scripts/val_eval/run_val_eval.sh -m torch.distributed.run \
+    --nproc_per_node=8 scripts/val_eval/verify_val_multirank.py
 ```
 
 Results are written under `./val_eval_results/` by default.
