@@ -123,6 +123,12 @@ class TrainConfig:
     val_repo_id: str | None = None
     val_episodes_index: list[int] | None = None
 
+    # B1K chunk-streaming anchor stride for the *training* loader. The
+    # validation loader always uses the baseline stride-1 contract. The trainer
+    # materializes this as ``OPENPI_B1K_ANCHOR_STRIDE`` scoped to train-dataset
+    # construction. Default 1 preserves pre-existing behavior.
+    streaming_anchor_stride: int = 1
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         return (pathlib.Path(self.assets_base_dir) / self.name).resolve()
@@ -162,6 +168,11 @@ class TrainConfig:
 
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+        if self.streaming_anchor_stride < 1:
+            raise ValueError(
+                f"--streaming_anchor_stride must be a positive integer, got {self.streaming_anchor_stride}."
+            )
 
 
 def eps_index_fn(*indexs):

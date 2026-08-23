@@ -155,6 +155,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         subtask_template_path: str | Path | None = None,
         subtask_object_name_mapping_path: str | Path | None = None,
         subtask_joiner: str = " then ",
+        skill_bridge_config=None,  # SkillBridgeConfig or None (disabled)
     ):
         """
         Custom args:
@@ -217,6 +218,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             Path(subtask_object_name_mapping_path) if subtask_object_name_mapping_path is not None else None
         )
         self.subtask_joiner = subtask_joiner
+        self._skill_bridge_config = skill_bridge_config
         self._subtask_templates = None
         self._subtask_object_name_mapping = None
         self._subtask_segments = {}
@@ -495,6 +497,121 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             if s <= frame_index <= e:
                 return t
         return self._get_task_at_level(item, 1)
+
+    def _get_bridge_subtask_text(
+        self,
+        item: dict,
+        query_indices: dict | None = None,
+        padding: dict | None = None,
+    ) -> str | None:
+        """Bridge-aware subtask text.
+
+        When skill bridge is enabled AND subtask_source is annotations_skill,
+        and the action chunk crosses exactly one contiguous skill boundary
+        with no padding, returns a combined phrase like
+        ``"{current_skill} then {successor_skill}"``.
+
+        All other cases return the same result as ``_get_subtask_text``,
+        preserving original behavior exactly.
+
+        Frame index convention: skill segments use episode-local frame
+        indices (0-based within each episode).  HF query indices are global
+        (concatenated across episodes), so we convert to episode-local by
+        subtracting the episode start offset.
+        """
+        base_phrase = self._get_subtask_text(item)
+        if base_phrase is None:
+            return None
+
+        # Fast path: disabled or not a bridge-eligible source
+        sb_cfg = self._skill_bridge_config
+        if sb_cfg is None or not getattr(sb_cfg, "enabled", False):
+            return base_phrase
+        # Phase 1: only annotations_skill supports bridging
+        if self.subtask_source != "annotations_skill":
+            return base_phrase
+
+        ep_idx = item["episode_index"].item()
+        anchor_frame = round(item["timestamp"].item() * self.fps)
+
+        # Ensure segments are loaded (segments are episode-local)
+        if ep_idx not in self._subtask_segments:
+            segs, ends = self._build_subtask_segments_for_episode(ep_idx)
+            self._subtask_segments[ep_idx] = segs
+            self._subtask_segment_ends[ep_idx] = ends
+        segs = self._subtask_segments[ep_idx]
+        if not segs:
+            return base_phrase
+
+        # --- Compute action frames (episode-local) and pad mask ---------------
+        action_is_pad = None
+        local_action_frames = None
+        episode_end_frame = None
+
+        # 1. Try explicit padding from caller (streaming path)
+        if padding is not None:
+            for key in padding:
+                if "action_is_pad" in key:
+                    action_is_pad = list(padding[key])
+                    break
+
+        # 2. Try padding from item dict (non-streaming: parent puts it there)
+        if action_is_pad is None:
+            for key in item:
+                if "action_is_pad" in key:
+                    action_is_pad = list(item[key])
+                    break
+
+        # 3. Compute local action frame indices
+        if query_indices is not None:
+            # Streaming path: explicit query_indices
+            action_global = None
+            for key in query_indices:
+                if key.endswith("action") or key.startswith("action"):
+                    action_global = query_indices[key]
+                    break
+            if action_global is not None:
+                ep_pos = self.episode_data_index_pos[ep_idx]
+                ep_start = int(self.episode_data_index["from"][ep_pos].item())
+                local_action_frames = [f - ep_start for f in action_global]
+        elif action_is_pad is not None:
+            # Non-streaming path: no explicit query_indices passed, but
+            # item has action_is_pad.  Derive local frames from anchor + horizon.
+            horizon = len(action_is_pad)
+            local_action_frames = [anchor_frame + d for d in range(horizon)]
+
+        # 4. Episode end (for padded-tail detection when no pad mask)
+        if self.episode_data_index is not None and ep_idx in self.episode_data_index_pos:
+            ep_pos = self.episode_data_index_pos[ep_idx]
+            ep_end_global = int(self.episode_data_index["to"][ep_pos].item())
+            ep_start = int(self.episode_data_index["from"][ep_pos].item())
+            episode_end_frame = ep_end_global - ep_start - 1  # inclusive
+
+        # Import lazily to avoid top-level dependency in dataset module
+        from openpi.training.skill_bridge_integration import get_bridge_subtask_text
+
+        return get_bridge_subtask_text(
+            segs,
+            anchor_frame,
+            chunk_size=self._action_horizon(),
+            action_query_frames=local_action_frames,
+            action_is_pad=action_is_pad,
+            episode_end_frame=episode_end_frame,
+            min_pre_boundary_steps=getattr(sb_cfg, "min_pre_boundary_steps", 1),
+            min_post_boundary_steps=getattr(sb_cfg, "min_post_boundary_steps", 1),
+            fallback_phrase=base_phrase,
+            subtask_source=self.subtask_source,
+            enabled=True,  # already checked enabled above
+        )
+
+    def _action_horizon(self) -> int:
+        """Infer action horizon from delta_indices config."""
+        if self.delta_indices is not None:
+            for key, deltas in self.delta_indices.items():
+                if key.endswith("action") or key.startswith("action"):
+                    return len(deltas)
+        # Fallback: should not happen in normal usage
+        return 0
 
     def prepare_task(self, fine_grained_level: int):
         """set train subtask mode for lerobot dataset"""
@@ -1000,7 +1117,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
             item["task"] = self._get_fine_grained_task(item)
-            subtask_text = self._get_subtask_text(item)
+            # Non-streaming path: no per-step query indices available,
+            # so bridge uses anchor_frame + chunk_size fallback.
+            subtask_text = self._get_bridge_subtask_text(item)
             if subtask_text is not None:
                 item["subtask_text"] = subtask_text
             return item
@@ -1068,7 +1187,13 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                     item[cam] = self.image_transforms(item[cam])
 
             item["task"] = self._get_fine_grained_task(item)
-            subtask_text = self._get_subtask_text(item)
+            # Streaming path: pass actual query indices + pad mask for
+            # accurate bridge boundary detection.
+            subtask_text = self._get_bridge_subtask_text(
+                item,
+                query_indices=query_indices if self.delta_indices is not None else None,
+                padding=padding if self.delta_indices is not None else None,
+            )
             if subtask_text is not None:
                 item["subtask_text"] = subtask_text
             self._advance_streaming_anchor(observation_consumed=True, context="advancing after an aligned anchor")

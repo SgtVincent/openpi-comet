@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# π0.5-KI joint-query single-task BF16 training for Merlin/Arnold on HL.
-# Contract: turning_on_radio, episodes 0-179 train / 180-199 validation,
-# KI enabled, 2000-step cap and one epoch, validation every 100 steps,
-# checkpoint every 200 steps, Accelerate + DeepSpeed ZeRO-2.
+# ============================================================
+# π0.5-KI joint-query Skill Bridge single-task BF16 training
+# for Merlin/Arnold on LQ (cloudnative-lq) cluster.
+#
+# Topology: 4 nodes × 8 A100-SXM4-40GB = 32 GPUs
+# Config  : pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_bf16
+# Task    : turning_on_radio
+# Budget  : min(2000 steps, 1 epoch)
+# Precision: BF16 (DeepSpeed ZeRO-2, GPU-resident optimizer)
+# ============================================================
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# REPO_ROOT may be explicitly set (e.g. /opt/tiger/openpi-comet for web
+# FULL_SCRIPT mounts). If unset, derive from script location.
+if [[ -z "${REPO_ROOT:-}" ]]; then
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
 cd "${REPO_ROOT}"
 
 export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
@@ -14,35 +24,29 @@ export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 export PYTHONNOUSERSITE=1
 unset PYTHONHOME
 
-# The no-training test mode skips conda and all model/data/dependency checks, but
-# runs the exact same temp-path binding and validation as a real job.
-if [[ "${OPENPI_LAUNCH_PREFLIGHT_ONLY:-0}" != "1" ]]; then
-  CONDA_ROOT="${CONDA_ROOT:-/mnt/bn/navigation-hl/mlx/users/chenjunting/miniconda3}"
-  CONDA_ENV="${CONDA_ENV:-openpi-comet-nas}"
-  CONDA_SH="${CONDA_ROOT}/etc/profile.d/conda.sh"
-  if [[ ! -f "${CONDA_SH}" ]]; then
-    echo "ERROR: conda initialization script not found: ${CONDA_SH}" >&2
-    exit 1
-  fi
-  # shellcheck disable=SC1090
-  source "${CONDA_SH}"
-  conda activate "${CONDA_ENV}"
-  export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+# ---- LQ cluster paths ----
+CONDA_ROOT="${CONDA_ROOT:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-openpi-comet-nas}"
+CONDA_SH="${CONDA_ROOT}/etc/profile.d/conda.sh"
+if [[ ! -f "${CONDA_SH}" ]]; then
+  echo "ERROR: conda initialization script not found: ${CONDA_SH}" >&2
+  exit 1
 fi
+# shellcheck disable=SC1090
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
-CONFIG_NAME="${CONFIG_NAME:-pi05_ki_joint_query_b1k-single_task-radio-ki_on_bf16}"
-BASE_PI05_CKPT="${BASE_PI05_CKPT:-${REPO_ROOT}/checkpoints/pi05_base_pytorch}"
-B1K_DATASET_ROOT="${B1K_DATASET_ROOT:-/mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos/}"
-# Keep model and normalization assets coherent when BASE_PI05_CKPT is overridden.
+CONFIG_NAME="${CONFIG_NAME:-pi05_ki_joint_query_b1k-single_task-radio-ki_on_skillbridge_bf16}"
+BASE_PI05_CKPT="${BASE_PI05_CKPT:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/repo/openpi-comet/checkpoints/pi05_base_pytorch}"
+B1K_DATASET_ROOT="${B1K_DATASET_ROOT:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/data/2025-challenge-demos/}"
 B1K_ASSETS_DIR="${BASE_PI05_CKPT}/assets/behavior-1k/2025-challenge-demos"
 NORM_STATS_PATH="${B1K_ASSETS_DIR}/norm_stats.json"
 ACCEL_CONFIG="${ACCEL_CONFIG:-${REPO_ROOT}/configs/accelerate_ds_zero2.yaml}"
 DEEPSPEED_CONFIG="${REPO_ROOT}/configs/deepspeed_zero2.json"
 TRAINER="${TRAINER:-${REPO_ROOT}/scripts/train_accelerate.py}"
 
-# Put cache and temporary read/write state on each node's local filesystem.
-# Arnold job/task IDs are shared by all nodes in one run, while /tmp itself is
-# node-local. This isolates concurrent jobs without giving ranks divergent paths.
+# ---- Local per-node cache (avoid NAS lock contention) ----
 CACHE_RUN_KEY="${ARNOLD_JOB_ID:-${ARNOLD_TASK_ID:-${ARNOLD_WORKER_0_HOST:-manual}_${ARNOLD_WORKER_0_PORT:-local}}}"
 CACHE_RUN_KEY="${CACHE_RUN_KEY//\//_}"
 CACHE_RUN_KEY="${CACHE_RUN_KEY//:/_}"
@@ -177,22 +181,10 @@ print(f"MULTIPROCESS_MANAGER_SOCKET_BYTES={manager_socket_bytes}")
 print("MULTIPROCESS_MANAGER_PREFLIGHT_OK")
 PY
 
-# Verifying the AF_UNIX fix must not require HL NAS assets or any GPU, so exit
-# here before the checkpoint/dataset/dependency checks and the Accelerate launch.
-if [[ "${OPENPI_LAUNCH_PREFLIGHT_ONLY:-0}" == "1" ]]; then
-  printf '%s\n' \
-    "LOCAL_CACHE_ROOT=${LOCAL_CACHE_ROOT}" \
-    "LOCAL_TMP_BACKING=${LOCAL_TMP_BACKING}" \
-    "TMPDIR=${TMPDIR}" \
-    "TMP=${TMP}" \
-    "TEMP=${TEMP}"
-  echo "LOCAL_CACHE_PREFLIGHT_OK; distributed launch skipped"
-  exit 0
-fi
-
-# Offline OpenPI tokenizer bootstrap. The model itself stays on shared NAS, while
-# its small metadata is copied locally for offline consumers that expect a cache.
-REPO_OPENPI_CACHE="${REPO_OPENPI_CACHE:-${REPO_ROOT}/.cache/openpi}"
+# Offline tokenizer bootstrap.
+# NOTE: the tokenizer cache is NOT part of the Git checkout (untracked).
+# Default to the canonical LQ NAS path; allow env override for custom setups.
+REPO_OPENPI_CACHE="${REPO_OPENPI_CACHE:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/repo/openpi-comet/.cache/openpi}"
 TOKENIZER_REL="big_vision/paligemma_tokenizer.model"
 TOKENIZER_SOURCE="${REPO_OPENPI_CACHE}/${TOKENIZER_REL}"
 TOKENIZER_LOCAL="${OPENPI_DATA_HOME}/${TOKENIZER_REL}"
@@ -238,21 +230,44 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-1800}"
 export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
 
-# Merlin exposes these ARNOLD_* values on every node. Explicit standard names
-# remain available as overrides for manual launches and debugging.
-NUM_NODES="${NUM_NODES:-${NNODES:-${ARNOLD_WORKER_NUM:-1}}}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-${NPROC_PER_NODE:-${ARNOLD_WORKER_GPU:-8}}}"
-NODE_RANK="${NODE_RANK:-${ARNOLD_ID:-0}}"
+# ============================================================
+# Topology: strict 4×8 = 32 GPUs for formal LQ trial
+# ============================================================
+NUM_NODES="${NUM_NODES:-${NNODES:-${ARNOLD_WORKER_NUM:-}}}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-${NPROC_PER_NODE:-${ARNOLD_WORKER_GPU:-}}}"
+NODE_RANK="${NODE_RANK:-${ARNOLD_ID:-}}"
 MASTER_ADDR="${MASTER_ADDR:-${ARNOLD_WORKER_0_HOST:-}}"
-MASTER_PORT="${MASTER_PORT:-${ARNOLD_WORKER_0_PORT:-29514}}"
+MASTER_PORT="${MASTER_PORT:-${ARNOLD_WORKER_0_PORT:-}}"
 MASTER_PORT="${MASTER_PORT%%,*}"
-if [[ -z "${MASTER_ADDR}" && "${NUM_NODES}" == "1" ]]; then
-  MASTER_ADDR="127.0.0.1"
-fi
-if [[ -z "${MASTER_ADDR}" ]]; then
-  echo "ERROR: MASTER_ADDR/ARNOLD_WORKER_0_HOST is required for multi-node launch." >&2
+
+# Formal script: fail fast if critical Arnold vars are missing
+if [[ -z "${NUM_NODES}" ]]; then
+  echo "ERROR: NUM_NODES / ARNOLD_WORKER_NUM is required for formal LQ launch." >&2
+  echo "       (use ARNOLD_WORKER_NUM or set NUM_NODES explicitly)" >&2
   exit 2
 fi
+if [[ -z "${GPUS_PER_NODE}" ]]; then
+  echo "ERROR: GPUS_PER_NODE / ARNOLD_WORKER_GPU is required for formal LQ launch." >&2
+  echo "       (use ARNOLD_WORKER_GPU or set GPUS_PER_NODE explicitly)" >&2
+  exit 2
+fi
+if [[ -z "${NODE_RANK}" ]]; then
+  echo "ERROR: NODE_RANK / ARNOLD_ID is required for formal LQ launch." >&2
+  echo "       (use ARNOLD_ID or set NODE_RANK explicitly)" >&2
+  exit 2
+fi
+if [[ -z "${MASTER_ADDR}" ]]; then
+  echo "ERROR: MASTER_ADDR / ARNOLD_WORKER_0_HOST is required for formal LQ multi-node launch." >&2
+  echo "       (use ARNOLD_WORKER_0_HOST or set MASTER_ADDR explicitly)" >&2
+  exit 2
+fi
+if [[ -z "${MASTER_PORT}" ]]; then
+  echo "ERROR: MASTER_PORT / ARNOLD_WORKER_0_PORT is required for formal LQ multi-node launch." >&2
+  echo "       (use ARNOLD_WORKER_0_PORT or set MASTER_PORT explicitly)" >&2
+  exit 2
+fi
+
+# Validate topology values
 if ! [[ "${NUM_NODES}" =~ ^[1-9][0-9]*$ && "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ && "${NODE_RANK}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: invalid topology NUM_NODES=${NUM_NODES} GPUS_PER_NODE=${GPUS_PER_NODE} NODE_RANK=${NODE_RANK}" >&2
   exit 2
@@ -261,9 +276,26 @@ if (( NODE_RANK >= NUM_NODES )); then
   echo "ERROR: NODE_RANK=${NODE_RANK} must be less than NUM_NODES=${NUM_NODES}." >&2
   exit 2
 fi
+
 TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
+
+# Strict 4×8 = 32 GPU constraint for this formal trial script
+if [[ "${NUM_NODES}" != "4" ]]; then
+  echo "ERROR: this LQ formal script requires NUM_NODES=4, got ${NUM_NODES}." >&2
+  exit 2
+fi
+if [[ "${GPUS_PER_NODE}" != "8" ]]; then
+  echo "ERROR: this LQ formal script requires GPUS_PER_NODE=8, got ${GPUS_PER_NODE}." >&2
+  exit 2
+fi
+if [[ "${TOTAL_GPUS}" != "32" ]]; then
+  echo "ERROR: this LQ formal script requires TOTAL_GPUS=32, got ${TOTAL_GPUS}." >&2
+  exit 2
+fi
+
 export MASTER_ADDR MASTER_PORT NUM_NODES GPUS_PER_NODE NODE_RANK
 
+# ---- Training hyperparameters ----
 NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-2000}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-200}"
@@ -279,7 +311,7 @@ if [[ "${PYTORCH_TRAINING_PRECISION}" != "bfloat16" ]]; then
   exit 2
 fi
 
-# Check all default HL dependencies before any distributed process is started.
+# ---- Preflight checks (filesystem + deps) ----
 for _required_file in \
   "${TRAINER}" \
   "${ACCEL_CONFIG}" \
@@ -339,8 +371,8 @@ if [[ -n "${TRAINING_DEP_ISSUES}" ]]; then
   exit 1
 fi
 
-# All durable artifacts stay under the shared repository/NAS checkout.
-PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-${REPO_ROOT}/outputs/${CONFIG_NAME}}"
+# ---- Persistent output on shared NAS (not local /opt/tiger) ----
+PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/repo/outputs/pi05_skillbridge_a100_lq_bf16}"
 ASSETS_BASE_DIR="${ASSETS_BASE_DIR:-${PERSISTENT_OUTPUT_ROOT}/assets}"
 CHECKPOINT_BASE_DIR="${CHECKPOINT_BASE_DIR:-${PERSISTENT_OUTPUT_ROOT}/checkpoints}"
 LOG_BASE_DIR="${LOG_BASE_DIR:-${PERSISTENT_OUTPUT_ROOT}/logs}"
@@ -359,13 +391,14 @@ else
   fi
 fi
 
+# ---- EXP_NAME sync across nodes (on shared NAS) ----
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 if [[ -z "${EXP_NAME:-}" ]]; then
   RUN_KEY="${ARNOLD_JOB_ID:-${ARNOLD_TASK_ID:-${MASTER_ADDR}_${MASTER_PORT}_${NUM_NODES}x${GPUS_PER_NODE}}}"
   RUN_KEY="${RUN_KEY//\//_}"
   RUN_KEY="${RUN_KEY//:/_}"
   RUN_KEY="${RUN_KEY// /_}"
-  EXP_NAME_FILE="${EXP_NAME_SYNC_DIR}/radio_bf16_${RUN_KEY}.txt"
+  EXP_NAME_FILE="${EXP_NAME_SYNC_DIR}/skillbridge_radio_bf16_lq_${RUN_KEY}.txt"
   _script_start_sentinel="${EXP_NAME_SYNC_DIR}/.node${NODE_RANK}.start_sentinel.$$"
   : > "${_script_start_sentinel}"
   _script_start_ts="$(stat -c %Y "${_script_start_sentinel}")"
@@ -375,7 +408,7 @@ if [[ -z "${EXP_NAME:-}" ]]; then
       EXP_NAME="$(<"${EXP_NAME_FILE}")"
       touch "${EXP_NAME_FILE}"
     else
-      EXP_NAME="pi05_ki_joint_query_single_task_radio_bf16_${NUM_NODES}n${GPUS_PER_NODE}g_${TIMESTAMP}"
+      EXP_NAME="pi05_ki_joint_query_single_task_radio_skillbridge_bf16_lq_${NUM_NODES}n${GPUS_PER_NODE}g_${TIMESTAMP}"
       _exp_name_tmp="${EXP_NAME_FILE}.tmp.$$"
       printf '%s\n' "${EXP_NAME}" > "${_exp_name_tmp}"
       mv -f "${_exp_name_tmp}" "${EXP_NAME_FILE}"
@@ -397,6 +430,7 @@ if [[ -z "${EXP_NAME:-}" ]]; then
   fi
 fi
 
+# Per-node console logs on shared NAS
 CONSOLE_LOG_DIR="${PERSISTENT_OUTPUT_ROOT}/console_logs/${EXP_NAME}"
 if [[ "${NODE_RANK}" == "0" ]]; then
   mkdir -p "${CONSOLE_LOG_DIR}"
@@ -424,7 +458,7 @@ fi
 
 GLOBAL_BATCH_SIZE=$((BATCH_SIZE_PER_GPU * TOTAL_GPUS * GRADIENT_ACCUMULATION_STEPS))
 echo "============================================================"
-echo "π0.5-KI joint-query single-task BF16 HL launch"
+echo "π0.5-KI Skill Bridge single-task BF16 LQ launch"
 echo "CONFIG_NAME=${CONFIG_NAME}"
 echo "EXP_NAME=${EXP_NAME}"
 echo "TOPOLOGY=${NUM_NODES} nodes x ${GPUS_PER_NODE} GPUs (rank ${NODE_RANK}, world ${TOTAL_GPUS})"
@@ -439,11 +473,33 @@ echo "BUDGET=min(${NUM_TRAIN_STEPS} steps, ${NUM_TRAIN_EPOCHS} epoch)"
 echo "INTERVALS=validation ${VAL_LOG_INTERVAL}, save ${SAVE_INTERVAL}"
 echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "LOCAL_CACHE_ROOT=${LOCAL_CACHE_ROOT}"
-echo "TMPDIR=${TMPDIR} -> $(readlink -- "${TMPDIR}" 2>/dev/null || echo "${TMPDIR}")"
 echo "PERSISTENT_OUTPUT_ROOT=${PERSISTENT_OUTPUT_ROOT}"
 echo "CONSOLE_LOG=${CONSOLE_LOG}"
 echo "============================================================"
 
+# ---- Preflight-only mode: print command and exit without launching training ----
+if [[ "${OPENPI_LAUNCH_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  echo ""
+  echo "PREFLIGHT MODE (OPENPI_LAUNCH_PREFLIGHT_ONLY=1) — would run:"
+  echo "  python -m accelerate.commands.launch \\"
+  echo "    --config_file ${ACCEL_CONFIG} \\"
+  echo "    --num_processes ${TOTAL_GPUS} \\"
+  echo "    --num_machines ${NUM_NODES} \\"
+  echo "    --machine_rank ${NODE_RANK} \\"
+  echo "    --main_process_ip ${MASTER_ADDR} \\"
+  echo "    --main_process_port ${MASTER_PORT} \\"
+  echo "    --same_network \\"
+  echo "    ${TRAINER} \\"
+  echo "    ${CONFIG_NAME} \\"
+  echo "    --pytorch-weight-path ${BASE_PI05_CKPT} \\"
+  echo "    --exp-name ${EXP_NAME} \\"
+  echo "    ... (remaining CLI args)"
+  echo ""
+  echo "Preflight OK — all checks passed. Exiting without launching training."
+  exit 0
+fi
+
+# ---- Single accelerate launch ----
 python -m accelerate.commands.launch \
   --config_file "${ACCEL_CONFIG}" \
   --num_processes "${TOTAL_GPUS}" \

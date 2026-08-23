@@ -346,6 +346,29 @@ def _baseline_b1k_dataset_env():
                 os.environ[key] = value
 
 
+@contextmanager
+def _train_b1k_anchor_stride_env(stride: int):
+    """Pin ``OPENPI_B1K_ANCHOR_STRIDE`` for the train-loader build only.
+
+    The B1K streaming dataset reads its anchor stride from the environment at
+    construction time. We set it from ``config.streaming_anchor_stride`` scoped
+    to the train-dataloader build and restore the prior state afterwards, so
+    the config field stays the source of truth and validation can independently
+    force stride-1 via :func:`_baseline_b1k_dataset_env`.
+    """
+
+    env_key = "OPENPI_B1K_ANCHOR_STRIDE"
+    saved = os.environ.get(env_key)
+    try:
+        os.environ[env_key] = str(int(stride))
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = saved
+
+
 def _formal_b1k_pass_for_step(global_step: int) -> tuple[int, int, int, int, int]:
     if not 0 <= global_step < _FORMAL_B1K_PASS_BOUNDARIES[-1]:
         raise ValueError(f"Formal B1K global_step out of range: {global_step}")
@@ -2787,16 +2810,22 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 offload_config.get("pin_memory"),
             )
 
-    loader, data_config = build_datasets(config)
+    # Build the training loader under the config's streaming anchor stride.
+    # The formal B1K pass loop overrides this per-pass via
+    # _set_formal_b1k_pass_offset; for all other configs the stride comes from
+    # config.streaming_anchor_stride.
+    with _train_b1k_anchor_stride_env(getattr(config, "streaming_anchor_stride", 1)):
+        loader, data_config = build_datasets(config)
 
     # Build validation data loader (if val_data is configured)
     val_loader = None
     val_data_config = None
     if config.val_data:
-        if _is_formal_b1k_mode(config):
-            with _baseline_b1k_dataset_env():
-                val_loader, val_data_config = build_val_datasets(config)
-        else:
+        # Validation always uses the baseline stride-1 / no-drop contract so
+        # that metrics are computed on the full-resolution data, independent
+        # of any training-side streaming anchor stride (e.g. stride-4 skill
+        # bridge or the stride-12 formal passes).
+        with _baseline_b1k_dataset_env():
             val_loader, val_data_config = build_val_datasets(config)
         if is_main:
             val_eps = getattr(val_data_config, "episodes_index", None)
@@ -2820,6 +2849,40 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     steps_per_epoch = max(1, steps_per_epoch_micro // accelerator.gradient_accumulation_steps)
     if steps_per_epoch <= 0:
         raise RuntimeError(f"Computed steps_per_epoch={steps_per_epoch}, expected a positive value.")
+
+    # Streaming anchor stride: the B1K streaming dataset advances its cursor by
+    # ``config.streaming_anchor_stride`` frames per sample, so a single pass over
+    # the unique anchors spans ``len(loader) // stride`` micro-batches, not the
+    # full raw frame count. Without this correction, ``num_train_epochs=N``
+    # would iterate the anchor cycle ~``stride`` times per "epoch". We floor to
+    # the nearest complete anchor (incomplete trailing horizons are dropped,
+    # matching ``_streaming_drop_incomplete_horizon`` semantics). The grad-accum
+    # division is applied AFTER the stride reduction, so the effective optimizer
+    # steps per epoch == (microbatches // stride) // grad_accum. The formal B1K
+    # control uses a fixed 104,912-step budget (epochs=None) and is left
+    # untouched; this adjustment only affects epoch-based runs.
+    streaming_stride = int(getattr(config, "streaming_anchor_stride", 1))
+    if streaming_stride > 1 and config.num_train_epochs is not None:
+        effective_micro = max(1, steps_per_epoch_micro // streaming_stride)
+        effective_steps_per_epoch = max(
+            1, effective_micro // accelerator.gradient_accumulation_steps
+        )
+        if is_main:
+            logging.info(
+                "Streaming anchor stride=%s: steps_per_epoch reduced from %s to %s "
+                "(raw_micro=%s, effective_micro=%s//%s=%s, grad_accum=%s) "
+                "so one epoch == one pass over unique anchors",
+                streaming_stride,
+                steps_per_epoch,
+                effective_steps_per_epoch,
+                steps_per_epoch_micro,
+                steps_per_epoch_micro,
+                streaming_stride,
+                effective_micro,
+                accelerator.gradient_accumulation_steps,
+            )
+        steps_per_epoch = effective_steps_per_epoch
+
     if _is_formal_b1k_mode(config) and is_main:
         logging.info(
             "Formal B1K lean contract: offsets=(0,4,8), pass_steps=(34982,34971,34959), "
