@@ -4,10 +4,15 @@
   "gradient_clipping": 1.0,
   "zero_optimization": {
     "stage": 2,
-    "overlap_comm": true,
+    "overlap_comm": false,
     "contiguous_gradients": true,
     "reduce_bucket_size": 500000000,
     "allgather_bucket_size": 500000000
+  },
+  "timers": {
+    "throughput": {
+      "enabled": false
+    }
   },
   "bf16": {
     "enabled": true

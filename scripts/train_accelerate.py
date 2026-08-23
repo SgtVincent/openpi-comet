@@ -1065,6 +1065,107 @@ def _validate_deepspeed_precision_config(accelerator: Accelerator, ds_config: di
         raise ValueError(f"Requested float32 training but accelerator.mixed_precision={accel_mp}.")
 
 
+def _fast_grad_norm_enabled() -> bool:
+    """Whether the batched fp32 ZeRO gradient-norm replacement is installed.
+
+    Defaults to disabled so unset environments keep DeepSpeed's stock float64
+    behavior. Set ``OPENPI_DS_FAST_GRAD_NORM=1`` to enable.
+    """
+    return os.environ.get("OPENPI_DS_FAST_GRAD_NORM", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def _patch_deepspeed_grad_norm() -> None:
+    """Compute ZeRO gradient norms in fp32 with batched multi-tensor kernels.
+
+    DeepSpeed's ``get_grad_norm_direct`` casts **every** gradient tensor to
+    float64 before taking its norm::
+
+        torch.linalg.vector_norm(g.data.double().detach(), ord=norm_type)
+
+    This model has ~812 parameter tensors, so each call issues roughly 1600
+    kernels (one cast plus one norm per tensor), and the call runs once per
+    parameter group per optimizer step. Profiling with ``py-spy --native``
+    showed the main thread busy inside ``libcuda`` rather than waiting on the
+    GPU, i.e. the cost is kernel-launch overhead rather than arithmetic.
+
+    float64 is not needed for this quantity, and it is not what the reference
+    pipelines in this repository use:
+
+    * ``scripts/train.py`` clips through ``optax.clip_by_global_norm``, and JAX
+      leaves ``jax_enable_x64`` disabled by default, so float64 is silently
+      downgraded and the norm is computed in float32 at best.
+    * ``scripts/train_pytorch.py`` calls ``torch.nn.utils.clip_grad_norm_``,
+      which preserves the gradient dtype and therefore returns bfloat16 for
+      bfloat16 gradients.
+
+    Measured against a float64 reference over 812 tensors, float32 accumulation
+    differs by about 5e-7 relative, while the sum of squared norms keeps roughly
+    1e32 headroom before float32 would overflow. Accumulating in the native
+    bfloat16 instead would give ~7e-5, so the dtype is pinned to float32.
+
+    The replacement keeps cross-rank and model-parallel reduction, the parameter
+    filtering rules, the ``inf``-norm branch and the non-finite masking
+    behavior. It falls back to the original implementation on any error.
+    """
+    try:
+        from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    except ImportError:
+        return
+
+    if getattr(DeepSpeedZeroOptimizer, "_openpi_fast_grad_norm_patched", False):
+        return
+
+    ds_module = sys.modules[DeepSpeedZeroOptimizer.__module__]
+    _orig_get_grad_norm_direct = DeepSpeedZeroOptimizer.get_grad_norm_direct
+
+    @functools.wraps(_orig_get_grad_norm_direct)
+    def _patched_get_grad_norm_direct(self, gradients, params, norm_type=2):
+        norm_type = float(norm_type)
+        # The infinity norm is cheap and rarely used; keep DeepSpeed's version.
+        if norm_type == ds_module.inf:
+            return _orig_get_grad_norm_direct(self, gradients, params, norm_type)
+
+        try:
+            selected = []
+            for grad, param in zip(gradients, params):
+                if grad is None:
+                    continue
+                # Pipeline parallelism may replicate parameters; avoid multi-counting.
+                if getattr(param, ds_module.PIPE_REPLICATED, False):
+                    continue
+                if ds_module.is_model_parallel_parameter(param) or self.model_parallel_rank == 0:
+                    selected.append(grad.detach())
+
+            total_norm = torch.zeros((), dtype=torch.float32, device=self.device)
+            if selected:
+                # _foreach_norm requires a uniform device and dtype per batch.
+                batches: dict[tuple, list] = {}
+                for tensor in selected:
+                    batches.setdefault((tensor.device, tensor.dtype), []).append(tensor)
+                for batch in batches.values():
+                    norms = torch._foreach_norm(batch, norm_type, dtype=torch.float32)
+                    total_norm = total_norm + torch.stack(norms).square().sum()
+        except Exception as exc:
+            _safe_log_warning(
+                "fast ZeRO grad-norm failed (%s); falling back to the DeepSpeed implementation", exc
+            )
+            return _orig_get_grad_norm_direct(self, gradients, params, norm_type)
+
+        # Sum of squared norms across data-parallel and model-parallel ranks.
+        ds_module.dist.all_reduce(total_norm, op=ds_module.dist.ReduceOp.SUM, group=self.dp_process_group)
+        self._model_parallel_all_reduce(tensor=total_norm, op=ds_module.dist.ReduceOp.SUM)
+
+        total_norm = total_norm.pow(1.0 / norm_type)
+        ds_module.mask_nan_or_inf_with_val_inplace(total_norm, device=self.device)
+        return total_norm
+
+    DeepSpeedZeroOptimizer.get_grad_norm_direct = _patched_get_grad_norm_direct
+    DeepSpeedZeroOptimizer._openpi_fast_grad_norm_patched = True
+    logging.info(
+        "Patched DeepSpeed get_grad_norm_direct: batched fp32 norms (was per-tensor float64)"
+    )
+
+
 def _patch_deepspeed_autocast(accelerator: Accelerator) -> None:
     """Patch DeepSpeed engine to be transparent to external torch.autocast contexts.
 
@@ -1455,45 +1556,54 @@ def _metrics_buffer_close() -> None:
         _safe_log_warning("metrics.jsonl close failed: %s", exc)
 
 
+def _loss_finite_check_enabled() -> bool:
+    """Whether the per-step loss-level finite consensus check runs.
+
+    Defaults to enabled so unset environments keep their current behavior. Set
+    ``OPENPI_LOSS_FINITE_CHECK=0`` to skip it.
+
+    Skipping is safe for bf16 / fp32 because a non-finite loss still produces
+    non-finite gradients, and DeepSpeed runs its own gradient-level overflow
+    check (``check_grad_overflow`` defaults to True) which zeroes the gradients
+    and returns without stepping the optimizer. The trainer additionally aborts
+    after ``OPENPI_MAX_CONSECUTIVE_SKIPPED_UPDATES`` skipped updates, so the
+    runaway-divergence guard is preserved.
+
+    The benefit is removing a per-step host/device synchronization: the loss is
+    the terminal node of the forward graph, so reading it drains the CUDA queue
+    between forward and backward and destroys CPU run-ahead.
+    """
+    return os.environ.get("OPENPI_LOSS_FINITE_CHECK", "1").strip().lower() not in {"0", "false", "no"}
+
+
 def _gather_finite_consensus(
     accelerator: Accelerator, *scalars: torch.Tensor
-) -> tuple[bool, list[float]]:
-    """Cheap cross-rank finiteness consensus for multiple scalar tensors.
+) -> bool:
+    """Cheap cross-rank finiteness consensus for one or more scalar tensors.
 
-    Uses only **one** all-reduce (SUM) to determine whether every scalar on
-    every rank is finite.  Unlike :func:`_gather_scalar_stats`, no min / max /
-    mean / std are computed — this is intended for the common fast path where
-    we only need a boolean "is everything OK?" answer.
+    Fast path used on every training step.  Keeps the scalar checks on-device
+    until the single distributed verdict is read, avoiding the per-loss
+    ``.item()`` calls that previously forced extra host/device synchronizations
+    on every rank.
 
-    All ranks get the same answer, so skip / abort decisions are consistent.
-
-    Args:
-        accelerator: Accelerator instance.
-        *scalars: One or more scalar (or 1-element) tensors to check.
-
-    Returns:
-        ``(all_finite, local_values)`` where ``all_finite`` is True only if
-        every scalar on every rank is finite, and ``local_values`` is a list
-        of the local scalar values converted to Python floats.
+    Detailed scalar values / min / max / mean / std should be gathered only on
+    slower diagnostic paths such as log-interval boundaries or when a non-finite
+    value has already been detected.
     """
     import torch.distributed as dist
 
-    local_values: list[float] = []
-    local_bad = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+    local_bad = torch.zeros(1, device=accelerator.device, dtype=torch.float32)
 
     for s in scalars:
         val = s.detach().float().reshape(1)
-        local_values.append(float(val.item()))
-        if not torch.isfinite(val).all():
-            local_bad.fill_(1.0)
+        local_bad += (~torch.isfinite(val)).float()
 
-    # Single all-reduce: sum of "bad rank" flags across all ranks.
+    # Single all-reduce: sum of "bad scalar" flags across all ranks.
     # If the sum is > 0, at least one rank has at least one non-finite scalar.
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(local_bad, op=dist.ReduceOp.SUM)
 
-    all_finite = bool(local_bad.item() == 0.0)
-    return all_finite, local_values
+    return bool(local_bad.item() == 0.0)
 
 
 def _gather_scalar_stats(accelerator: Accelerator, scalar: torch.Tensor) -> dict[str, float]:
@@ -3285,6 +3395,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
         _patch_deepspeed_loss_scaler()
+        if _fast_grad_norm_enabled():
+            _patch_deepspeed_grad_norm()
 
     # Prepare with Accelerator (DDP or DeepSpeed).
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
@@ -3305,8 +3417,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             raise FileNotFoundError(f"No checkpoints found in {config.checkpoint_dir}")
         latest_step, latest_dir = latest
         acc_state_dir = latest_dir / "accelerate_state"
-        if acc_state_dir.exists():
-            accelerator.load_state(str(acc_state_dir))
+        if not acc_state_dir.exists():
+            raise FileNotFoundError(
+                f"Resume checkpoint is missing accelerate_state: {acc_state_dir}. "
+                "Refusing to continue with fresh model/optimizer state."
+            )
+        accelerator.load_state(str(acc_state_dir))
         metadata_path = latest_dir / "metadata.pt"
         if metadata_path.exists():
             metadata = torch.load(metadata_path, map_location="cpu", weights_only=False)
@@ -3548,9 +3664,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     # Cheap cross-rank finiteness check for backbone loss
                     # (1 all-reduce instead of 5 from _gather_scalar_stats).
-                    bb_all_finite, bb_local_vals = _gather_finite_consensus(accelerator, bb_loss)
+                    bb_all_finite = (
+                        _gather_finite_consensus(accelerator, bb_loss)
+                        if _loss_finite_check_enabled()
+                        else True
+                    )
                     bb_nonfinite = not bb_all_finite
-                    bb_loss_val = bb_local_vals[0]
 
                     if bb_nonfinite:
                         # Non-finite detected: compute detailed stats for error diagnostics.
@@ -3606,21 +3725,25 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     # Backbone backward (accumulates grads on backbone params only)
                     accelerator.backward(bb_loss)
 
-                    # Capture scalar metrics, free backbone graph
-                    bb_loss_val = float(bb_loss.detach().float().item())
-                    # Collect raw component losses with their original keys
-                    extra_metrics = {
-                        k: v.item()
-                        for k, v in bb_losses.items()
-                        if k != "backbone_loss" and isinstance(v, torch.Tensor) and v.numel() == 1
-                    }
-                    # Structured loss component keys for π0.5-KI joint query training
-                    # loss_backbone = total backbone loss (CE + query MSE, weighted)
-                    # loss_ce = raw CE loss (detached)
-                    # loss_query_mse = raw query MSE loss (detached)
-                    extra_metrics["loss_backbone"] = bb_loss_val
-                    extra_metrics["loss_ce"] = extra_metrics.get("ce_loss", float("nan"))
-                    extra_metrics["loss_query_mse"] = extra_metrics.get("query_mse_loss", float("nan"))
+                    # Capture scalar metrics only on rank 0. The old code called
+                    # .item() for every component on all 64 ranks even though only
+                    # rank 0 writes metrics, creating unnecessary device syncs.
+                    if is_main:
+                        bb_loss_val = float(bb_loss.detach().float().item())
+                        extra_metrics = {
+                            k: float(v.detach().float().item())
+                            for k, v in bb_losses.items()
+                            if k != "backbone_loss" and isinstance(v, torch.Tensor) and v.numel() == 1
+                        }
+                        # Structured loss component keys for π0.5-KI joint query training
+                        # loss_backbone = total backbone loss (CE + query MSE, weighted)
+                        # loss_ce = raw CE loss (detached)
+                        # loss_query_mse = raw query MSE loss (detached)
+                        extra_metrics["loss_backbone"] = bb_loss_val
+                        extra_metrics["loss_ce"] = extra_metrics.get("ce_loss", float("nan"))
+                        extra_metrics["loss_query_mse"] = extra_metrics.get("query_mse_loss", float("nan"))
+                    else:
+                        bb_loss_val = float("nan")
                     del bb_losses, bb_loss
 
                     if profile_memory:
@@ -3638,9 +3761,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     # Cheap cross-rank finiteness check for expert loss
                     # (1 all-reduce instead of 5 from _gather_scalar_stats).
-                    ex_all_finite, ex_local_vals = _gather_finite_consensus(accelerator, ex_loss)
+                    ex_all_finite = (
+                        _gather_finite_consensus(accelerator, ex_loss)
+                        if _loss_finite_check_enabled()
+                        else True
+                    )
                     ex_nonfinite = not ex_all_finite
-                    ex_loss_val = ex_local_vals[0]
 
                     if ex_nonfinite:
                         # Non-finite detected: compute detailed stats for error diagnostics.
@@ -3697,15 +3823,20 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     # adds flow→backbone grads with KI=OFF)
                     accelerator.backward(ex_loss)
 
-                    # Capture scalar metrics, free expert graph
-                    for k, v in ex_losses.items():
-                        if k != "expert_loss" and isinstance(v, torch.Tensor) and v.numel() == 1:
-                            extra_metrics[k] = v.item()
-                    # Structured loss component keys for π0.5-KI joint query training
-                    # loss_expert = weighted expert loss (alpha * flow_loss)
-                    # loss_flow_raw = raw flow matching loss (pre-alpha weighting)
-                    extra_metrics["loss_expert"] = ex_loss_val
-                    extra_metrics["loss_flow_raw"] = extra_metrics.get("flow_loss", float("nan"))
+                    # Capture scalar metrics only on rank 0; all other ranks keep
+                    # the training path free of logging-only .item() synchronizations.
+                    if is_main:
+                        ex_loss_val = float(ex_loss.detach().float().item())
+                        for k, v in ex_losses.items():
+                            if k != "expert_loss" and isinstance(v, torch.Tensor) and v.numel() == 1:
+                                extra_metrics[k] = float(v.detach().float().item())
+                        # Structured loss component keys for π0.5-KI joint query training
+                        # loss_expert = weighted expert loss (alpha * flow_loss)
+                        # loss_flow_raw = raw flow matching loss (pre-alpha weighting)
+                        extra_metrics["loss_expert"] = ex_loss_val
+                        extra_metrics["loss_flow_raw"] = extra_metrics.get("flow_loss", float("nan"))
+                    else:
+                        ex_loss_val = float("nan")
                     del ex_losses, ex_loss
 
                     # ---- Per-param-group gradient norms (before clipping) ----
@@ -3725,15 +3856,13 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     bb_params_group = list(unwrapped_model.get_backbone_params())
                     ex_params_group = list(unwrapped_model.get_expert_params())
 
-                    # ---- Loss-based expert fraction (always available) ----
-                    # This is a pure loss-magnitude diagnostic: what fraction of
-                    # the total loss comes from the expert phase.  Always computable
-                    # from loss values regardless of gradient visibility.
-                    total_loss_for_fraction = bb_loss_val + ex_loss_val
-                    if total_loss_for_fraction > 0:
-                        extra_metrics["expert_loss_fraction"] = ex_loss_val / total_loss_for_fraction
-                    else:
-                        extra_metrics["expert_loss_fraction"] = 0.0
+                    if is_main:
+                        # ---- Loss-based expert fraction (logging only) ----
+                        total_loss_for_fraction = bb_loss_val + ex_loss_val
+                        if total_loss_for_fraction > 0:
+                            extra_metrics["expert_loss_fraction"] = ex_loss_val / total_loss_for_fraction
+                        else:
+                            extra_metrics["expert_loss_fraction"] = 0.0
 
                     # Per-group grad norms: only compute on sync steps AND at log
                     # cadence (or debug overflow mode).  Pure diagnostics.
@@ -3777,7 +3906,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     # This is a loss-magnitude proxy for KI, not a direct measurement.
                     # A proper KI verification requires unit tests with
                     # controlled single-phase backwards (see test_ki_integration_*.py).
-                    if accelerator.sync_gradients:
+                    if is_main and accelerator.sync_gradients:
                         total_loss_for_ratio = bb_loss_val + ex_loss_val
                         if total_loss_for_ratio > 0:
                             # Heuristic: expert_loss / (backbone_loss + expert_loss)
@@ -3786,7 +3915,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             extra_metrics["ki_heuristic_loss_ratio"] = ex_loss_val / total_loss_for_ratio
                         else:
                             extra_metrics["ki_heuristic_loss_ratio"] = 0.0
-                    else:
+                    elif is_main:
                         extra_metrics["ki_heuristic_loss_ratio"] = float("nan")
 
                     # Both phases passed — reset counter
@@ -3795,10 +3924,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     if profile_memory:
                         log_memory_usage(accelerator, global_step, "after_expert_backward")
 
-                    # Combined loss for logging (backbone + expert)
-                    loss_for_log = bb_loss_val + ex_loss_val
-                    # loss_total alias for consistency with structured keys
-                    extra_metrics["loss_total"] = loss_for_log
+                    # Combined loss is required only for rank-0 logging and
+                    # diagnostics; non-main ranks avoid scalar materialization.
+                    loss_for_log = bb_loss_val + ex_loss_val if is_main else float("nan")
+                    if is_main:
+                        extra_metrics["loss_total"] = loss_for_log
                     # Use expert loss stats as the primary loss_rank_stats for downstream code.
                     # On non-log-interval steps without errors, ex_loss_stats may be None;
                     # supply a stub with all_finite=True (we already passed the cheap check).
@@ -3886,7 +4016,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         (accelerator.sync_gradients and global_step % int(config.log_interval) == 0)
                         or _debug_overflow_enabled(config)
                     )
-                    loss_all_finite, _ = _gather_finite_consensus(accelerator, loss)
+                    loss_all_finite = (
+                        _gather_finite_consensus(accelerator, loss)
+                        if _loss_finite_check_enabled()
+                        else True
+                    )
                     any_rank_has_nonfinite_loss = not loss_all_finite
 
                     if any_rank_has_nonfinite_loss or _need_detailed_stats:

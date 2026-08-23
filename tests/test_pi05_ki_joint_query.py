@@ -868,11 +868,204 @@ class TestKIToggle:
 class TestQueryAttentionMask:
     """Test query tokens use bidirectional self-attention within the block."""
 
-    def test_query_att_masks_all_zeros(self, model_ki):
-        """query_att_masks = all zeros → bidirectional within query block."""
+    NUM_QUERY = 6
+    HIDDEN = 32
+    BASE_LEN = 4
+    SUBTASK_MAX = 8
+
+    def _real_query_masks(self, num_query=None):
+        """Call the REAL _embed_query_tokens with a minimal attribute shim.
+
+        The shared ``model_ki`` fixture is a hand-written stub that does not
+        implement this method, so bind the production implementation to a
+        namespace supplying exactly the attributes it touches. This keeps the
+        assertions pinned to shipping code rather than to a test double.
+        """
+        import types
+
+        import torch
+        from torch import nn
+
         from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch
-        import inspect
-        src = inspect.getsource(PI05KIJointQueryPytorch._embed_query_tokens)
-        # Check that attention mask is zeros (bidirectional block), not [1, 0, 0...]
-        # (all zeros = same block, bidirectional under make_att_2d_masks cumsum semantics)
-        assert "query_att_masks = torch.zeros" in src
+
+        n = self.NUM_QUERY if num_query is None else num_query
+        shim = types.SimpleNamespace(
+            num_query_tokens=n,
+            query_embeddings=nn.Parameter(torch.randn(n, self.HIDDEN) * 0.02),
+            query_to_vlm_proj=nn.Identity(),
+            _vlm_hidden_dim=self.HIDDEN,
+        )
+        return PI05KIJointQueryPytorch._embed_query_tokens(
+            shim,
+            batch_size=2,
+            device=torch.device("cpu"),
+            target_dtype=torch.float32,
+        )
+
+    def _build_sequence(self, n_valid_subtask, *, legacy_query_mask=False, causal=True):
+        """Assemble (pad_masks, att_masks, boundaries) for the real layout.
+
+        Mirrors production assembly order: embed_prefix (images+prompt, all
+        att=0 -> one bidirectional block) then
+        ``_embed_conditioning_subtask`` (att=ones_like over EVERY physical
+        slot when causal, including right padding) then the query block.
+        """
+        import torch
+
+        base_att = [0] * self.BASE_LEN
+        base_pad = [1] * self.BASE_LEN
+
+        sub_att = [1 if causal else 0] * self.SUBTASK_MAX
+        sub_pad = [1] * n_valid_subtask + [0] * (self.SUBTASK_MAX - n_valid_subtask)
+
+        n = self.NUM_QUERY
+        q_att = [0] * n if legacy_query_mask else [1] + [0] * (n - 1)
+
+        att = torch.tensor([base_att + sub_att + q_att], dtype=torch.bool)
+        pad = torch.tensor([base_pad + sub_pad + [1] * n], dtype=torch.bool)
+        return pad, att, self.BASE_LEN, self.BASE_LEN + self.SUBTASK_MAX
+
+    def _ce_supervised_rows(self, n_valid_subtask):
+        """Absolute indices of logit rows that actually contribute to the CE.
+
+        Reproduces ``_compute_ce_loss``: loss_mask from ``tokenize_subtask`` is
+        ``[False] + [True]*(n-1)`` padded with False; the loss then uses
+        ``logits[:, :-1]`` against ``loss_mask[:, 1:]``, so logit row t counts
+        only when ``loss_mask[t+1]`` is True.
+        """
+        loss_mask = (
+            [False]
+            + [True] * (n_valid_subtask - 1)
+            + [False] * (self.SUBTASK_MAX - n_valid_subtask)
+        )
+        shifted = loss_mask[1:]
+        return {self.BASE_LEN + t for t, keep in enumerate(shifted) if keep}
+
+    def test_query_att_masks_open_own_block(self):
+        """First query token opens a block; the rest join it bidirectionally."""
+        import torch
+
+        _, pad_masks, att_masks = self._real_query_masks()
+        n = self.NUM_QUERY
+        assert att_masks.shape == (2, n)
+        assert att_masks.dtype == torch.bool
+        assert pad_masks.all(), "query tokens are never padding"
+        assert att_masks[:, 0].all(), "first query token must start a new attention block"
+        assert not att_masks[:, 1:].any(), "non-first query tokens must join the same block"
+
+    def test_num_query_tokens_must_be_positive(self):
+        """num_query_tokens < 1 is rejected instead of producing an empty block.
+
+        ``query_att_masks[:, 0] = True`` would raise IndexError on an empty
+        block, so construction is rejected with an actionable message.
+        """
+        import pytest
+
+        from openpi.models_pytorch.pi05_ki_joint_query import _validate_num_query_tokens
+
+        for bad in (0, -1):
+            with pytest.raises(ValueError, match="num_query_tokens must be >= 1"):
+                _validate_num_query_tokens(bad)
+        for good in (1, 6, 32):
+            assert _validate_num_query_tokens(good) == good
+
+    @pytest.mark.parametrize(
+        ("label", "n_valid"),
+        [
+            ("subtask shorter than the cap (typical)", 3),
+            ("subtask exactly fills the cap (boundary)", SUBTASK_MAX),
+            ("single valid subtask token", 1),
+        ],
+    )
+    def test_prefix_never_attends_query(self, label, n_valid):
+        """No valid prefix row may attend any query column, in any regime."""
+        from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+
+        pad, att, _, prefix_len = self._build_sequence(n_valid)
+        att_2d = make_att_2d_masks(pad, att)
+
+        leak = att_2d[0, :prefix_len, prefix_len:] & pad[0, :prefix_len, None]
+        assert not leak.any(), f"prefix attends query tokens ({label})"
+
+        assert att_2d[0, prefix_len:, prefix_len:].all(), (
+            "query tokens must attend each other bidirectionally"
+        )
+        valid_prefix = pad[0, :prefix_len]
+        assert att_2d[0, prefix_len:, :prefix_len][:, valid_prefix].all(), (
+            "query tokens must attend the full valid prefix"
+        )
+
+    # n_valid=1 is deliberately absent: a BOS-only subtask has loss_mask
+    # [False], so after the next-token shift there is NO supervised row and the
+    # comparison would be vacuous. That regime is still covered by
+    # test_prefix_never_attends_query.
+    @pytest.mark.parametrize("n_valid", [2, 3, SUBTASK_MAX])
+    def test_ce_rows_are_bit_identical_to_legacy_mask(self, n_valid):
+        """CE-supervised rows see exactly the same columns under both masks.
+
+        This is the invariant that makes the fix safe to resume onto an
+        existing checkpoint: the subtask cross-entropy is untouched.
+        """
+        import torch
+
+        from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+
+        pad_new, att_new, _, prefix_len = self._build_sequence(n_valid)
+        pad_old, att_old, _, _ = self._build_sequence(n_valid, legacy_query_mask=True)
+        new_2d = make_att_2d_masks(pad_new, att_new)
+        old_2d = make_att_2d_masks(pad_old, att_old)
+
+        ce_rows = sorted(self._ce_supervised_rows(n_valid))
+        assert ce_rows, "test would be vacuous without supervised rows"
+        for row in ce_rows:
+            assert torch.equal(new_2d[0, row], old_2d[0, row]), (
+                f"CE-supervised row {row} changed (n_valid={n_valid})"
+            )
+
+    def test_prefix_block_unchanged_by_appending_queries(self):
+        """Appending the query block must not alter prefix-to-prefix attention.
+
+        Equivalent to saying the prefix KV rows are unaffected by the presence
+        of the query tokens.
+        """
+        import torch
+
+        from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+
+        pad, att, _, prefix_len = self._build_sequence(self.SUBTASK_MAX)
+        joint = make_att_2d_masks(pad, att)
+        prefix_only = make_att_2d_masks(pad[:, :prefix_len], att[:, :prefix_len])
+        assert torch.equal(joint[0, :prefix_len, :prefix_len], prefix_only[0]), (
+            "prefix-to-prefix attention must be independent of the query block"
+        )
+
+    def test_bidirectional_subtask_would_leak_under_legacy_mask(self):
+        """Documents WHY the fix matters: causal=False makes the old mask bite.
+
+        With bidirectional subtask conditioning the segment collapses into the
+        preceding block. The legacy all-zero query mask then exposes the
+        queries to every supervised CE row, while the fixed mask stays clean.
+        This pins the guard comment in
+        ``SubtaskActionExpert._embed_conditioning_subtask``.
+        """
+        from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+
+        n_valid = 3
+        ce_rows = sorted(self._ce_supervised_rows(n_valid))
+
+        pad_old, att_old, _, prefix_len = self._build_sequence(
+            n_valid, legacy_query_mask=True, causal=False
+        )
+        old_2d = make_att_2d_masks(pad_old, att_old)
+        leaked = [r for r in ce_rows if old_2d[0, r, prefix_len:].any()]
+        assert leaked == ce_rows, (
+            "expected the legacy mask to leak into every supervised CE row "
+            f"under bidirectional subtask conditioning, got {leaked}"
+        )
+
+        pad_new, att_new, _, _ = self._build_sequence(n_valid, causal=False)
+        new_2d = make_att_2d_masks(pad_new, att_new)
+        still_leaking = [r for r in ce_rows if new_2d[0, r, prefix_len:].any()]
+        assert not still_leaking, (
+            f"fixed mask must stay clean even with causal=False, got {still_leaking}"
+        )
