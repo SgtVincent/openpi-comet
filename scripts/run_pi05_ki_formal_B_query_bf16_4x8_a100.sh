@@ -3,7 +3,7 @@
 # Formal pi0.5-KI **Variant B** (query-MSE) -- 4-node x 8 A100 BF16.
 #
 # Contract:
-#   * B4/GPU x world 32 x GA2 = global batch 256
+#   * B8/GPU x world 32 x GA1 = global batch 256
 #   * stride=4, 4 epochs, anchor offsets 0/1/2/3
 #   * BF16, DeepSpeed ZeRO-2, CPU optimizer offload
 #   * No FAST action-token head (query-MSE arm)
@@ -107,8 +107,8 @@ MASTER_PORT="${_MASTER_PORT%%,*}"
 # ---- Precision & batch contract --------------------------------------------
 PYTORCH_TRAINING_PRECISION="${PYTORCH_TRAINING_PRECISION:-bfloat16}"
 ACCELERATE_MIXED_PRECISION="${ACCELERATE_MIXED_PRECISION:-bf16}"
-BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
+BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-4}"
 STREAMING_ANCHOR_STRIDE="${STREAMING_ANCHOR_STRIDE:-4}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
@@ -131,8 +131,8 @@ done
 
 [[ "${PYTORCH_TRAINING_PRECISION}" == "bfloat16" ]] || die "A100 formal requires BF16"
 [[ "${ACCELERATE_MIXED_PRECISION}" == "bf16" ]] || die "A100 formal requires Accelerate bf16"
-(( BATCH_SIZE_PER_GPU == 4 )) || die "A100 formal requires BATCH_SIZE_PER_GPU=4"
-(( GRADIENT_ACCUMULATION_STEPS == 2 )) || die "A100 formal requires GRADIENT_ACCUMULATION_STEPS=2"
+(( BATCH_SIZE_PER_GPU == 8 )) || die "A100 formal requires BATCH_SIZE_PER_GPU=8"
+(( GRADIENT_ACCUMULATION_STEPS == 1 )) || die "A100 formal requires GRADIENT_ACCUMULATION_STEPS=1"
 (( NUM_TRAIN_EPOCHS == 4 )) || die "A100 formal requires NUM_TRAIN_EPOCHS=4"
 (( STREAMING_ANCHOR_STRIDE == 4 )) || die "A100 formal requires stride=4"
 (( SAVE_INTERVAL == 10000 )) || die "SAVE_INTERVAL=10000"
@@ -140,7 +140,7 @@ done
 (( VAL_NUM_BATCHES == 20 )) || die "VAL_NUM_BATCHES=20"
 
 GLOBAL_BATCH_SIZE=$(( BATCH_SIZE_PER_GPU * TOTAL_GPUS * GRADIENT_ACCUMULATION_STEPS ))
-(( GLOBAL_BATCH_SIZE == 256 )) || die "global batch must be 256 (B4xW32xGA2), got ${GLOBAL_BATCH_SIZE}"
+(( GLOBAL_BATCH_SIZE == 256 )) || die "global batch must be 256 (B8xW32xGA1), got ${GLOBAL_BATCH_SIZE}"
 
 # ---- W&B (fresh, no resume) ------------------------------------------------
 WANDB_MODE="${WANDB_MODE:-online}"
@@ -210,8 +210,8 @@ checks = {
     "model dtype bfloat16": cfg.model.dtype == "bfloat16",
     "KI enabled": cfg.model.knowledge_insulation is True,
     "expert KV truncated": cfg.model.truncate_expert_kv is True,
-    "B4": cfg.batch_size_per_gpu == 4,
-    "GA2": cfg.gradient_accumulation_steps == 2,
+    "B8": cfg.batch_size_per_gpu == 8,
+    "GA1": cfg.gradient_accumulation_steps == 1,
     "4 epochs": cfg.num_train_epochs == 4,
     "stride4": cfg.streaming_anchor_stride == 4,
     "offsets [0,1,2,3]": cfg.epoch_anchor_offsets == [0, 1, 2, 3],
@@ -226,7 +226,7 @@ checks = {
 failed = [label for label, ok in checks.items() if not ok]
 if failed:
     raise SystemExit(f"ERROR: config {name!r} failed: " + "; ".join(failed))
-print(f"A100_CONFIG_PREFLIGHT_OK name={name} model={model_name} B4xW32xGA2=256 epochs=4 stride=4 offsets=0,1,2,3")
+print(f"A100_CONFIG_PREFLIGHT_OK name={name} model={model_name} B8xW32xGA1=256 epochs=4 stride=4 offsets=0,1,2,3")
 PY
 
 # ---- B does not need FAST tokenizer ----------------------------------------
@@ -252,7 +252,7 @@ info "============================================================"
 info "formal A100 arm=${ARM} objective=${ARM_LABEL} config=${EXPECTED_CONFIG}"
 info "code_commit=${ACTUAL_COMMIT} openpi=${OPENPI_IMPORT_PATH}"
 info "topology=${NUM_NODES}x${GPUS_PER_NODE} world=${TOTAL_GPUS} rank=${NODE_RANK}"
-info "BF16 ZeRO-2 CPU-offload B4/GPU GA2 global_batch=${GLOBAL_BATCH_SIZE}"
+info "BF16 ZeRO-2 CPU-offload B8/GPU GA1 global_batch=${GLOBAL_BATCH_SIZE}"
 info "epochs=4 stride=4 offsets=0,1,2,3 wandb_project=${WANDB_PROJECT}"
 info "output_root=${PERSISTENT_OUTPUT_ROOT}"
 info "============================================================"

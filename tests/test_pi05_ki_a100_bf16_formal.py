@@ -3,7 +3,7 @@
 
 Covers:
   * A/B config identity (differ only in objective)
-  * B4 x W32 x GA2 = 256 global batch
+  * B8 x W32 x GA1 = 256 global batch
   * stride=4, 4 epochs, offsets [0,1,2,3]
   * cap208 fail-closed ordering
   * cap literal coupling across formal + debug configs
@@ -60,8 +60,8 @@ def test_a100_configs_are_exactly_matched_outside_objective():
         assert cfg.pytorch_training_precision == "bfloat16"
         assert cfg.accelerate_mixed_precision == "bf16"
         assert cfg.model.dtype == "bfloat16"
-        assert cfg.batch_size_per_gpu == 4
-        assert cfg.gradient_accumulation_steps == 2
+        assert cfg.batch_size_per_gpu == 8
+        assert cfg.gradient_accumulation_steps == 1
         assert cfg.num_train_epochs == 4
         assert cfg.streaming_anchor_stride == 4
         assert cfg.epoch_anchor_offsets == [0, 1, 2, 3]
@@ -100,14 +100,20 @@ def test_a100_configs_are_exactly_matched_outside_objective():
 def test_global_batch_contract():
     from openpi.training.train_config import get_config
 
+    observed = {}
     for name in (_A_CONFIG, _B_CONFIG):
         cfg = get_config(name)
         world = 32
         micro = cfg.batch_size_per_gpu
         ga = cfg.gradient_accumulation_steps
         assert micro * world * ga == 256, f"{name}: {micro}*{world}*{ga} != 256"
-        assert micro == 4
-        assert ga == 2
+        assert micro == 8
+        assert ga == 1
+        observed[name] = (micro, ga)
+
+    # Both arms must share the identical micro/GA split, not merely the same
+    # product: an A/B where one arm accumulates differently is not controlled.
+    assert observed[_A_CONFIG] == observed[_B_CONFIG], observed
 
 
 # ---------------------------------------------------------------------------
@@ -485,8 +491,8 @@ def test_cuda_preflight_has_required_checks():
 def test_launcher_locks_contract(launcher, config_name, arm_prefix, fast_expected):
     source = launcher.read_text()
     assert f'EXPECTED_CONFIG="{config_name}"' in source
-    assert "BATCH_SIZE_PER_GPU=4" in source
-    assert "GRADIENT_ACCUMULATION_STEPS=2" in source
+    assert "BATCH_SIZE_PER_GPU=8" in source
+    assert "GRADIENT_ACCUMULATION_STEPS=1" in source
     assert "NUM_TRAIN_EPOCHS=4" in source
     assert 'STREAMING_ANCHOR_STRIDE:-4' in source
     assert "STREAMING_ANCHOR_STRIDE == 4" in source

@@ -959,7 +959,7 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # ------------------------------------------------------------------
     # Formal 4x8 A100_SXM4_40GB BF16 pair.
     #
-    # B4/GPU x world32 x GA2 preserves global batch 256. Four epochs with
+    # B8/GPU x world32 x GA1 preserves global batch 256. Four epochs with
     # stride-4 anchor offsets (0, 1, 2, 3) cover every anchor position
     # exactly once across the four passes. The per-epoch offset rotation is
     # enforced by train_accelerate.py via config.epoch_anchor_offsets and
@@ -977,8 +977,8 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         behavior_dataset_root=_B1K_DATA_ROOT,
         base_checkpoint_path=_CANONICAL_BASE_CKPT,
         base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
-        batch_size_per_gpu=4,
-        gradient_accumulation_steps=2,
+        batch_size_per_gpu=8,
+        gradient_accumulation_steps=1,
         num_train_steps=0,
         num_train_epochs=4,
         warmup_steps=1_000,
@@ -997,8 +997,8 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         behavior_dataset_root=_B1K_DATA_ROOT,
         base_checkpoint_path=_CANONICAL_BASE_CKPT,
         base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
-        batch_size_per_gpu=4,
-        gradient_accumulation_steps=2,
+        batch_size_per_gpu=8,
+        gradient_accumulation_steps=1,
         num_train_steps=0,
         num_train_epochs=4,
         warmup_steps=1_000,
