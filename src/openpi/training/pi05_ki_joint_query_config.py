@@ -16,15 +16,17 @@ Precision variants:
 - ``*_v100_fp32``: formal B1/GPU, GA8, global-batch-256 Variant A/B configs
 """
 
+import dataclasses
 from pathlib import Path
 
 import openpi.models.pi05_ki_joint_fast_config as pi05_ki_joint_fast_config
 import openpi.models.pi05_ki_joint_query_config as pi05_ki_joint_query_config
+from openpi.training.data_config import AssetsConfig
+from openpi.training.data_config import DataConfig
+from openpi.training.data_config import LeRobotB1KDataConfig
 import openpi.training.optimizer as _optimizer
-from openpi.training.data_config import AssetsConfig, DataConfig, LeRobotB1KDataConfig
 from openpi.training.skill_bridge_config import SkillBridgeConfig
 from openpi.training.train_config import TrainConfig
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _B1K_DATA_ROOT = "/mnt/bn/saiwenresearch/mlx/users/chenjunting/data/2025-challenge-demos/"
@@ -719,6 +721,27 @@ def _make_pi05_ki_joint_full_task_set_config(
     )
 
 
+_A100_BF16_PRODUCTION_VARIANT_B = _make_pi05_ki_joint_full_task_set_config(
+    name="pi05_ki_joint_query_b1k-full_task-ki_on_a100_bf16",
+    behavior_dataset_root=_B1K_DATA_ROOT,
+    base_checkpoint_path=_CANONICAL_BASE_CKPT,
+    base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+    batch_size_per_gpu=4,
+    gradient_accumulation_steps=2,
+    num_train_steps=0,
+    num_train_epochs=4,
+    warmup_steps=1_000,
+    peak_lr=1e-5,
+    decay_steps=0,
+    decay_lr=0.0,
+    action_repr="query_mse",
+    precision="bfloat16",
+    streaming_anchor_stride=4,
+    epoch_anchor_offsets=[0, 1, 2, 3],
+    project_name="pi05_ki_a100",
+)
+
+
 _PI05_KI_JOINT_QUERY_CONFIGS = [
     # --- fp16 base configs (intended production; may be unstable on V100) ---
     _make_pi05_ki_joint_query_config(
@@ -992,23 +1015,18 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         epoch_anchor_offsets=[0, 1, 2, 3],
         project_name="pi05_ki_a100",
     ),
-    _make_pi05_ki_joint_full_task_set_config(
-        name="pi05_ki_joint_query_b1k-full_task-ki_on_a100_bf16",
-        behavior_dataset_root=_B1K_DATA_ROOT,
-        base_checkpoint_path=_CANONICAL_BASE_CKPT,
-        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
-        batch_size_per_gpu=4,
-        gradient_accumulation_steps=2,
-        num_train_steps=0,
-        num_train_epochs=4,
-        warmup_steps=1_000,
-        peak_lr=1e-5,
-        decay_steps=0,
-        decay_lr=0.0,
-        action_repr="query_mse",
-        precision="bfloat16",
-        streaming_anchor_stride=4,
-        epoch_anchor_offsets=[0, 1, 2, 3],
-        project_name="pi05_ki_a100",
+    _A100_BF16_PRODUCTION_VARIANT_B,
+    # Experiment-only 1x8 optimizer-offload measurement. Derive directly from
+    # production Variant B with exactly three bounded measurement controls:
+    # 100 optimizer steps, per-step logs, and no val_data so the trainer cannot
+    # append end-of-run validation to timing. Existing A100/V100 formal configs
+    # remain untouched and must not launch this entry.
+    dataclasses.replace(
+        _A100_BF16_PRODUCTION_VARIANT_B,
+        name="pi05_ki_joint_query_b1k-full_task-ki_on_a100_bf16_offload_short",
+        exp_name="pi05_ki_joint_query_b1k-full_task-ki_on_a100_bf16_offload_short",
+        num_train_steps=100,
+        log_interval=1,
+        val_data=[],
     ),
 ]
