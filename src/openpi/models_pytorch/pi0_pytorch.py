@@ -149,22 +149,34 @@ class PI0Pytorch(nn.Module):
         )
 
     def gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing for memory optimization."""
-        self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        """Recursively enable activation checkpointing on every HF layer.
 
-        logging.info("Enabled gradient checkpointing for PI0Pytorch model")
+        Setting only ``GemmaModel.gradient_checkpointing`` does not reach the
+        ``GradientCheckpointingLayer`` decoder modules that perform the actual
+        recomputation in Transformers 4.53. Use each pretrained model's public
+        recursive API and non-reentrant checkpointing, which supports the tensor
+        structures used by the two KI forwards.
+        """
+        # Recompute must replay the same stochastic path without advancing the
+        # global RNG stream before the separate expert phase samples noise/time.
+        checkpoint_kwargs = {"use_reentrant": False, "preserve_rng_state": True}
+        self.paligemma_with_expert.paligemma.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=checkpoint_kwargs
+        )
+        self.paligemma_with_expert.gemma_expert.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=checkpoint_kwargs
+        )
+        self.gradient_checkpointing_enabled = True
+
+        logging.info("Enabled recursive gradient checkpointing for PI0Pytorch model")
 
     def gradient_checkpointing_disable(self):
-        """Disable gradient checkpointing."""
+        """Recursively disable activation checkpointing."""
+        self.paligemma_with_expert.paligemma.gradient_checkpointing_disable()
+        self.paligemma_with_expert.gemma_expert.gradient_checkpointing_disable()
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
-        logging.info("Disabled gradient checkpointing for PI0Pytorch model")
+        logging.info("Disabled recursive gradient checkpointing for PI0Pytorch model")
 
     def is_gradient_checkpointing_enabled(self):
         """Check if gradient checkpointing is enabled."""
@@ -174,7 +186,7 @@ class PI0Pytorch(nn.Module):
         """Helper method to apply gradient checkpointing if enabled."""
         if self.gradient_checkpointing_enabled and self.training:
             return torch.utils.checkpoint.checkpoint(
-                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
+                func, *args, use_reentrant=False, preserve_rng_state=True, **kwargs
             )
         return func(*args, **kwargs)
 

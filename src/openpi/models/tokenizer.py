@@ -48,7 +48,7 @@ class PaligemmaTokenizer:
 
 
 class FASTTokenizer:
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(self, max_len: int = 256, fast_tokenizer_path: str | None = None):
         self._max_len = max_len
 
         # Import transformers lazily so non-FAST code paths do not pay its startup cost.
@@ -59,8 +59,19 @@ class FASTTokenizer:
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-        # Instantiate FAST tokenizer
-        self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        # Variant A launchers can point directly at a pre-cached processor tree.
+        # In offline mode, force local-only resolution so a missing cache fails
+        # immediately instead of hanging every distributed rank on network I/O.
+        fast_tokenizer_path = (
+            fast_tokenizer_path or os.environ.get("OPENPI_FAST_TOKENIZER_PATH") or "physical-intelligence/fast"
+        )
+        processor_kwargs = {"trust_remote_code": True}
+        if os.environ.get("OPENPI_OFFLINE") == "1":
+            processor_kwargs["local_files_only"] = True
+        self._fast_tokenizer = AutoProcessor.from_pretrained(
+            fast_tokenizer_path,
+            **processor_kwargs,
+        )
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
 
     def tokenize(
@@ -139,6 +150,94 @@ class FASTTokenizer:
         if isinstance(tokens, list):
             tokens = np.array(tokens)
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+    def tokenize_action_chunk(
+        self, actions: np.ndarray, max_len: int = 64
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Tokenize one action chunk into a fixed-length discrete token segment.
+
+        This is the Variant A (paper-accurate Knowledge Insulation) backbone
+        target: the action chunk is compressed by the FAST frequency-space
+        tokenizer and supervised with next-token cross-entropy, instead of being
+        regressed by a continuous query head.
+
+        The returned 4-tuple deliberately matches
+        ``SubtaskTokenizer.tokenize_subtask`` exactly -- BOS-prefixed, causal
+        ar_mask, ``loss_mask = [False] + [True] * (n - 1)`` -- so the model can
+        reuse a single cross-entropy implementation for both the subtask segment
+        and the action segment.
+
+        Action ids are mapped by ``vocab_size - 1 - fast_skip_tokens - t``,
+        counting down from the top of the PaliGemma vocabulary (below the final
+        ``fast_skip_tokens`` special ids). This objective needs NO new
+        parameters: it reuses the existing embedding table and its tied output
+        projection.
+
+        This range is NOT disjoint from the text vocabulary. FAST's vocabulary
+        is 2048 entries while PaliGemma's ``<loc>`` block provides only 1024
+        slots, so the mapping necessarily extends about 1024 ids past that
+        block and reaches into rare text ids. That is the upstream pi0-FAST
+        convention and is retained deliberately for checkpoint compatibility;
+        the ids are effectively repurposed for actions during this training.
+        The invariant that actually matters is therefore not disjointness but
+        that action ids never collide with the id the model treats as the image
+        token -- see
+        ``tests/test_pi05_ki_joint_fast.py::TestFastActionTokenization::
+        test_action_ids_avoid_the_configured_image_token``, which pins it.
+
+        Args:
+            actions: ``[action_horizon, action_dim]``, already normalized to
+                roughly ``[-1, 1]`` by the upstream normalization transform.
+            max_len: fixed segment length required by the batched data
+                contract. The formal B1K configuration uses 208: an exhaustive
+                scan found chunks up to 199 tokens (including BOS/EOS), and 208
+                is the smallest 16-aligned cap with headroom. Dynamic per-sample
+                sizing is unsafe because these arrays are stacked before they
+                reach the model.
+
+        Returns:
+            ``(tokens, mask, ar_mask, loss_mask)``, each of shape ``[max_len]``.
+        """
+        if actions.ndim != 2:
+            raise ValueError(f"actions must be [action_horizon, action_dim], got shape {actions.shape}")
+
+        fast_tokens = self._fast_tokenizer(np.asarray(actions, dtype=np.float32)[None])[0]
+        action_tokens = self._act_tokens_to_paligemma_tokens(fast_tokens).tolist()
+
+        # BOS so the FIRST real action token is supervised by next-token CE;
+        # EOS so the model learns where the chunk ends.
+        tokens = [self._paligemma_tokenizer.bos_id(), *action_tokens, self._paligemma_tokenizer.eos_id()]
+        n = len(tokens)
+        mask = [True] * n
+        ar_mask = [1] * n
+        # Row t predicts token t+1, so BOS is the first supervised row and the
+        # final row has no target.
+        loss_mask = [False] + [True] * (n - 1)
+
+        if n > max_len:
+            # Truncation is NOT benign: FAST is byte-pair encoded over DCT
+            # coefficients, so dropping trailing tokens corrupts the
+            # reconstructed chunk rather than merely shortening it. A fixed
+            # segment is still required for batching, therefore fail before
+            # returning any partial target.
+            raise ValueError(
+                f"FAST action chunk produced {n} tokens, exceeding "
+                f"action_token_max_len={max_len}. Refusing to truncate a corrupted "
+                "action target; raise action_token_max_len for this data contract."
+            )
+
+        pad = max_len - n
+        tokens = tokens + [0] * pad
+        mask = mask + [False] * pad
+        ar_mask = ar_mask + [0] * pad
+        loss_mask = loss_mask + [False] * pad
+
+        return (
+            np.asarray(tokens, dtype=np.int32),
+            np.asarray(mask, dtype=np.bool_),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask, dtype=np.bool_),
+        )
 
 
 ###########################################################################

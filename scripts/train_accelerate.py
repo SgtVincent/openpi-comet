@@ -129,6 +129,95 @@ if TYPE_CHECKING:
 _WANDB = None
 
 
+class _TwoPhaseUpdateController:
+    """Keep two KI graphs separate while committing one optimizer update.
+
+    Accelerate 1.13's DeepSpeed wrapper calls ``engine.step()`` from every
+    synced ``accelerator.backward()``. The KI loop has two backwards per outer
+    microbatch, so using that wrapper twice would update and clear gradients
+    after the backbone phase before the expert phase runs.
+
+    For DeepSpeed, this adapter drives the engine directly: both disjoint phase
+    backwards inherit the outer ``accelerator.sync_gradients`` boundary so
+    ZeRO-2 finalizes both parameter groups, while ``engine.step()`` is called
+    exactly once after both graphs only at that boundary. DeepSpeed performs
+    its real optimizer step and gradient clear inside ``engine.step()``. The
+    non-DeepSpeed path deliberately retains Accelerate's normal backward and
+    optimizer semantics.
+    """
+
+    def __init__(self, accelerator) -> None:
+        self._accelerator = accelerator
+        self._is_deepspeed = accelerator.distributed_type == DistributedType.DEEPSPEED
+        self._engine = (
+            accelerator.deepspeed_engine_wrapped.engine if self._is_deepspeed else None
+        )
+
+    @property
+    def is_deepspeed(self) -> bool:
+        return self._is_deepspeed
+
+    def backward(self, loss: torch.Tensor) -> None:
+        """Backpropagate one phase under the outer accumulation boundary."""
+
+        if not self._is_deepspeed:
+            self._accelerator.backward(loss)
+            return
+
+        # ZeRO-2 finalizes only parameters participating in a boundary
+        # backward. The two KI phases own disjoint groups, so both must inherit
+        # the outer boundary on the final accumulation microbatch. The update
+        # remains deferred until the single engine.step after both phases.
+        boundary = bool(self._accelerator.sync_gradients)
+        self._engine.set_gradient_accumulation_boundary(boundary)
+        self._engine.backward(loss)
+
+    def clip_grad_norm_before_step(self, parameters, *, max_norm: float):
+        """Clip before a non-DeepSpeed update; DS clips inside ``engine.step``."""
+
+        if self._is_deepspeed:
+            # Before the first engine step, DeepSpeed's cached global norm is
+            # None. Reading it through Accelerate's clip_grad_norm_ would not
+            # clip anything and would later crash when converted to float.
+            return None
+        return self._accelerator.clip_grad_norm_(parameters, max_norm=max_norm)
+
+    def step_and_zero_grad(self, optimizer):
+        """Commit once and return DeepSpeed's post-step cached grad norm."""
+
+        if not self._accelerator.sync_gradients:
+            return None
+        if self._is_deepspeed:
+            # DeepSpeed computes/clips the real norm inside `_take_model_step`,
+            # caches it on the engine, then owns the single gradient clear.
+            self._engine.step()
+            return self._engine.get_global_grad_norm()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        return None
+
+    def clear_gradients(self, optimizer) -> None:
+        """Discard a partial accumulation after a rejected KI microbatch."""
+
+        if self._is_deepspeed:
+            # ZeRO optimizers own partitioned gradient state; clear through the
+            # engine optimizer rather than Accelerate's no-op wrapper. Match
+            # DeepSpeed's own `_take_model_step` clearing path for ZeRO-2.
+            self._engine.optimizer.zero_grad()
+            return
+        optimizer.zero_grad(set_to_none=True)
+
+
+def _grad_norm_to_float(grad_norm) -> float:
+    """Convert a reported norm for logging without ever calling ``float(None)``."""
+
+    if grad_norm is None:
+        return float("nan")
+    if isinstance(grad_norm, torch.Tensor):
+        return float(grad_norm.item())
+    return float(grad_norm)
+
+
 def _get_wandb():
     global _WANDB
     if _WANDB is None:
@@ -308,7 +397,36 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         return None
 
 
-_FORMAL_B1K_CONFIG_NAME = "pi05_ki_joint_query_b1k-full_task-ki_on_bf16"
+_FORMAL_B1K_CONFIG_CONTRACTS = {
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_bf16": {
+        "pytorch_model_name": "pi05_ki_joint_fast",
+        "batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 1,
+        "pytorch_training_precision": "bfloat16",
+        "accelerate_mixed_precision": "bf16",
+    },
+    "pi05_ki_joint_query_b1k-full_task-ki_on_bf16": {
+        "pytorch_model_name": "pi05_ki_joint_query",
+        "batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 1,
+        "pytorch_training_precision": "bfloat16",
+        "accelerate_mixed_precision": "bf16",
+    },
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32": {
+        "pytorch_model_name": "pi05_ki_joint_fast",
+        "batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": 8,
+        "pytorch_training_precision": "float32",
+        "accelerate_mixed_precision": "no",
+    },
+    "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32": {
+        "pytorch_model_name": "pi05_ki_joint_query",
+        "batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": 8,
+        "pytorch_training_precision": "float32",
+        "accelerate_mixed_precision": "no",
+    },
+}
 _FORMAL_B1K_PASS_SPECS = ((0, 34_982), (4, 34_971), (8, 34_959))
 _FORMAL_B1K_PASS_BOUNDARIES = (34_982, 69_953, 104_912)
 _FORMAL_B1K_DATASET_ENV_KEYS = (
@@ -319,7 +437,7 @@ _FORMAL_B1K_DATASET_ENV_KEYS = (
 
 
 def _is_formal_b1k_mode(config) -> bool:
-    return getattr(config, "name", None) == _FORMAL_B1K_CONFIG_NAME
+    return getattr(config, "name", None) in _FORMAL_B1K_CONFIG_CONTRACTS
 
 
 def _set_formal_b1k_pass_offset(offset: int) -> None:
@@ -411,10 +529,17 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
     if not _is_formal_b1k_mode(config):
         return
 
+    contract = _FORMAL_B1K_CONFIG_CONTRACTS[config.name]
     expected_fields = {
-        "batch_size_per_gpu": 8,
-        "gradient_accumulation_steps": 1,
+        **contract,
         "num_train_steps": 104_912,
+        "save_interval": 10_000,
+        "checkpoint_policy": "step",
+        "rolling_checkpoint_interval": 10_000,
+        "val_log_interval": 1_000,
+        "val_num_batches": 20,
+        "streaming_anchor_stride": 12,
+        "overwrite": False,
         "wandb_enabled": True,
         "project_name": "pi05_ki",
     }
@@ -432,6 +557,23 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
             "Formal B1K resume is unsupported: checkpoints are weights/evaluation artifacts, "
             "not exact data-order resume points"
         )
+    if len(config.data) != 1 or len(config.val_data) != 1:
+        raise ValueError("Formal B1K requires exactly one train and one validation data config")
+    train_data = config.data[0]
+    val_data = config.val_data[0]
+    for label, data, expected_episodes in (
+        ("train", train_data, list(range(180))),
+        ("validation", val_data, list(range(180, 200))),
+    ):
+        base_config = data.base_config
+        if base_config.tasks is not None:
+            raise ValueError(f"Formal B1K {label} data must cover all tasks (tasks=None)")
+        if base_config.episodes_index != expected_episodes:
+            raise ValueError(
+                f"Formal B1K {label} episodes must be {expected_episodes[0]}..{expected_episodes[-1]}"
+            )
+        if base_config.skill_bridge.enabled:
+            raise ValueError(f"Formal B1K {label} data requires Skill Bridge disabled")
 
     schedule = config.lr_schedule
     schedule_values = (
@@ -476,11 +618,33 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
     if accelerator is not None:
         if int(accelerator.num_processes) != 32:
             raise ValueError(f"Formal B1K requires world size 32; got {accelerator.num_processes}")
-        if int(accelerator.gradient_accumulation_steps) != 1:
+        expected_grad_accum = int(contract["gradient_accumulation_steps"])
+        if int(accelerator.gradient_accumulation_steps) != expected_grad_accum:
             raise ValueError(
-                "Formal B1K requires Accelerator gradient_accumulation_steps=1; "
+                "Formal B1K requires Accelerator "
+                f"gradient_accumulation_steps={expected_grad_accum}; "
                 f"got {accelerator.gradient_accumulation_steps}"
             )
+        effective_global_batch = (
+            int(config.batch_size_per_gpu)
+            * int(accelerator.num_processes)
+            * int(accelerator.gradient_accumulation_steps)
+        )
+        if effective_global_batch != 256:
+            raise ValueError(
+                "Formal B1K requires effective global batch 256; "
+                f"got {effective_global_batch}"
+            )
+        if contract["pytorch_training_precision"] == "float32":
+            if accelerator.distributed_type != DistributedType.DEEPSPEED:
+                raise ValueError("Formal V100 FP32 requires DeepSpeed")
+            ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
+            zero_config = ds_config.get("zero_optimization", {})
+            if zero_config.get("stage") != 2:
+                raise ValueError("Formal V100 FP32 requires DeepSpeed ZeRO stage 2")
+            offload_config = zero_config.get("offload_optimizer", {})
+            if offload_config.get("device") != "cpu":
+                raise ValueError("Formal V100 FP32 requires DeepSpeed CPU optimizer offload")
 
 
 def _init_formal_b1k_wandb(config, *, accelerator) -> None:
@@ -1722,6 +1886,42 @@ def _loss_tensor_debug_metrics(losses: object, actions: torch.Tensor) -> dict[st
     return metrics
 
 
+_PI05_KI_LOSS_WANDB_KEYS = (
+    ("loss_backbone", "loss/backbone"),
+    ("loss_ce", "loss/ce"),
+    ("loss_action_ce", "loss/action_ce"),
+    ("loss_query_mse", "loss/query_mse"),
+    ("loss_expert", "loss/expert"),
+    ("loss_flow_raw", "loss/flow_raw"),
+    ("expert_loss_fraction", "loss/expert_fraction"),
+)
+
+
+def _add_pi05_ki_structured_backbone_metrics(extra_metrics: dict[str, float], backbone_loss: float) -> None:
+    """Add arm-correct structured keys without aliasing CE as query MSE."""
+    has_action_ce = "action_ce_loss" in extra_metrics
+    has_query_mse = "query_mse_loss" in extra_metrics
+    if has_action_ce and has_query_mse:
+        raise ValueError("π0.5-KI backbone metrics cannot contain both action CE and query MSE")
+
+    extra_metrics["loss_backbone"] = backbone_loss
+    extra_metrics["loss_ce"] = extra_metrics.get("ce_loss", float("nan"))
+    if has_action_ce:
+        extra_metrics["loss_action_ce"] = extra_metrics["action_ce_loss"]
+    elif has_query_mse:
+        extra_metrics["loss_query_mse"] = extra_metrics["query_mse_loss"]
+
+
+def _update_pi05_ki_wandb_loss_metrics(
+    log_payload: dict[str, float], infos: list[dict[str, float]]
+) -> None:
+    """Map only metrics present for the active π0.5-KI objective to W&B."""
+    for metric_key, wandb_key in _PI05_KI_LOSS_WANDB_KEYS:
+        vals = [info[metric_key] for info in infos if metric_key in info and np.isfinite(info[metric_key])]
+        if vals:
+            log_payload[wandb_key] = sum(vals) / len(vals)
+
+
 # =====================================================================
 # Buffered metrics.jsonl writer: reduce I/O overhead on the hot path by
 # batching metrics.jsonl writes and flushing only at boundaries.
@@ -2634,6 +2834,37 @@ def _atomic_write_checkpoint_dir(tmp_dir: Path, final_dir: Path) -> None:
     tmp_dir.rename(final_dir)
 
 
+def _move_observation_to_device(observation, device: torch.device):
+    """Move every tensor in an Observation, including Variant A targets."""
+
+    def _maybe_to(x: torch.Tensor | None) -> torch.Tensor | None:
+        if x is None:
+            return None
+        return x.to(device, non_blocking=True)
+
+    # Observation is a flax.struct.dataclass, not a dm-tree container, so its
+    # optional fields must be routed explicitly. Keep this list centralized for
+    # both training and validation to prevent newly added fields from drifting.
+    return observation.replace(
+        images={k: v.to(device, non_blocking=True) for k, v in observation.images.items()},
+        image_masks={k: v.to(device, non_blocking=True) for k, v in observation.image_masks.items()},
+        state=observation.state.to(device, non_blocking=True),
+        tokenized_prompt=_maybe_to(observation.tokenized_prompt),
+        tokenized_prompt_mask=_maybe_to(observation.tokenized_prompt_mask),
+        token_ar_mask=_maybe_to(observation.token_ar_mask),
+        token_loss_mask=_maybe_to(observation.token_loss_mask),
+        subtask_tokens=_maybe_to(observation.subtask_tokens),
+        subtask_mask=_maybe_to(observation.subtask_mask),
+        subtask_loss_mask=_maybe_to(observation.subtask_loss_mask),
+        subtask_ar_mask=_maybe_to(observation.subtask_ar_mask),
+        action_tokens=_maybe_to(observation.action_tokens),
+        action_token_mask=_maybe_to(observation.action_token_mask),
+        action_token_loss_mask=_maybe_to(observation.action_token_loss_mask),
+        action_token_ar_mask=_maybe_to(observation.action_token_ar_mask),
+        pcd_xyz=_maybe_to(observation.pcd_xyz),
+    )
+
+
 def run_validation(
     *,
     accelerator: Accelerator,
@@ -2706,27 +2937,7 @@ def run_validation(
 
                 # Move data to device
                 if _model is not None and isinstance(observation, _model.Observation):
-                    device = accelerator.device
-
-                    def _maybe_to_val(x, *, target_device=device):
-                        if x is None:
-                            return None
-                        return x.to(target_device, non_blocking=True)
-
-                    observation = observation.replace(
-                        images={k: v.to(device, non_blocking=True) for k, v in observation.images.items()},
-                        image_masks={k: v.to(device, non_blocking=True) for k, v in observation.image_masks.items()},
-                        state=observation.state.to(device, non_blocking=True),
-                        tokenized_prompt=_maybe_to_val(observation.tokenized_prompt),
-                        tokenized_prompt_mask=_maybe_to_val(observation.tokenized_prompt_mask),
-                        token_ar_mask=_maybe_to_val(observation.token_ar_mask),
-                        token_loss_mask=_maybe_to_val(observation.token_loss_mask),
-                        subtask_tokens=_maybe_to_val(observation.subtask_tokens),
-                        subtask_mask=_maybe_to_val(observation.subtask_mask),
-                        subtask_loss_mask=_maybe_to_val(observation.subtask_loss_mask),
-                        subtask_ar_mask=_maybe_to_val(observation.subtask_ar_mask),
-                        pcd_xyz=_maybe_to_val(observation.pcd_xyz),
-                    )
+                    observation = _move_observation_to_device(observation, accelerator.device)
                 else:
                     observation = tree.map_structure(
                         lambda x: x.to(accelerator.device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
@@ -3095,7 +3306,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     _validate_runtime_config(config)
 
     kwargs_handlers = []
-    if config.pytorch_model_name == "pi05_ki_joint_query":
+    if config.pytorch_model_name in ("pi05_ki_joint_query", "pi05_ki_joint_fast"):
         # Each KI optimizer step uses two distinct wrapped forwards.  DDP must
         # discover the parameters unused by each phase so both reducer passes
         # complete and synchronize the correct parameter subset.
@@ -3460,7 +3671,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     use_vlm2 = config.pytorch_model_name in ("vlm2", "vlm2_subtask")
-    is_pi05_ki_joint = config.pytorch_model_name == "pi05_ki_joint_query"
+    # Both KI variants share the two-phase (backbone then expert) training loop;
+    # they differ only in the backbone action objective.
+    is_pi05_ki_joint = config.pytorch_model_name in ("pi05_ki_joint_query", "pi05_ki_joint_fast")
     if config.pytorch_model_name in ("vlm2", "vlm2_subtask"):
         import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
 
@@ -3515,17 +3728,31 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             alpha=alpha,
             action_expert_name="subtask",
         )
-    elif config.pytorch_model_name == "pi05_ki_joint_query":
-        import openpi.models_pytorch.pi05_ki_joint_query as _pi05_ki_joint_query
+    elif config.pytorch_model_name in ("pi05_ki_joint_query", "pi05_ki_joint_fast"):
+        if config.pytorch_model_name == "pi05_ki_joint_fast":
+            # Variant A: discrete FAST action tokens + cross-entropy backbone
+            # objective (paper-accurate Knowledge Insulation).
+            import openpi.models_pytorch.pi05_ki_joint_fast as _pi05_ki_joint_fast
 
-        model = _pi05_ki_joint_query.PI05KIJointQueryPytorch(model_cfg)
+            model = _pi05_ki_joint_fast.PI05KIJointFastPytorch(model_cfg)
+            variant_label = "FAST action-token CE variant"
+            objective_weight_name = "beta_action"
+        else:
+            # Variant B: learned action queries + MSE backbone objective.
+            import openpi.models_pytorch.pi05_ki_joint_query as _pi05_ki_joint_query
+
+            model = _pi05_ki_joint_query.PI05KIJointQueryPytorch(model_cfg)
+            variant_label = "query-MSE variant"
+            objective_weight_name = "beta_query"
         if is_main:
             ki = bool(getattr(model, "knowledge_insulation", False))
             logging.info(
-                "π0.5-KI joint query query-MSE variant model loaded (knowledge_insulation=%s, beta_text=%.3f, beta_query=%.3f)",
+                "π0.5-KI joint %s model loaded (knowledge_insulation=%s, beta_text=%.3f, %s=%.3f)",
+                variant_label,
                 ki,
                 getattr(model, "beta_text", 1.0),
-                getattr(model, "beta_query", 1.0),
+                objective_weight_name,
+                getattr(model, objective_weight_name, 1.0),
             )
     else:
         import openpi.models_pytorch.pi0_pytorch as _pi0_pytorch
@@ -3545,9 +3772,18 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+        # A formal launcher may set this before Python imports torch, which is
+        # when the allocator configuration must take effect. Never overwrite an
+        # explicitly validated launch contract after CUDA/model initialization.
+        os.environ.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True"
+        )
         if is_main:
-            logging.info("Enabled memory optimizations for 8+ GPU training")
+            logging.info(
+                "Enabled memory optimizations for 8+ GPU training "
+                "(PYTORCH_CUDA_ALLOC_CONF=%s)",
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"],
+            )
 
     # Weight loading for fine-tuning.
     if config.pytorch_weight_path is not None:
@@ -3559,6 +3795,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 logging.warning("Model checkpoint not found at %s. Skipping weight loading.", model_path)
         else:
             load_strict = config.pytorch_model_name not in (
+                "pi05_ki_joint_fast",
                 "vlm2",
                 "vlm2_subtask",
                 "subtask",
@@ -3728,6 +3965,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     # Prepare with Accelerator (DDP or DeepSpeed).
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+    two_phase_update = _TwoPhaseUpdateController(accelerator) if is_pi05_ki_joint else None
     # `accelerator.prepare()` may wrap/replace the model parameters (especially for DeepSpeed).
     # Keep a post-prepare view for gradient clipping/debugging; otherwise debug stats can report
     # grad_tensors=0 even when DeepSpeed computed a non-zero grad_norm.
@@ -3888,31 +4126,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             # NOTE: Observation is a flax.struct.dataclass, which is *not* a dm-tree container.
             # tree.map_structure would treat it as a leaf and leave nested tensors on CPU.
             if _model is not None and isinstance(observation, _model.Observation):
-                device = accelerator.device
-
-                def _maybe_to(
-                    x: torch.Tensor | None,
-                    *,
-                    target_device: torch.device = device,
-                ) -> torch.Tensor | None:
-                    if x is None:
-                        return None
-                    return x.to(target_device, non_blocking=True)
-
-                observation = observation.replace(
-                    images={k: v.to(device, non_blocking=True) for k, v in observation.images.items()},
-                    image_masks={k: v.to(device, non_blocking=True) for k, v in observation.image_masks.items()},
-                    state=observation.state.to(device, non_blocking=True),
-                    tokenized_prompt=_maybe_to(observation.tokenized_prompt),
-                    tokenized_prompt_mask=_maybe_to(observation.tokenized_prompt_mask),
-                    token_ar_mask=_maybe_to(observation.token_ar_mask),
-                    token_loss_mask=_maybe_to(observation.token_loss_mask),
-                    subtask_tokens=_maybe_to(observation.subtask_tokens),
-                    subtask_mask=_maybe_to(observation.subtask_mask),
-                    subtask_loss_mask=_maybe_to(observation.subtask_loss_mask),
-                    subtask_ar_mask=_maybe_to(observation.subtask_ar_mask),
-                    pcd_xyz=_maybe_to(observation.pcd_xyz),
-                )
+                observation = _move_observation_to_device(observation, accelerator.device)
             else:
                 observation = tree.map_structure(
                     lambda x: x.to(accelerator.device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
@@ -4031,7 +4245,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         consecutive_nonfinite_losses += 1
                         total_nonfinite_loss_batches += 1
-                        optimizer.zero_grad(set_to_none=True)
+                        two_phase_update.clear_gradients(optimizer)
                         accelerator.wait_for_everyone()
                         # Flush metrics before raising / skipping on error.
                         _metrics_buffer_flush()
@@ -4050,8 +4264,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         continue
 
-                    # Backbone backward (accumulates grads on backbone params only)
-                    accelerator.backward(bb_loss)
+                    # Backbone backward inherits the outer boundary so ZeRO-2
+                    # finalizes the backbone group, but no update happens yet.
+                    two_phase_update.backward(bb_loss)
 
                     # Capture scalar metrics only on rank 0. The old code called
                     # .item() for every component on all 64 ranks even though only
@@ -4063,13 +4278,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             for k, v in bb_losses.items()
                             if k != "backbone_loss" and isinstance(v, torch.Tensor) and v.numel() == 1
                         }
-                        # Structured loss component keys for π0.5-KI joint query training
-                        # loss_backbone = total backbone loss (CE + query MSE, weighted)
-                        # loss_ce = raw CE loss (detached)
-                        # loss_query_mse = raw query MSE loss (detached)
-                        extra_metrics["loss_backbone"] = bb_loss_val
-                        extra_metrics["loss_ce"] = extra_metrics.get("ce_loss", float("nan"))
-                        extra_metrics["loss_query_mse"] = extra_metrics.get("query_mse_loss", float("nan"))
+                        # Structured loss keys are arm-specific: Variant A reports
+                        # action-token CE, while Variant B reports query MSE.
+                        _add_pi05_ki_structured_backbone_metrics(extra_metrics, bb_loss_val)
                     else:
                         bb_loss_val = float("nan")
                     del bb_losses, bb_loss
@@ -4128,7 +4339,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         consecutive_nonfinite_losses += 1
                         total_nonfinite_loss_batches += 1
-                        optimizer.zero_grad(set_to_none=True)
+                        two_phase_update.clear_gradients(optimizer)
                         accelerator.wait_for_everyone()
                         # Flush metrics before raising / skipping on error.
                         _metrics_buffer_flush()
@@ -4147,9 +4358,12 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         continue
 
-                    # Expert backward (accumulates grads on expert params only with KI=ON;
-                    # adds flow→backbone grads with KI=OFF)
-                    accelerator.backward(ex_loss)
+                    # Expert backward accumulates expert gradients (and
+                    # flow→backbone gradients with KI=OFF). For DeepSpeed this
+                    # phase is marked with the actual outer accumulation
+                    # boundary, but the engine update is still deferred until
+                    # both graphs have been freed below.
+                    two_phase_update.backward(ex_loss)
 
                     # Capture scalar metrics only on rank 0; all other ranks keep
                     # the training path free of logging-only .item() synchronizations.
@@ -4158,7 +4372,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         for k, v in ex_losses.items():
                             if k != "expert_loss" and isinstance(v, torch.Tensor) and v.numel() == 1:
                                 extra_metrics[k] = float(v.detach().float().item())
-                        # Structured loss component keys for π0.5-KI joint query training
+                        # Structured expert loss keys shared by both π0.5-KI arms.
                         # loss_expert = weighted expert loss (alpha * flow_loss)
                         # loss_flow_raw = raw flow matching loss (pre-alpha weighting)
                         extra_metrics["loss_expert"] = ex_loss_val
@@ -4443,12 +4657,23 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                     clip_threshold = float(
                         default_clip_threshold if clip_threshold_override is None else clip_threshold_override
                     )
-                    if _debug_overflow_enabled(config):
+                    deepspeed_two_phase_update = is_pi05_ki_joint and two_phase_update.is_deepspeed
+                    if _debug_overflow_enabled(config) and not deepspeed_two_phase_update:
                         grad_stats_pre = _collect_grad_debug_stats(optim_params, accelerator)
 
-                    grad_norm = accelerator.clip_grad_norm_(optim_params, max_norm=clip_threshold)
-                    grad_norm_value = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
-                    if not np.isfinite(grad_norm_value):
+                    # DeepSpeed's cached global norm is unavailable before the
+                    # first engine step. For two-phase KI, clipping and norm
+                    # computation are owned by the single engine.step below.
+                    if deepspeed_two_phase_update:
+                        grad_norm = None
+                    elif is_pi05_ki_joint:
+                        grad_norm = two_phase_update.clip_grad_norm_before_step(
+                            optim_params, max_norm=clip_threshold
+                        )
+                    else:
+                        grad_norm = accelerator.clip_grad_norm_(optim_params, max_norm=clip_threshold)
+                    grad_norm_value = _grad_norm_to_float(grad_norm)
+                    if not deepspeed_two_phase_update and not np.isfinite(grad_norm_value):
                         total_nonfinite_grad_updates += 1
                         if accelerator.distributed_type == DistributedType.DEEPSPEED and let_deepspeed_handle_nonfinite_grad:
                             if is_main:
@@ -4463,7 +4688,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 )
                         else:
                             consecutive_skipped_updates += 1
-                            optimizer.zero_grad(set_to_none=True)
+                            if is_pi05_ki_joint:
+                                two_phase_update.clear_gradients(optimizer)
+                            else:
+                                optimizer.zero_grad(set_to_none=True)
                             accelerator.wait_for_everyone()
                             if is_main:
                                 logging.warning(
@@ -4484,7 +4712,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 )
                             continue
 
-                    if _debug_overflow_enabled(config):
+                    if _debug_overflow_enabled(config) and not deepspeed_two_phase_update:
                         grad_stats_post = _collect_grad_debug_stats(optim_params, accelerator)
                         if is_main:
                             clipping_triggered = grad_norm_value > clip_threshold
@@ -4534,11 +4762,32 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 logging.warning("overflow_debug loss scale collapsed to %.1f at step=%s", loss_scale, global_step)
                     if profile_memory:
                         _reset_peak_memory_stats(accelerator)
-                    optimizer.step()
+                    if is_pi05_ki_joint:
+                        post_step_grad_norm = two_phase_update.step_and_zero_grad(optimizer)
+                        if deepspeed_two_phase_update:
+                            # DeepSpeed populates this cache inside
+                            # `_take_model_step`, after its clipping/optimizer
+                            # logic and before it clears the partitioned grads.
+                            grad_norm_value = _grad_norm_to_float(post_step_grad_norm)
+                            if not np.isfinite(grad_norm_value):
+                                total_nonfinite_grad_updates += 1
+                                if is_main:
+                                    logging.warning(
+                                        "DeepSpeed reported a non-finite or unavailable post-step grad_norm at "
+                                        "global_step=%s loss=%.6f grad_norm=%s; the engine already handled "
+                                        "clipping/overflow. total_nonfinite_grad_updates=%s",
+                                        global_step,
+                                        loss_for_log,
+                                        grad_norm_value,
+                                        total_nonfinite_grad_updates,
+                                    )
+                    else:
+                        optimizer.step()
                     step_was_skipped = accelerator.optimizer_step_was_skipped
                     if profile_memory:
                         log_memory_usage(accelerator, global_step, "after_optimizer_step")
-                    optimizer.zero_grad(set_to_none=True)
+                    if not is_pi05_ki_joint:
+                        optimizer.zero_grad(set_to_none=True)
 
                     if step_was_skipped:
                         consecutive_skipped_updates += 1
@@ -4708,20 +4957,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                         }
                                     )
 
-                                # --- π0.5-KI joint query structured metrics ---
+                                # --- π0.5-KI structured metrics ---
                                 if is_pi05_ki_joint:
-                                    # Loss components
-                                    for metric_key, wandb_key in [
-                                        ("loss_backbone", "loss/backbone"),
-                                        ("loss_ce", "loss/ce"),
-                                        ("loss_query_mse", "loss/query_mse"),
-                                        ("loss_expert", "loss/expert"),
-                                        ("loss_flow_raw", "loss/flow_raw"),
-                                        ("expert_loss_fraction", "loss/expert_fraction"),
-                                    ]:
-                                        vals = [info[metric_key] for info in infos if metric_key in info and np.isfinite(info[metric_key])]
-                                        if vals:
-                                            log_payload[wandb_key] = sum(vals) / len(vals)
+                                    # Loss components use arm-correct objective names.
+                                    _update_pi05_ki_wandb_loss_metrics(log_payload, infos)
 
                                     # Per-param-group LRs
                                     for pg_name in ("backbone", "expert"):

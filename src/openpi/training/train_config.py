@@ -38,7 +38,16 @@ class TrainConfig:
     # Gemma/PaliGemma fine-tuning than bf16.
     pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "bfloat16"
 
-    pytorch_model_name: Literal["pi0", "pi0_hamlet", "pi0_memoryvla", "vlm2", "vlm2_subtask", "subtask", "pi05_ki_joint_query"] = "pi0"
+    pytorch_model_name: Literal[
+        "pi0",
+        "pi0_hamlet",
+        "pi0_memoryvla",
+        "vlm2",
+        "vlm2_subtask",
+        "subtask",
+        "pi05_ki_joint_query",  # KI Variant B: learned action queries + MSE
+        "pi05_ki_joint_fast",  # KI Variant A: FAST discrete tokens + CE
+    ] = "pi0"
 
     # Accelerate controls (used by scripts/train_accelerate.py). Defaults preserve existing behavior.
     gradient_accumulation_steps: int = 1

@@ -166,6 +166,12 @@ def _detach_kv_cache(past_key_values: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
+    #: Whether this class creates the learned query-token parameters. The
+    #: Variant A subclass sets this False: its backbone target is discrete FAST
+    #: action tokens embedded through the existing vocabulary, so it needs no
+    #: query embeddings and no query action head.
+    _uses_learned_query_tokens: bool = True
+
     """π0.5-KI joint query training model — query-MSE variant: action query tokens + MSE + KI.
 
     Extends :class:`PI05SubtaskPytorch` with:
@@ -237,6 +243,15 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         self._action_dim = action_dim
 
         # ---- Learned query embeddings ----
+        # Guarded so the Variant A subclass (FAST discrete action tokens + CE)
+        # can inherit every shared phase without carrying dead query-MSE
+        # parameters in its state_dict or handing ZeRO gradient-free tensors.
+        # Defaults to True, so this variant is unaffected.
+        if not self._uses_learned_query_tokens:
+            self._action_dim = action_dim
+            self._log_init_summary(action_dim)
+            return
+
         # Shape: [num_query_tokens, query_emb_dim]
         # These are learned embeddings placed after subtask tokens in the
         # backbone sequence.  They contain NO ground-truth action information
@@ -262,6 +277,9 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
         nn.init.zeros_(self.query_action_head.bias)
         nn.init.xavier_uniform_(self.query_action_head.weight, gain=0.01)
 
+        self._log_init_summary(action_dim)
+
+    def _log_init_summary(self, action_dim: int) -> None:
         logger.info(
             "PI05KIJointQueryPytorch initialized: KI=%s, beta_text=%.3f, beta_query=%.3f, "
             "num_query_tokens=%d, query_emb_dim=%d, action_dim=%d, truncate_kv=%s, "
@@ -397,26 +415,40 @@ class PI05KIJointQueryPytorch(PI05SubtaskPytorch):
 
     @contextlib.contextmanager
     def _no_gc_on_backbone(self):
-        """Temporarily disable gradient checkpointing on the backbone language model.
+        """Temporarily disable recursive backbone GC while building the KV cache.
 
-        PaliGemmaWithExpertModel.forward() forces gradient checkpointing ON
-        in training mode (gemma_pytorch.py), which disables ``use_cache`` and
-        returns ``past_key_values=None``.  We need KV cache for the expert's
-        cross-attention, so we temporarily disable GC during prefix encoding.
-
-        Also saves/restores ``config.use_cache`` for robustness.
+        Decoder layers, not only ``GemmaModel``, own the checkpointing hooks in
+        Transformers 4.53. A top-level boolean therefore cannot make
+        ``use_cache=True`` safe after recursive checkpointing is enabled. Snapshot
+        every backbone checkpoint flag and function, disable them for this
+        prefix-only cache pass, then restore the exact per-module state even on
+        exceptions. The expert checkpointing state is deliberately untouched.
         """
         lm = self.paligemma_with_expert.paligemma.language_model
-        old_gc = getattr(lm, "gradient_checkpointing", False)
+        missing = object()
+        gc_states = [
+            (
+                module,
+                module.gradient_checkpointing,
+                getattr(module, "_gradient_checkpointing_func", missing),
+            )
+            for module in lm.modules()
+            if hasattr(module, "gradient_checkpointing")
+        ]
         old_use_cache = getattr(lm.config, "use_cache", True)
         try:
-            if old_gc:
-                lm.gradient_checkpointing = False
+            for module, _enabled, _checkpoint_func in gc_states:
+                module.gradient_checkpointing = False
             lm.config.use_cache = True
             yield
         finally:
-            if old_gc:
-                lm.gradient_checkpointing = old_gc
+            for module, enabled, checkpoint_func in gc_states:
+                module.gradient_checkpointing = enabled
+                if checkpoint_func is missing:
+                    if hasattr(module, "_gradient_checkpointing_func"):
+                        delattr(module, "_gradient_checkpointing_func")
+                else:
+                    module._gradient_checkpointing_func = checkpoint_func
             lm.config.use_cache = old_use_cache
 
     def compute_expert_loss(
