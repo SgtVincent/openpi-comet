@@ -52,6 +52,10 @@ class TrainConfig:
     # Accelerate controls (used by scripts/train_accelerate.py). Defaults preserve existing behavior.
     gradient_accumulation_steps: int = 1
     accelerate_mixed_precision: Literal["no", "fp16", "bf16"] | None = None
+    # Activation checkpointing was historically unconditional in the Accelerate
+    # trainer. Keep it enabled by default while allowing explicit opt-out for
+    # controlled experiments via ``--no-gradient-checkpointing``.
+    gradient_checkpointing: bool = True
     debug_overflow: bool = False
 
     vlm2_geometry_dim: int = 512
@@ -137,6 +141,22 @@ class TrainConfig:
     # materializes this as ``OPENPI_B1K_ANCHOR_STRIDE`` scoped to train-dataset
     # construction. Default 1 preserves pre-existing behavior.
     streaming_anchor_stride: int = 1
+
+    # Per-epoch anchor offsets for streaming-anchor training. When set, the
+    # trainer rebuilds the training dataloader at each epoch boundary with
+    # ``OPENPI_B1K_ANCHOR_OFFSET`` set to the corresponding entry. The list
+    # length must equal ``num_train_epochs`` (when that is not None) and each
+    # value must satisfy ``0 <= offset < streaming_anchor_stride``.
+    #
+    # Rationale: the streaming dataset captures the anchor offset from the
+    # environment *at construction time* (``_read_streaming_anchor_env`` in
+    # ``behavior/learning/datas/dataset.py``). Simply calling ``iter(loader)``
+    # at an epoch boundary does NOT change the offset — the same dataset
+    # instance with its construction-time offset is replayed. To actually
+    # rotate offsets the dataset and loader must be rebuilt.
+    #
+    # Default None preserves legacy single-offset / fixed-step behavior.
+    epoch_anchor_offsets: list[int] | None = None
 
     # ---- Deterministic / representative validation (opt-in) ----
     # Default False everywhere => legacy behaviour is bit-for-bit unchanged.
@@ -228,6 +248,9 @@ class TrainConfig:
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("--gradient_accumulation_steps must be a positive integer.")
 
+        if not isinstance(self.gradient_checkpointing, bool):
+            raise ValueError("--gradient_checkpointing must be a boolean flag.")
+
         if not isinstance(self.debug_overflow, bool):
             raise ValueError("--debug_overflow must be a boolean flag.")
 
@@ -238,6 +261,19 @@ class TrainConfig:
             raise ValueError(
                 f"--streaming_anchor_stride must be a positive integer, got {self.streaming_anchor_stride}."
             )
+
+        if self.epoch_anchor_offsets is not None:
+            if not isinstance(self.epoch_anchor_offsets, (list, tuple)) or len(self.epoch_anchor_offsets) == 0:
+                raise ValueError(
+                    "epoch_anchor_offsets must be a non-empty list when set; "
+                    f"got {self.epoch_anchor_offsets!r}"
+                )
+            for offset in self.epoch_anchor_offsets:
+                if not isinstance(offset, int) or not 0 <= offset < self.streaming_anchor_stride:
+                    raise ValueError(
+                        f"epoch_anchor_offsets entry {offset!r} must be an integer in "
+                        f"[0, {self.streaming_anchor_stride}); got list {self.epoch_anchor_offsets!r}"
+                    )
 
 
 def eps_index_fn(*indexs):

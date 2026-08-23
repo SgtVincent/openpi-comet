@@ -427,6 +427,10 @@ _FORMAL_B1K_CONFIG_CONTRACTS = {
         "accelerate_mixed_precision": "no",
     },
 }
+_A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS = {
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_a100_bf16",
+    "pi05_ki_joint_query_b1k-full_task-ki_on_a100_bf16",
+}
 _FORMAL_B1K_PASS_SPECS = ((0, 34_982), (4, 34_971), (8, 34_959))
 _FORMAL_B1K_PASS_BOUNDARIES = (34_982, 69_953, 104_912)
 _FORMAL_B1K_DATASET_ENV_KEYS = (
@@ -486,6 +490,32 @@ def _train_b1k_anchor_stride_env(stride: int):
             os.environ.pop(env_key, None)
         else:
             os.environ[env_key] = saved
+
+
+@contextmanager
+def _train_b1k_anchor_env(stride: int, offset: int = 0):
+    """Pin both ``OPENPI_B1K_ANCHOR_STRIDE`` and ``..._OFFSET`` for a loader build.
+
+    Used for per-epoch rebuilds when ``config.epoch_anchor_offsets`` rotates
+    the offset between epochs. The dataset captures these at construction, so
+    rebuilding the dataset under a new offset is the only way to make a later
+    epoch consume different anchor positions.
+    """
+
+    stride_key = "OPENPI_B1K_ANCHOR_STRIDE"
+    offset_key = "OPENPI_B1K_ANCHOR_OFFSET"
+    saved_stride = os.environ.get(stride_key)
+    saved_offset = os.environ.get(offset_key)
+    try:
+        os.environ[stride_key] = str(int(stride))
+        os.environ[offset_key] = str(int(offset))
+        yield
+    finally:
+        for key, saved in ((stride_key, saved_stride), (offset_key, saved_offset)):
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
 
 
 def _formal_b1k_pass_for_step(global_step: int) -> tuple[int, int, int, int, int]:
@@ -3302,6 +3332,42 @@ def _validate_runtime_config(config: _config.TrainConfig) -> None:
         raise ValueError("--val-log-interval must be a positive integer.")
 
 
+def _resolved_gradient_checkpointing_state(model) -> bool | None:
+    state_getter = getattr(model, "is_gradient_checkpointing_enabled", None)
+    return state_getter() if state_getter is not None else getattr(model, "gradient_checkpointing_enabled", None)
+
+
+def _configure_gradient_checkpointing(model, *, enabled: bool) -> None:
+    """Apply the requested GC policy and fail closed if the model disagrees."""
+
+    if enabled:
+        if not hasattr(model, "gradient_checkpointing_enable"):
+            raise RuntimeError("Model does not support requested gradient checkpointing policy: enabled=True")
+        model.gradient_checkpointing_enable()
+    else:
+        if not hasattr(model, "gradient_checkpointing_disable"):
+            raise RuntimeError("Model does not support requested gradient checkpointing policy: enabled=False")
+        model.gradient_checkpointing_disable()
+
+    resolved = _resolved_gradient_checkpointing_state(model)
+    if not isinstance(resolved, bool) or resolved is not enabled:
+        raise RuntimeError(
+            "Gradient checkpointing state mismatch: "
+            f"requested={enabled} resolved={resolved!r}"
+        )
+
+
+def _validate_a100_optimizer_offload_policy(config_name: str, ds_config: dict) -> None:
+    if config_name not in _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS:
+        return
+    zero_config = ds_config.get("zero_optimization", {})
+    if "offload_optimizer" in zero_config:
+        raise ValueError(
+            f"A100 formal config {config_name!r} requires optimizer offload disabled; "
+            f"got {zero_config.get('offload_optimizer')!r}"
+        )
+
+
 def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> None:
     _validate_runtime_config(config)
 
@@ -3424,6 +3490,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             clip_grad_norm=float(config.optimizer.clip_gradient_norm),
         )
         _validate_deepspeed_precision_config(accelerator, ds_config, precision=precision)
+        _validate_a100_optimizer_offload_policy(config.name, ds_config)
         if is_main:
             fp16_config = ds_config.get("fp16", {}) if isinstance(ds_config.get("fp16", {}), dict) else {}
             zero_config = (
@@ -3462,8 +3529,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     # Build the training loader under the config's streaming anchor stride.
     # The formal B1K pass loop overrides this per-pass via
     # _set_formal_b1k_pass_offset; for all other configs the stride comes from
-    # config.streaming_anchor_stride.
-    with _train_b1k_anchor_stride_env(getattr(config, "streaming_anchor_stride", 1)):
+    # config.streaming_anchor_stride. Epoch-anchor-offset configs build the
+    # first epoch with offset[0] and rebuild at each epoch boundary.
+    epoch_offsets = getattr(config, "epoch_anchor_offsets", None)
+    initial_offset = int(epoch_offsets[0]) if epoch_offsets else 0
+    with _train_b1k_anchor_env(
+        getattr(config, "streaming_anchor_stride", 1),
+        initial_offset,
+    ):
         loader, data_config = build_datasets(config)
 
     # Build validation data loader (if val_data is configured)
@@ -3543,6 +3616,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     if config.num_train_epochs is not None:
         if config.num_train_epochs <= 0:
             raise ValueError("--num_train_epochs must be a positive integer when provided.")
+        if epoch_offsets is not None and len(epoch_offsets) != int(config.num_train_epochs):
+            raise ValueError(
+                f"epoch_anchor_offsets length ({len(epoch_offsets)}) must equal "
+                f"num_train_epochs ({config.num_train_epochs}); got offsets={epoch_offsets}"
+            )
         computed_steps = int(config.num_train_epochs) * steps_per_epoch
         provided_steps = int(config.num_train_steps)
         target_steps = computed_steps if provided_steps <= 0 else min(provided_steps, computed_steps)
@@ -3759,13 +3837,14 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
         model = _pi0_pytorch.PI0Pytorch(model_cfg)
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-        if is_main:
-            logging.info("Enabled gradient checkpointing for memory optimization")
-    else:
-        if is_main:
-            logging.info("Gradient checkpointing is not supported for this model")
+    gradient_checkpointing = bool(config.gradient_checkpointing)
+    _configure_gradient_checkpointing(model, enabled=gradient_checkpointing)
+    if is_main:
+        logging.info(
+            "Gradient checkpointing runtime policy resolved: requested=%s enabled=%s",
+            gradient_checkpointing,
+            _resolved_gradient_checkpointing_state(model),
+        )
 
     # Memory/perf knobs (keep same behavior as train_pytorch.py).
     if world_size >= 8:
@@ -4082,6 +4161,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     formal_pass_start = 0
     formal_pass_end = int(config.num_train_steps)
     train_iterator = None
+    epoch_anchor_index = 0 if (epoch_offsets is not None and not formal_b1k_mode) else None
     while global_step < int(config.num_train_steps):
         if formal_b1k_mode:
             next_pass_index, next_offset, pass_steps, pass_start, pass_end = _formal_b1k_pass_for_step(global_step)
@@ -4112,12 +4192,45 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         formal_pass_end,
                     )
         else:
+            # Epoch-anchor-offset mode: rebuild the loader when a new epoch
+            # starts so the dataset captures the next offset from the env.
+            # The streaming dataset reads OPENPI_B1K_ANCHOR_OFFSET at
+            # construction time; merely calling iter(loader) would replay the
+            # same offset for every epoch. Formal B1K mode uses its own
+            # explicit multi-pass rebuild above and never enters this branch.
+            if epoch_offsets is not None and not formal_b1k_mode:
+                current_epoch = global_step // steps_per_epoch
+                if current_epoch != epoch_anchor_index:
+                    if current_epoch >= len(epoch_offsets):
+                        break
+                    accelerator.wait_for_everyone()
+                    _close_training_iterator(train_iterator)
+                    train_iterator = None
+                    del loader
+                    gc.collect()
+                    next_offset = int(epoch_offsets[current_epoch])
+                    with _train_b1k_anchor_env(
+                        int(getattr(config, "streaming_anchor_stride", 1)),
+                        next_offset,
+                    ):
+                        loader, _ = build_datasets(config)
+                    loader = accelerator.prepare(loader)
+                    epoch_anchor_index = current_epoch
+                    if is_main:
+                        logging.info(
+                            "Epoch anchor offset rotated: epoch=%s offset=%s stride=%s",
+                            current_epoch + 1,
+                            next_offset,
+                            getattr(config, "streaming_anchor_stride", 1),
+                        )
             train_iterator = iter(loader)
 
         for observation, actions in train_iterator:
             if global_step >= int(config.num_train_steps):
                 break
             if formal_b1k_mode and global_step >= formal_pass_end:
+                break
+            if epoch_anchor_index is not None and global_step >= (epoch_anchor_index + 1) * steps_per_epoch:
                 break
 
             profile_memory = is_main and _should_profile_memory_step(global_step)

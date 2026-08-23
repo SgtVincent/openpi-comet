@@ -179,8 +179,41 @@ class PI0Pytorch(nn.Module):
         logging.info("Disabled recursive gradient checkpointing for PI0Pytorch model")
 
     def is_gradient_checkpointing_enabled(self):
-        """Check if gradient checkpointing is enabled."""
-        return self.gradient_checkpointing_enabled
+        """Return the resolved recursive checkpointing state.
+
+        The wrapper flag alone is insufficient: Transformers performs the
+        recomputation in decoder layers reached by the two public recursive
+        APIs above. Raise on a partial/mismatched state instead of reporting a
+        misleading enabled or disabled value.
+        """
+        wrapper_enabled = bool(self.gradient_checkpointing_enabled)
+        recursive_states = {}
+        for name, nested_model in (
+            ("paligemma", self.paligemma_with_expert.paligemma),
+            ("gemma_expert", self.paligemma_with_expert.gemma_expert),
+        ):
+            module_states = [
+                bool(module.gradient_checkpointing)
+                for module in nested_model.modules()
+                if hasattr(module, "gradient_checkpointing")
+            ]
+            recursive_states[name] = {
+                "reported": bool(nested_model.is_gradient_checkpointing),
+                "modules": module_states,
+            }
+        mismatched = {
+            name: state
+            for name, state in recursive_states.items()
+            if not state["modules"]
+            or state["reported"] != wrapper_enabled
+            or any(module_state != wrapper_enabled for module_state in state["modules"])
+        }
+        if mismatched:
+            raise RuntimeError(
+                "Gradient checkpointing state is not recursive: "
+                f"wrapper={wrapper_enabled} nested={recursive_states}"
+            )
+        return wrapper_enabled
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""

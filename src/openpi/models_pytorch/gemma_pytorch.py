@@ -252,19 +252,18 @@ class PaliGemmaWithExpertModel(nn.Module):
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
-            # Check if gradient checkpointing is enabled for any of the models
-            use_gradient_checkpointing = (
-                hasattr(self.gemma_expert.model, "gradient_checkpointing")
-                and self.gemma_expert.model.gradient_checkpointing
-                and self.training
-            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
-
-            # Force enable gradient checkpointing if we're in training mode and the model supports it
-            if self.training and hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                if not self.gemma_expert.model.gradient_checkpointing:
-                    print("Forcing gradient checkpointing to be enabled for Gemma expert model")
-                    self.gemma_expert.model.gradient_checkpointing = True
-                use_gradient_checkpointing = True
+            # Respect the recursively configured model policy. This dual-stream
+            # path used to force-enable only the expert flag during training,
+            # which made an explicit trainer-level GC opt-out ineffective and
+            # left backbone/expert state inconsistent after the first forward.
+            backbone_gc = bool(getattr(self.paligemma.language_model, "gradient_checkpointing", False))
+            expert_gc = bool(getattr(self.gemma_expert.model, "gradient_checkpointing", False))
+            if backbone_gc != expert_gc:
+                raise RuntimeError(
+                    "Dual-stream gradient checkpointing state mismatch: "
+                    f"backbone={backbone_gc} expert={expert_gc}"
+                )
+            use_gradient_checkpointing = self.training and backbone_gc
 
             # Debug gradient checkpointing status
             if hasattr(self, "_debug_gc_printed") and not self._debug_gc_printed:
@@ -374,7 +373,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                         position_ids,
                         adarms_cond,
                         use_reentrant=False,
-                        preserve_rng_state=False,
+                        preserve_rng_state=True,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
@@ -395,7 +394,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             # Apply gradient checkpointing to final norm if enabled
             if use_gradient_checkpointing:
                 outputs_embeds = torch.utils.checkpoint.checkpoint(
-                    compute_final_norms, inputs_embeds, adarms_cond, use_reentrant=False, preserve_rng_state=False
+                    compute_final_norms, inputs_embeds, adarms_cond, use_reentrant=False, preserve_rng_state=True
                 )
             else:
                 outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)

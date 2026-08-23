@@ -609,6 +609,8 @@ def _make_pi05_ki_joint_full_task_set_config(
     action_repr: str = "query_mse",
     action_token_max_len: int = 64,
     precision: str = "bfloat16",
+    epoch_anchor_offsets: list[int] | None = None,
+    project_name: str = "pi05_ki",
 ) -> TrainConfig:
     """Build a matched KI Variant A/B config over the full B1K task set.
 
@@ -664,7 +666,7 @@ def _make_pi05_ki_joint_full_task_set_config(
     return TrainConfig(
         name=name,
         exp_name=name,
-        project_name="pi05_ki",
+        project_name=project_name,
         pytorch_model_name=_ACTION_REPR_TO_MODEL_NAME[action_repr],
         model=_make_ki_model_config(
             action_repr=action_repr,
@@ -713,6 +715,7 @@ def _make_pi05_ki_joint_full_task_set_config(
         val_log_interval=val_log_interval,
         val_num_batches=val_num_batches,
         streaming_anchor_stride=streaming_anchor_stride,
+        epoch_anchor_offsets=epoch_anchor_offsets,
     )
 
 
@@ -952,5 +955,60 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         save_interval=10_000,
         val_log_interval=2_000,
         streaming_anchor_stride=4,
+    ),
+    # ------------------------------------------------------------------
+    # Formal 4x8 A100_SXM4_40GB BF16 pair.
+    #
+    # B4/GPU x world32 x GA2 preserves global batch 256. Four epochs with
+    # stride-4 anchor offsets (0, 1, 2, 3) cover every anchor position
+    # exactly once across the four passes. The per-epoch offset rotation is
+    # enforced by train_accelerate.py via config.epoch_anchor_offsets and
+    # proven by tests/test_pi05_ki_a100_bf16_formal.py.
+    #
+    # Cap 208 is retained unchanged from the V100 formal pair: the exhaustive
+    # token bound is max(train 199, val 190) = 199 and 208 is the smallest
+    # 16-aligned value with 9 tokens of headroom. Variant B has no FAST target.
+    #
+    # A/B differ ONLY in action_repr (fast_ce vs query_mse) and its
+    # model-specific consequence (action_token_max_len=208 on A).
+    # ------------------------------------------------------------------
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_a100_bf16",
+        behavior_dataset_root=_B1K_DATA_ROOT,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        batch_size_per_gpu=4,
+        gradient_accumulation_steps=2,
+        num_train_steps=0,
+        num_train_epochs=4,
+        warmup_steps=1_000,
+        peak_lr=1e-5,
+        decay_steps=0,
+        decay_lr=0.0,
+        action_repr="fast_ce",
+        action_token_max_len=208,
+        precision="bfloat16",
+        streaming_anchor_stride=4,
+        epoch_anchor_offsets=[0, 1, 2, 3],
+        project_name="pi05_ki_a100",
+    ),
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_query_b1k-full_task-ki_on_a100_bf16",
+        behavior_dataset_root=_B1K_DATA_ROOT,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        batch_size_per_gpu=4,
+        gradient_accumulation_steps=2,
+        num_train_steps=0,
+        num_train_epochs=4,
+        warmup_steps=1_000,
+        peak_lr=1e-5,
+        decay_steps=0,
+        decay_lr=0.0,
+        action_repr="query_mse",
+        precision="bfloat16",
+        streaming_anchor_stride=4,
+        epoch_anchor_offsets=[0, 1, 2, 3],
+        project_name="pi05_ki_a100",
     ),
 ]
