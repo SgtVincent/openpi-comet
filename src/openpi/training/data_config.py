@@ -150,6 +150,28 @@ class DataConfig:
         default_factory=lambda: SkillBridgeConfig()
     )
 
+    # ---- Dataset access mode ----
+    # BehaviorLeRobotDataset supports two access modes:
+    #   chunk_streaming_using_keyframe=True  (default, used for TRAINING)
+    #       A stateful sequential video stream. ``__getitem__(idx)`` IGNORES idx
+    #       and instead returns the frame at an internal, monotonically advancing
+    #       cursor. Fast (keyframe/GOP-aligned decoding) but:
+    #         * sampler permutations / ``shuffle`` are decorative no-ops,
+    #         * a batch of N is N CONSECUTIVE frames of one episode,
+    #         * the cursor persists across DataLoader ``iter()`` calls when
+    #           ``persistent_workers=True``, so repeated passes drift forward.
+    #       These properties are acceptable for training but make VALIDATION
+    #       non-reproducible and non-representative.
+    #   chunk_streaming_using_keyframe=False (recommended for VALIDATION)
+    #       Plain map-style access: ``__getitem__(idx)`` is honored, so an
+    #       explicit index list (e.g. a stratified per-task subset) works and
+    #       every evaluation scores exactly the same samples.
+    #       Costs ~10x more per random sample (video seek) but parallelizes.
+    chunk_streaming_using_keyframe: bool = True
+    # Only meaningful when chunk_streaming_using_keyframe=True (it permutes the
+    # streaming chunk order). Has no effect in map-style mode.
+    dataset_shuffle: bool = True
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
