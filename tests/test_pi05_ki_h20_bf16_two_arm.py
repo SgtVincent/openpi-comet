@@ -153,6 +153,174 @@ def test_smoke_arms_are_bounded_but_keep_the_formal_per_gpu_batch() -> None:
         assert cfg.model.action_token_max_len == _EXPECTED_CAP
 
 
+def test_smoke_must_actually_reach_validation() -> None:
+    """A smoke that never calls compute_eval_metrics is not a gate.
+
+    Variant A's known historical failure is *inside* validation: the trainer
+    passes ``deterministic_flow`` to both KI variants through one shared
+    ``is_pi05_ki_joint`` branch, and Variant A's override of
+    ``compute_eval_metrics`` did not accept it -- which killed an A100 FAST run at
+    its first validation after ~2h40m of training. Validation fires on
+    ``global_step % val_log_interval == 0 and global_step > 0``, so the interval
+    must be strictly below the budget (an equal interval puts the only validation
+    on the termination boundary) and must yield at least two passes.
+    """
+    for name in (_ARM_A_SMOKE, _ARM_B_SMOKE):
+        cfg = get_config(name)
+        assert cfg.val_log_interval < cfg.num_train_steps, (
+            f"{name}: val_log_interval={cfg.val_log_interval} >= "
+            f"num_train_steps={cfg.num_train_steps}, so validation would land on or "
+            "past the termination boundary and might never run"
+        )
+        assert cfg.num_train_steps // cfg.val_log_interval >= 2, (
+            f"{name}: only {cfg.num_train_steps // cfg.val_log_interval} validation "
+            "pass(es) in the budget; need >= 2"
+        )
+
+
+def test_step0_capability_gate_blocks_the_regression_and_the_bad_fixes(tmp_path) -> None:
+    """The step-0 gate must reject the original bug AND the tempting bad fixes.
+
+    The cost of this bug class was never the TypeError itself -- it was that it
+    fired at the first validation, hours into a 32-GPU run, and that a smoke
+    shorter than one validation interval could not reach it. So the gate is
+    checked here against four implementations.
+    """
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        "_ta_capcheck", _REPO_ROOT / "scripts" / "train_accelerate.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_ta_capcheck"] = module
+    try:
+        spec.loader.exec_module(module)
+    except SystemExit:
+        pass
+
+    cfg = get_config(_ARM_A_SMOKE)
+    assert cfg.val_deterministic_flow is True, (
+        "this gate is only meaningful while the flag is requested ON"
+    )
+
+    # File-backed so inspect.getsource works, exactly as for real model classes.
+    mod_path = tmp_path / "_capcheck_models.py"
+    mod_path.write_text(
+        "class Honoured:\n"
+        "    def compute_eval_metrics(self, o, a, *, compute_flow_l1=False,\n"
+        "                             num_denoise_steps=10, flow_l1_seed=42,\n"
+        "                             deterministic_flow=False):\n"
+        "        if deterministic_flow:\n"
+        "            import torch\n"
+        "            torch.manual_seed(flow_l1_seed)\n"
+        "        return {}\n"
+        "class Regressed:\n"
+        "    def compute_eval_metrics(self, o, a, *, compute_flow_l1=False,\n"
+        "                             num_denoise_steps=10, flow_l1_seed=42):\n"
+        "        return {}\n"
+        "class Absorber:\n"
+        "    def compute_eval_metrics(self, o, a, **kwargs):\n"
+        "        return {}\n"
+        "class NoOp:\n"
+        "    def compute_eval_metrics(self, o, a, *, compute_flow_l1=False,\n"
+        "                             num_denoise_steps=10, flow_l1_seed=42,\n"
+        "                             deterministic_flow=False):\n"
+        "        return {}\n"
+    )
+    sys.path.insert(0, str(tmp_path))
+    try:
+        spec2 = importlib.util.spec_from_file_location("_capcheck_models", mod_path)
+        models = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(models)
+
+        # The correct implementation passes.
+        module._validate_ki_eval_capability(models.Honoured(), cfg, is_main=False)
+
+        # The original bug: TypeError at first validation.
+        with pytest.raises(RuntimeError, match="deterministic_flow"):
+            module._validate_ki_eval_capability(models.Regressed(), cfg, is_main=False)
+
+        # The forbidden **kwargs "fix": converts a loud crash into total silence.
+        with pytest.raises(RuntimeError, match="silently swallowed"):
+            module._validate_ki_eval_capability(models.Absorber(), cfg, is_main=False)
+
+        # Signature parity with a no-op body: accepted and ignored.
+        with pytest.raises(RuntimeError, match="never referenced in its body"):
+            module._validate_ki_eval_capability(models.NoOp(), cfg, is_main=False)
+    finally:
+        sys.path.remove(str(tmp_path))
+
+
+def test_both_ki_variants_accept_the_shared_trainer_call_surface() -> None:
+    """Guard the bug class, not just the one instance that bit us.
+
+    ``is_pi05_ki_joint`` treats the two classes as interchangeable while they are
+    maintained separately, so any kwarg added to one implementation and to the
+    call site -- but not to the other implementation -- is a latent TypeError that
+    only fires at validation. Assert full signature parity on every method FAST
+    overrides, except the two deliberate fail-closed ``**kwargs`` stubs.
+    """
+    import inspect
+
+    from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch as Fast
+    from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch as Query
+
+    # These two are intentionally divergent: FAST replaces them with
+    # NotImplementedError stubs because they are Variant-B-only code paths.
+    intentional_stubs = {"_embed_query_tokens", "_compute_query_mse_loss"}
+
+    q_attrs, f_attrs = vars(Query), vars(Fast)
+    overridden = [
+        name
+        for name in f_attrs
+        if name in q_attrs and callable(f_attrs[name]) and not name.startswith("__")
+    ]
+    assert overridden, "expected FAST to override at least compute_eval_metrics"
+
+    divergent = {}
+    for name in overridden:
+        if name in intentional_stubs:
+            continue
+        sig_q = inspect.signature(q_attrs[name])
+        sig_f = inspect.signature(f_attrs[name])
+        if str(sig_q) != str(sig_f):
+            divergent[name] = (str(sig_q), str(sig_f))
+    assert not divergent, f"signature divergence between KI variants: {divergent}"
+
+    # And the stubs really are fail-closed rather than silently absorbing calls.
+    for name in intentional_stubs:
+        assert name in f_attrs, f"{name} should still be overridden in FAST"
+        src = inspect.getsource(f_attrs[name])
+        assert "NotImplementedError" in src, f"{name} must fail closed, not absorb the call"
+
+
+def test_fast_eval_metrics_honours_deterministic_flow_the_same_way() -> None:
+    """Signature parity is not enough -- the behaviour must match.
+
+    If Variant B makes flow sampling deterministic and Variant A merely absorbs
+    the kwarg, the two arms would differ in validation determinism, which is a
+    confound in the very comparison this pair exists to run. ``val_deterministic
+    _flow`` defaults to True, so this path is live, not hypothetical.
+    """
+    import inspect
+
+    from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch as Fast
+    from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch as Query
+
+    for cls in (Query, Fast):
+        src = inspect.getsource(cls.compute_eval_metrics)
+        assert "deterministic_flow" in src
+        # fixed (noise, time) drawn from flow_l1_seed
+        assert "torch.manual_seed(flow_l1_seed)" in src, cls.__name__
+        # no random image augmentation on the deterministic path
+        assert "train_preprocess=False" in src, cls.__name__
+        # CUDA generators restored explicitly: manual_seed reseeds CPU *and* CUDA,
+        # while get/set_rng_state covers only CPU, so omitting this leaks a CUDA
+        # reseed into the training RNG stream.
+        assert "set_rng_state_all" in src, cls.__name__
+
+
 def test_formal_contract_table_registers_both_arms_consistently() -> None:
     """The trainer's formal table must agree with the registered configs."""
     source = (_REPO_ROOT / "scripts" / "train_accelerate.py").read_text()
@@ -245,13 +413,261 @@ def test_launcher_pins_each_arm_to_its_own_norm_stats_digest() -> None:
     assert "7233650408" in text
 
 
-def test_cap_provenance_comment_does_not_reuse_the_4dde119e_exhaustive_ids() -> None:
-    """Reusing that provenance under a different normalization would be a false claim."""
+def _make_eval_probe(cls, n_backbone_outputs: int):
+    """Lightweight subclass that runs the REAL compute_eval_metrics.
+
+    Only the expensive collaborators are stubbed, so the deterministic_flow code
+    path itself -- manual_seed, the CPU/CUDA state save-restore, the (noise, time)
+    draw and the train_preprocess passthrough -- is genuinely executed. Building
+    the real 4.1B-parameter module would make this test unusable, and asserting
+    only on the signature is what allowed the original bug through in the first
+    place.
+    """
+    import torch
+
+    class _Probe(cls):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.calls: list[dict] = []
+
+        def _compute_backbone_eval_metrics(self, observation, actions):
+            z = torch.zeros((), dtype=torch.float32)
+            return tuple(z.clone() for _ in range(n_backbone_outputs))
+
+        def compute_expert_loss(
+            self, observation, actions, noise=None, time=None, *, train_preprocess=True
+        ):
+            self.calls.append(
+                {
+                    "noise": None if noise is None else noise.detach().clone(),
+                    "time": None if time is None else time.detach().clone(),
+                    "train_preprocess": train_preprocess,
+                }
+            )
+            # Make the reported metric a function of (noise, time) so that
+            # identical draws must produce bit-identical flow metrics.
+            val = (
+                (noise.double().sum() + time.double().sum()).float()
+                if noise is not None
+                else torch.zeros((), dtype=torch.float32)
+            )
+            return {"expert_loss": val, "flow_loss": val}
+
+    return _Probe()
+
+
+@pytest.mark.parametrize(("variant", "n_backbone"), [("fast", 5), ("query", 5)])
+def test_deterministic_flow_is_actually_honoured_and_leaves_rng_untouched(
+    variant: str, n_backbone: int
+) -> None:
+    """Behaviour test, not a signature test.
+
+    Three properties, all of which the original Variant A silently lacked:
+      1. two calls with deterministic_flow=True yield bit-identical flow metrics
+      2. the deterministic path disables random image augmentation
+      3. the global RNG stream is left byte-identical, so validation cannot
+         perturb training. torch.manual_seed() reseeds CPU *and* all CUDA
+         generators, so a partial restore would leak into the training stream.
+    """
+    import torch
+
+    from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch as Fast
+    from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch as Query
+
+    cls = Fast if variant == "fast" else Query
+    probe = _make_eval_probe(cls, n_backbone)
+    actions = torch.zeros((2, 4, 8), dtype=torch.float32)
+
+    torch.manual_seed(1234)
+    state_before = torch.get_rng_state()
+
+    m1 = probe.compute_eval_metrics(None, actions, deterministic_flow=True, flow_l1_seed=777)
+    m2 = probe.compute_eval_metrics(None, actions, deterministic_flow=True, flow_l1_seed=777)
+
+    state_after = torch.get_rng_state()
+
+    # 1. identical (noise, time) => bit-identical flow metrics
+    assert torch.equal(probe.calls[0]["noise"], probe.calls[1]["noise"]), (
+        f"{variant}: deterministic_flow did not fix the noise draw"
+    )
+    assert torch.equal(probe.calls[0]["time"], probe.calls[1]["time"]), (
+        f"{variant}: deterministic_flow did not fix the time draw"
+    )
+    assert torch.equal(m1["flow_loss"], m2["flow_loss"]), (
+        f"{variant}: flow_loss is not reproducible under deterministic_flow"
+    )
+    assert torch.equal(m1["expert_loss"], m2["expert_loss"])
+    assert torch.equal(m1["total_loss"], m2["total_loss"])
+
+    # 2. no random image augmentation on the deterministic path
+    assert probe.calls[0]["train_preprocess"] is False, (
+        f"{variant}: deterministic_flow must preprocess with train=False"
+    )
+    assert probe.calls[1]["train_preprocess"] is False
+
+    # 3. training RNG stream untouched
+    assert torch.equal(state_before, state_after), (
+        f"{variant}: validation perturbed the global CPU RNG state; manual_seed reseeds "
+        "CPU and CUDA, so both must be saved and restored"
+    )
+
+
+@pytest.mark.parametrize(("variant", "n_backbone"), [("fast", 5), ("query", 5)])
+def test_deterministic_flow_off_uses_the_random_path(variant: str, n_backbone: int) -> None:
+    """With the flag off, the model must delegate to the default random draw.
+
+    This is the control for the test above: if the implementation ignored the flag
+    entirely, both branches would look identical and the test above would pass for
+    the wrong reason.
+    """
+    import torch
+
+    from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch as Fast
+    from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch as Query
+
+    cls = Fast if variant == "fast" else Query
+    probe = _make_eval_probe(cls, n_backbone)
+    actions = torch.zeros((2, 4, 8), dtype=torch.float32)
+
+    probe.compute_eval_metrics(None, actions, deterministic_flow=False)
+    call = probe.calls[0]
+    assert call["noise"] is None, f"{variant}: flag off must not inject a fixed noise"
+    assert call["time"] is None, f"{variant}: flag off must not inject a fixed time"
+    assert call["train_preprocess"] is True, (
+        f"{variant}: flag off must keep the default train-time preprocessing"
+    )
+
+
+def test_both_variants_produce_identical_deterministic_draws() -> None:
+    """The two arms must be equally deterministic, or determinism is a confound.
+
+    Same seed, same action shape: both variants must draw the same (noise, time),
+    otherwise their validation losses are not comparable on equal terms even
+    though both nominally honour the flag.
+    """
+    import torch
+
+    from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch as Fast
+    from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch as Query
+
+    actions = torch.zeros((3, 4, 8), dtype=torch.float32)
+    draws = {}
+    for label, cls in (("fast", Fast), ("query", Query)):
+        probe = _make_eval_probe(cls, 5)
+        torch.manual_seed(99)
+        probe.compute_eval_metrics(None, actions, deterministic_flow=True, flow_l1_seed=4242)
+        draws[label] = (probe.calls[0]["noise"], probe.calls[0]["time"])
+
+    assert torch.equal(draws["fast"][0], draws["query"][0]), (
+        "arms draw different validation noise under the same seed"
+    )
+    assert torch.equal(draws["fast"][1], draws["query"][1]), (
+        "arms draw different validation time under the same seed"
+    )
+
+
+def test_flow_l1_path_rng_handling_is_shared_not_duplicated() -> None:
+    """The second RNG site must not become a second place to get this wrong.
+
+    Variant B has TWO independent CPU+CUDA save/restore blocks: one in
+    ``compute_eval_metrics`` and one in ``_compute_flow_l1_euler`` (the Euler
+    integration path reached when ``compute_flow_l1=True``). Variant A only
+    re-implements the first. It gets the second for free by inheritance, which is
+    exactly why that site never diverged -- the entire bug class lives in the set
+    of methods FAST *overrides*.
+
+    A partially deterministic validation is the worst outcome: it would pass a
+    two-call bit-identity test on the fixed path and still leak nondeterminism
+    through the unfixed one. So assert the sharing explicitly, and this test fails
+    if someone later re-implements the method in FAST without the RNG handling.
+    """
+    import inspect
+
+    from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch as Fast
+    from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch as Query
+
+    assert Fast._compute_flow_l1_euler is Query._compute_flow_l1_euler, (
+        "FAST has re-implemented _compute_flow_l1_euler; it must then carry its own "
+        "CPU+CUDA RNG save/restore, or validation becomes only partially deterministic"
+    )
+    src = inspect.getsource(Query._compute_flow_l1_euler)
+    assert "torch.manual_seed(seed)" in src
+    assert "torch.get_rng_state()" in src and "torch.set_rng_state(" in src
+    assert "get_rng_state_all" in src and "set_rng_state_all" in src
+
+
+@pytest.mark.parametrize("variant", ["fast", "query"])
+def test_deterministic_flow_holds_with_flow_l1_enabled_too(variant: str) -> None:
+    """Cover the compute_flow_l1=True branch, which reaches the second RNG site.
+
+    The heavy Euler integration is stubbed (it needs real model internals), so what
+    this asserts is the part living in compute_eval_metrics: the configured seed is
+    threaded through to the flow-L1 path, results stay bit-identical across calls,
+    and the global RNG stream is still untouched with the slow metric enabled.
+    """
+    import torch
+
+    from openpi.models_pytorch.pi05_ki_joint_fast import PI05KIJointFastPytorch as Fast
+    from openpi.models_pytorch.pi05_ki_joint_query import PI05KIJointQueryPytorch as Query
+
+    cls = Fast if variant == "fast" else Query
+    probe = _make_eval_probe(cls, 5)
+    seeds: list[int] = []
+
+    def _stub_flow_l1(*, observation, actions, num_steps, seed):
+        seeds.append(seed)
+        return torch.full((), float(seed), dtype=torch.float32)
+
+    probe._compute_flow_l1_euler = _stub_flow_l1  # noqa: SLF001
+    actions = torch.zeros((2, 4, 8), dtype=torch.float32)
+
+    torch.manual_seed(555)
+    before = torch.get_rng_state()
+    m1 = probe.compute_eval_metrics(
+        None, actions, compute_flow_l1=True, deterministic_flow=True, flow_l1_seed=31337
+    )
+    m2 = probe.compute_eval_metrics(
+        None, actions, compute_flow_l1=True, deterministic_flow=True, flow_l1_seed=31337
+    )
+    after = torch.get_rng_state()
+
+    assert "flow_l1" in m1 and "flow_l1" in m2, f"{variant}: flow_l1 not emitted when requested"
+    assert seeds == [31337, 31337], f"{variant}: flow_l1_seed not threaded through: {seeds}"
+    assert torch.equal(m1["flow_l1"], m2["flow_l1"])
+    assert torch.equal(m1["flow_loss"], m2["flow_loss"])
+    assert torch.equal(before, after), (
+        f"{variant}: RNG stream perturbed with compute_flow_l1=True"
+    )
+
+
+def test_cap_provenance_comment_is_exhaustive_and_does_not_reuse_the_4dde119e_ids() -> None:
+    """The cap comment must state what was actually measured, under which norm_stats.
+
+    Reusing the `4dde119e` exhaustive provenance would be a false claim, and now a
+    demonstrably false one: the `d66ed168` train max is 200, which exceeds that
+    population's 199. The comment must also stay honest that 208 would have
+    sufficed, so nobody reads 256 as vindicated.
+    """
     text = (_REPO_ROOT / "src" / "openpi" / "training" / "pi05_ki_joint_query_config.py").read_text()
-    block = text.split("_H20_FAST_ACTION_TOKEN_MAX_LEN", 1)[0][-4000:]
-    assert "SAMPLED, NOT EXHAUSTIVE" in block
-    assert "d66ed168" in block
-    # The exhaustive ids may be *named* as belonging to 4dde119e, but the block
-    # must say so rather than presenting them as this cap's provenance.
+    block = text.split("_H20_FAST_ACTION_TOKEN_MAX_LEN", 1)[0][-6000:]
+
+    # states its own strength, and the normalization it applies to
+    assert "EXHAUSTIVELY VERIFIED" in block
+    assert "d66ed16830a98f90dde8a315058b4a0df59f5e05734c1686d8b3f66787d0a929" in block
+    # the measured populations and maxima, in full
+    assert "26,857,712" in block and "max 200" in block
+    assert "11,398,271" in block and "max 189" in block
+    assert "exhaustive_W_cap256_20260824_124043" in block
+    # the old provenance may be NAMED, but only as belonging to the other population
     if "0bb9280746" in block:
-        assert "belongs to" in block or "NOT reused" in block
+        assert "4dde119e" in block and "NOT reused" in block
+    # and the unflattering half must be stated, not quietly dropped
+    assert "208 would in fact have sufficed" in block
+    assert "NOT presented as vindicated" in block
+
+
+def test_cap_comment_does_not_claim_the_old_bound_transfers() -> None:
+    """The measured fact that makes the old bound non-transferable must be recorded."""
+    text = (_REPO_ROOT / "src" / "openpi" / "training" / "pi05_ki_joint_query_config.py").read_text()
+    block = text.split("_H20_FAST_ACTION_TOKEN_MAX_LEN", 1)[0][-6000:]
+    assert "EXCEEDS" in block, "the 200 > 199 fact must be explicit"

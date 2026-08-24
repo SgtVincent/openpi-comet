@@ -75,50 +75,53 @@ _HL_PI05_BASE_CKPT = (
 )
 
 # --- Shared FAST action-token capacity for BOTH H20 arms ---------------------
-# SAMPLED, NOT EXHAUSTIVE. This bound was measured under Arm A's normalization
-# (norm_stats.json sha256 d66ed168…, 6368 B), which is a DIFFERENT normalization
-# from the one the historical cap-208 bound was proven on. The exhaustive
-# provenance recorded on the V100/A100 FAST configs
+# EXHAUSTIVELY VERIFIED under Arm A's normalization (norm_stats.json sha256
+# d66ed16830a98f90dde8a315058b4a0df59f5e05734c1686d8b3f66787d0a929, 6368 B) --
+# a DIFFERENT normalization from the one the historical cap-208 bound was proven
+# on. The exhaustive provenance recorded on the V100/A100 FAST configs
 # (run_id=0bb9280746…, manifest=ef4cb52d…, aggregate=51250f15…) belongs to
-# norm_stats 4dde119e… and is deliberately NOT reused here; reusing it would be
-# a false claim about a population that was never scanned.
+# norm_stats 4dde119e… and is deliberately NOT reused here.
 #
-# What was actually measured (seed=20260824, uniform i.i.d. windows, token count
-# includes BOS/EOS; harness validated by reproducing both window populations to
-# the digit -- train 26,857,712 and val 11,398,271):
-#   train  400,000 / 26,857,712 (1.489%): p50 37, p99.9  96, max 166, >199 = 0, >208 = 0
-#   val    300,000 / 11,398,271 (2.632%): p50 38, p99.9 102, max 178, >199 = 0, >208 = 0
-# Same harness re-run under 4dde119e… reproduced the known exhaustive p99.9 of
-# 99 to within one token (98), which is what validates the measurement.
+# MEASURED, every window in both populations, no sampling:
+#   train  n=26,857,712 (100%): min 19, p50 37, p99 73, p99.9  98, max 200
+#   val    n=11,398,271 (100%): min 19, p50 38, p99 74, p99.9 102, max 189
+#   windows >208 = 0 and >256 = 0 in both splits.
+# Provenance record (per-split JSON with full histograms, anchor rule, digests):
+#   h20_fastce_scan/exhaustive_W_cap256_20260824_124043/
+# The record asserts SAMPLED_NOT_EXHAUSTIVE=false and windows_scanned ==
+# population_windows, and its anchor_rule (stride 12, offsets [0,4,8], drop) is
+# the formal training contract, so the scanned population IS the population the
+# run consumes. action_dim=23, so only q01/q99 dims 0..22 affect token length.
 #
-# Why 256 and not 208, despite 0 sampled windows above 208:
-#   * Sampling cannot certify a fail-closed bound. Under 4dde119e… this harness's
-#     sampled max understated the known exhaustive max by 31 tokens on train
-#     (168 vs 199) and 13 on val (177 vs 190). Applying those same deficits to
-#     the d66ed168… samples extrapolates an exhaustive max of roughly 197-211,
-#     which STRADDLES 208.
-#   * Rule of three: 0 exceedances above 199 in 400,000 train draws only bounds
-#     the rate at <= 7.5e-6 (95%), i.e. up to ~201 of the 26.86M train windows
-#     could still exceed 199. Because tokenize_action_chunk RAISES rather than
-#     truncating, a single such window aborts the run.
-#   * FAST length is content-driven and non-smooth (an all-zero chunk yields 1
-#     token; a uniform-random one yields ~601), so a few-percent pad is not a
-#     valid extrapolation.
-# 256 is the next 16-aligned value above that straddle band: +78 tokens (+43.8%)
-# over the sampled max 178, and +45..59 tokens over the 197-211 extrapolation.
+# WHY THE OLD BOUND COULD NOT BE REUSED -- now a measured fact, not an argument:
+# the train max under d66ed168 is **200**, which EXCEEDS the known exhaustive max
+# of 199 under 4dde119e, on exactly 1 window in 26,857,712 (3.7e-08). Copying the
+# cap-208 provenance across normalizations would therefore have asserted a max of
+# 199 for a population whose max is 200 -- literally false, not merely unproven.
 #
-# Raising the cap is metric-neutral, so BOTH arms can share one value and the cap
+# HONEST NOTE ON THE VALUE: 208 would in fact have sufficed (200 < 208, 8 tokens
+# spare). 256 was chosen before this scan existed, from a sampled bound, and is
+# more conservative than the exhaustive result requires -- 56 tokens (28%) of
+# headroom where 8 would have done, costing ~+3% sequence length. It is kept
+# because it is exhaustively proven safe and because changing it now would
+# invalidate this record for no benefit. It is NOT presented as vindicated.
+# For the reader deciding a future cap: the sampled maxima were train 166 / val
+# 178, i.e. they understated the exhaustive maxima by 34 and 11 tokens. A sampled
+# max cannot bound a fail-closed cap; tokenize_action_chunk RAISES rather than
+# truncating, so one over-cap window aborts the run.
+#
+# Raising the cap is metric-neutral, so BOTH arms share one value and the cap
 # never becomes a third confound: padded positions are emitted with mask=False,
 # ar_mask=0 and loss_mask=False, and the action objective divides by
 # shift_loss_mask.sum() -- i.e. CE and accuracy are normalized over valid tokens
-# only. The cost is ~+3% total sequence length.
+# only.
 #
 # Arm B's population under 4dde119e… is exactly what cap 208 was exhaustively
 # proven on, so 256 is strictly slack there; it is held identical to Arm A purely
 # to keep the A/B comparison clean.
 #
-# GATE (not a blocker for the bounded smoke, required before the long run):
-#   /mnt/bn/navigation-hl/mlx/users/chenjunting/h20_fastce_scan/run_exhaustive_gate.sh W 256 64
+# To re-audit a different cap or normalization:
+#   h20_fastce_scan/run_exhaustive_gate.sh <P|W|/abs/path/norm_stats.json> <cap> <workers>
 _H20_FAST_ACTION_TOKEN_MAX_LEN = 256
 
 
@@ -1148,6 +1151,19 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # stride 1 and a single-digit optimizer-step budget. FAST capacity is held at
     # the formal value so the smoke exercises the same fail-closed data contract
     # instead of masking a formal overflow.
+    #
+    # val_log_interval is 4, NOT the budget length. This is a hard requirement,
+    # not a tuning choice: validation fires on
+    # ``global_step % val_log_interval == 0 and global_step > 0``, so an interval
+    # equal to num_train_steps would put the only validation exactly on the
+    # termination boundary, and an interval above the budget would skip
+    # validation entirely. Either way the smoke would never call
+    # ``compute_eval_metrics`` -- which is precisely where Variant A's known
+    # historical failure lives (the trainer passes ``deterministic_flow`` to both
+    # KI variants unconditionally, and Variant A's override lacked it, killing an
+    # A100 FAST run at its first validation after ~2h40m of training). A smoke
+    # that cannot reach the code path with a known failure mode is not a gate.
+    # At 4, an 8-step run validates twice (steps 4 and 8).
     _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16_smoke",
         behavior_dataset_root=_HL_B1K_DATA_ROOT,
@@ -1162,7 +1178,7 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         batch_size_per_gpu=8,
         gradient_accumulation_steps=1,
         save_interval=8,
-        val_log_interval=8,
+        val_log_interval=4,
         val_num_batches=1,
         log_interval=1,
         streaming_anchor_stride=1,
@@ -1184,7 +1200,7 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         batch_size_per_gpu=8,
         gradient_accumulation_steps=1,
         save_interval=8,
-        val_log_interval=8,
+        val_log_interval=4,
         val_num_batches=1,
         log_interval=1,
         streaming_anchor_stride=1,

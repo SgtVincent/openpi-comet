@@ -340,6 +340,7 @@ class PI05KIJointFastPytorch(PI05KIJointQueryPytorch):
         compute_flow_l1: bool = False,
         num_denoise_steps: int = 10,
         flow_l1_seed: int = 42,
+        deterministic_flow: bool = False,
     ) -> dict[str, Tensor]:
         """Compute validation metrics without entering learned-query code.
 
@@ -347,6 +348,21 @@ class PI05KIJointFastPytorch(PI05KIJointQueryPytorch):
         and ``action_token_accuracy``. It deliberately does not emit Variant B's
         ``query_mse_loss`` or ``query_l1`` keys: FAST has neither learned query
         tokens nor a query action head, so either name would misstate the metric.
+
+        Args:
+            deterministic_flow: if True, make the flow-matching metrics
+                reproducible by drawing the ``(noise, time)`` pair from a fixed
+                seed instead of the global RNG and preprocessing images with
+                ``train=False``. Without it ``flow_loss`` / ``expert_loss`` /
+                ``total_loss`` carry a random component that does NOT shrink as
+                the validation subset grows.
+
+                This must stay behaviourally identical to
+                ``PI05KIJointQueryPytorch.compute_eval_metrics``: the trainer
+                calls both variants through the same ``is_pi05_ki_joint`` branch
+                and passes this flag unconditionally, so any asymmetry here would
+                make the two arms differ in validation determinism and become a
+                confound in the A/B comparison rather than a code difference.
         """
         (
             backbone_loss,
@@ -356,7 +372,29 @@ class PI05KIJointFastPytorch(PI05KIJointQueryPytorch):
             action_token_accuracy,
         ) = self._compute_backbone_eval_metrics(observation, actions)
 
-        expert_losses = self.compute_expert_loss(observation, actions)
+        # ---- Expert forward ----
+        # Mirrors Variant B exactly. NOTE torch.manual_seed() reseeds BOTH the CPU
+        # and all CUDA generators while torch.get/set_rng_state() covers only the
+        # CPU one, so the CUDA state is saved and restored explicitly; otherwise
+        # this would leak a CUDA reseed into the training RNG stream.
+        if deterministic_flow:
+            cpu_state = torch.get_rng_state()
+            cuda_states = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            )
+            try:
+                torch.manual_seed(flow_l1_seed)
+                noise = self.sample_noise(actions.shape, actions.device)
+                time = self.sample_time(actions.shape[0], actions.device)
+            finally:
+                torch.set_rng_state(cpu_state)
+                if cuda_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_states)
+            expert_losses = self.compute_expert_loss(
+                observation, actions, noise=noise, time=time, train_preprocess=False
+            )
+        else:
+            expert_losses = self.compute_expert_loss(observation, actions)
         expert_loss = expert_losses["expert_loss"]
         flow_loss = expert_losses["flow_loss"]
 

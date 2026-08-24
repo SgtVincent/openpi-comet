@@ -170,7 +170,7 @@ GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 if [[ "${MODE}" == "smoke" ]]; then
   SAVE_INTERVAL="${SAVE_INTERVAL:-8}"
-  VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-8}"
+  VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-4}"
   VAL_NUM_BATCHES="${VAL_NUM_BATCHES:-1}"
 else
   SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
@@ -312,6 +312,18 @@ else:
     checks.update({
         "bounded smoke budget": 0 < cfg.num_train_steps <= 16,
         "smoke stride1": cfg.streaming_anchor_stride == 1,
+        # HARD REQUIREMENT. Validation fires on
+        # `global_step % val_log_interval == 0 and global_step > 0`, so the smoke
+        # must complete at least one FULL validation pass strictly before its
+        # final step. Variant A's known historical failure is inside
+        # compute_eval_metrics (the trainer passes deterministic_flow to both KI
+        # variants unconditionally and Variant A's override lacked it, killing an
+        # A100 FAST run at its first validation). A smoke that never reaches
+        # validation would pass and then let us promote a broken run to the
+        # formal budget.
+        "smoke reaches validation before its last step":
+            cfg.val_log_interval < cfg.num_train_steps
+            and cfg.num_train_steps // cfg.val_log_interval >= 2,
     })
 failed = [label for label, ok in checks.items() if not ok]
 if failed:

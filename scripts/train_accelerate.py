@@ -3387,6 +3387,148 @@ def _configure_gradient_checkpointing(model, *, enabled: bool) -> None:
         )
 
 
+# The kwargs the validation call site passes to compute_eval_metrics on BOTH KI
+# variants, classified by what a missing one actually costs. The two classes are
+# invoked through one shared `is_pi05_ki_joint` branch but are maintained
+# separately, so this surface is where they silently drift apart.
+#
+#   metric selectors  -- choose WHICH metrics are produced. A variant may
+#                        legitimately not emit one; consumers must then use
+#                        `in`/`.get()` rather than unconditional indexing.
+#   metric parameters -- only meaningful when their metric is enabled; they
+#                        travel with it.
+#   behaviour flags   -- change the STATISTICAL PROPERTIES of metrics that are
+#                        reported. These must be honoured or hard-fail. Silently
+#                        ignoring one is the worst case: with deterministic_flow
+#                        off, flow_loss / expert_loss / total_loss carry a random
+#                        component that does NOT shrink as the validation subset
+#                        grows, so an arm that ignores it has an irreducible noise
+#                        floor on exactly the metrics an A/B compares -- invisible,
+#                        and fatal to the conclusion rather than to the run.
+_KI_EVAL_METRIC_SELECTORS = ("compute_flow_l1",)
+_KI_EVAL_METRIC_PARAMETERS = ("num_denoise_steps", "flow_l1_seed")
+_KI_EVAL_BEHAVIOUR_FLAGS = ("deterministic_flow",)
+
+
+def _validate_ki_eval_capability(model, config, *, is_main: bool) -> None:
+    """Fail at step 0 if the model cannot honour the validation call the trainer makes.
+
+    Motivation (concrete): the trainer passes ``deterministic_flow`` to both KI
+    variants unconditionally, but Variant A's override of ``compute_eval_metrics``
+    did not accept it. The result was ``TypeError: compute_eval_metrics() got an
+    unexpected keyword argument 'deterministic_flow'`` raised at the FIRST
+    validation -- i.e. after ~2h40m of training on 32 GPUs, not at startup. A
+    bounded smoke shorter than one validation interval cannot catch it either.
+
+    This check resolves what will be requested against what the model actually
+    supports, before the training loop, so the same defect costs seconds.
+    """
+    import inspect
+
+    if config.pytorch_model_name not in ("pi05_ki_joint_query", "pi05_ki_joint_fast"):
+        return
+
+    fn = getattr(type(model), "compute_eval_metrics", None)
+    if fn is None:
+        raise RuntimeError(
+            f"model {type(model).__name__} is routed through the KI validation branch "
+            "but does not implement compute_eval_metrics"
+        )
+    params = inspect.signature(fn).parameters
+    accepts_var_kw = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+    requested = (
+        _KI_EVAL_METRIC_SELECTORS + _KI_EVAL_METRIC_PARAMETERS + _KI_EVAL_BEHAVIOUR_FLAGS
+    )
+    problems: list[str] = []
+
+    for name in requested:
+        if name in params:
+            continue
+        if accepts_var_kw:
+            # Absorbed by **kwargs: no TypeError, and therefore no signal at all.
+            problems.append(
+                f"{name!r} is not an explicit parameter and would be silently swallowed "
+                f"by **kwargs in {type(model).__name__}.compute_eval_metrics"
+            )
+        else:
+            problems.append(
+                f"{name!r} is not accepted by {type(model).__name__}.compute_eval_metrics "
+                "and would raise TypeError at the first validation"
+            )
+
+    # A behaviour flag that is requested ON must be genuinely implemented, not
+    # merely present in the signature. Signature parity with a no-op body is a
+    # silent failure, so require the flag to be referenced in the body as well as
+    # the signature (>= 2 occurrences: the parameter plus at least one use).
+    #
+    # This is a heuristic, deliberately a weak one: it catches a blatant no-op but
+    # a body that merely mentions the name in a comment would satisfy it. It is a
+    # backstop for the signature check, not a proof of correct semantics -- that is
+    # what tests/test_pi05_ki_h20_bf16_two_arm.py asserts, by requiring both
+    # variants to contain the actual mechanism (manual_seed, train_preprocess=False,
+    # set_rng_state_all).
+    source_available = True
+    try:
+        body = inspect.getsource(fn)
+    except (OSError, TypeError):
+        body = ""
+        source_available = False
+    for name in _KI_EVAL_BEHAVIOUR_FLAGS:
+        if not bool(getattr(config, f"val_{name}", False)):
+            continue
+        if not source_available:
+            # Do NOT skip silently: an unverifiable behaviour flag is a known gap,
+            # not a pass. Real model classes are file-backed so this should not
+            # occur in production.
+            if is_main:
+                logging.warning(
+                    "KI eval capability: could not read the source of %s.compute_eval_metrics, "
+                    "so whether behaviour flag %r is actually honoured is UNVERIFIED "
+                    "(signature accepts it)",
+                    type(model).__name__,
+                    name,
+                )
+            continue
+        if name in params and body.count(name) < 2:
+            problems.append(
+                f"behaviour flag {name!r} is accepted by {type(model).__name__}"
+                ".compute_eval_metrics but never referenced in its body, so it would be "
+                "accepted and ignored -- this changes the statistical properties of "
+                "reported metrics rather than which metrics appear"
+            )
+
+    if problems:
+        raise RuntimeError(
+            "KI validation capability check failed for "
+            f"{config.pytorch_model_name!r} ({type(model).__name__}):\n  - "
+            + "\n  - ".join(problems)
+        )
+
+    if is_main:
+        logging.info(
+            "KI eval capability OK model=%s selectors=%s parameters=%s "
+            "behaviour_flags=%s (val_deterministic_flow=%s)",
+            type(model).__name__,
+            list(_KI_EVAL_METRIC_SELECTORS),
+            list(_KI_EVAL_METRIC_PARAMETERS),
+            list(_KI_EVAL_BEHAVIOUR_FLAGS),
+            bool(getattr(config, "val_deterministic_flow", False)),
+        )
+        # Variant-specific metric keys, logged once so an absent column later is
+        # visible here rather than inferred from a gap in the metrics file.
+        if config.pytorch_model_name == "pi05_ki_joint_fast":
+            logging.info(
+                "KI eval metric surface: Variant A emits action_ce_loss / "
+                "action_token_accuracy and deliberately OMITS query_mse_loss / "
+                "query_l1 (no learned queries, no query head). Consumers must use "
+                "`in` or .get() for those keys; `query_l1=nan` in the [VAL] line is "
+                "expected for this variant, not a failure."
+            )
+
+
 def _validate_a100_optimizer_offload_policy(config_name: str, ds_config: dict) -> None:
     if config_name in _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS:
         family = "A100 formal"
@@ -3879,6 +4021,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             gradient_checkpointing,
             _resolved_gradient_checkpointing_state(model),
         )
+
+    # Step-0 gate: prove the model can honour the validation call the trainer will
+    # make, before spending any training time. See _validate_ki_eval_capability.
+    _validate_ki_eval_capability(model, config, is_main=is_main)
 
     # Memory/perf knobs (keep same behavior as train_pytorch.py).
     if world_size >= 8:
