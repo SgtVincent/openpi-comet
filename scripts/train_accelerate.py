@@ -426,6 +426,36 @@ _FORMAL_B1K_CONFIG_CONTRACTS = {
         "pytorch_training_precision": "float32",
         "accelerate_mixed_precision": "no",
     },
+    # Formal 4x8 NVIDIA_H20 BF16 Variant A pair. Same B8/GA1 x world32 = global
+    # batch 256 contract as the original bf16 formal config, so both arms inherit
+    # the identical stride-12 three-pass rotation with offsets (0, 4, 8) and the
+    # fixed 104,912-step budget. The two entries differ only in warm-start
+    # package (comet B1K fine-tune vs pi05 pretrain, each paired with its own
+    # norm_stats), which this contract intentionally does not constrain -- it
+    # pins schedule, batch and data population, not which weights you start from.
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16": {
+        "pytorch_model_name": "pi05_ki_joint_fast",
+        "batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 1,
+        "pytorch_training_precision": "bfloat16",
+        "accelerate_mixed_precision": "bf16",
+    },
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16": {
+        "pytorch_model_name": "pi05_ki_joint_fast",
+        "batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 1,
+        "pytorch_training_precision": "bfloat16",
+        "accelerate_mixed_precision": "bf16",
+    },
+}
+# H20 shares the A100 memory policy: ZeRO-2 with the optimizer resident on GPU.
+# H20 carries ~96 GB HBM3 versus A100-40GB, so if no-offload is safe on A100 it
+# is safe here; the bounded smoke still has to produce the real measured peak.
+_H20_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS = {
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16_smoke",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16_smoke",
 }
 _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS = {
     "pi05_ki_joint_fast_b1k-full_task-ki_on_a100_bf16",
@@ -3358,12 +3388,16 @@ def _configure_gradient_checkpointing(model, *, enabled: bool) -> None:
 
 
 def _validate_a100_optimizer_offload_policy(config_name: str, ds_config: dict) -> None:
-    if config_name not in _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS:
+    if config_name in _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS:
+        family = "A100 formal"
+    elif config_name in _H20_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS:
+        family = "H20"
+    else:
         return
     zero_config = ds_config.get("zero_optimization", {})
     if "offload_optimizer" in zero_config:
         raise ValueError(
-            f"A100 formal config {config_name!r} requires optimizer offload disabled; "
+            f"{family} config {config_name!r} requires optimizer offload disabled; "
             f"got {zero_config.get('offload_optimizer')!r}"
         )
 

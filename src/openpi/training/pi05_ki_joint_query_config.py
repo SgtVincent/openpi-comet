@@ -41,6 +41,86 @@ _B1K_OBJECT_MAPPING = str(
 )
 _PI05_BASE_CKPT = "checkpoints/pi05_base_pytorch"
 
+# --- H20 warm-start packages -------------------------------------------------
+# The 4x8 NVIDIA_H20 pool mounts behavior-data-hl / navigation-hl /
+# robot-mllm-data-hl and does **not** mount saiwenresearch, so _CANONICAL_BASE_CKPT
+# and _B1K_DATA_ROOT above are unreachable from H20. These are the H20-reachable
+# base packages and are the only ones the H20 entrypoints may use.
+#
+# Each arm deliberately pairs a weight set with the ``assets`` (hence the
+# ``norm_stats.json``) that ships alongside it, because that arm's flow expert and
+# action head were fit in that normalization space:
+#   Arm A "comet base" -- Team Comet's B1K fine-tune. norm_stats sha256
+#       d66ed168…, 6368 B. fp32 weights, model.safetensors 14,467,165,872 B.
+#   Arm B "pi05 base"  -- the pi05 pretrain. norm_stats sha256 4dde119e…,
+#       6361 B. bf16 weights, model.safetensors 7,233,650,408 B.
+# Both expose an identical 812-tensor / 3,616,757,520-parameter state dict and
+# both were measured to cover 100.0000% of the Variant A parameter set with
+# 0 missing / 0 unexpected / 0 shape-mismatched keys (the single absent
+# ``embed_tokens.weight`` is a documented tie to ``paligemma.lm_head.weight``
+# recorded in each file's safetensors ``__metadata__``); see
+# scripts/verify_warm_start_keymap.py --actually-load.
+#
+# NOTE for the A/B write-up: the two arms differ in TWO coupled variables --
+# base weights *and* action normalization -- plus a minor stored-dtype asymmetry
+# (fp32 vs bf16, both downcast to bf16 for training). A comparison between them
+# therefore ranks base *packages*; it does not isolate the weights with
+# normalization held fixed.
+_HL_COMET_B1K_FT_CKPT = (
+    "/mnt/bn/navigation-hl/mlx/users/chenjunting/repo/openpi-comet"
+    "/checkpoints/openpi_comet/pi05-b1kpt50-cs32"
+)
+_HL_PI05_BASE_CKPT = (
+    "/mnt/bn/behavior-data-hl/chenjunting/repo/openpi-comet/checkpoints/pi05_base_pytorch"
+)
+
+# --- Shared FAST action-token capacity for BOTH H20 arms ---------------------
+# SAMPLED, NOT EXHAUSTIVE. This bound was measured under Arm A's normalization
+# (norm_stats.json sha256 d66ed168…, 6368 B), which is a DIFFERENT normalization
+# from the one the historical cap-208 bound was proven on. The exhaustive
+# provenance recorded on the V100/A100 FAST configs
+# (run_id=0bb9280746…, manifest=ef4cb52d…, aggregate=51250f15…) belongs to
+# norm_stats 4dde119e… and is deliberately NOT reused here; reusing it would be
+# a false claim about a population that was never scanned.
+#
+# What was actually measured (seed=20260824, uniform i.i.d. windows, token count
+# includes BOS/EOS; harness validated by reproducing both window populations to
+# the digit -- train 26,857,712 and val 11,398,271):
+#   train  400,000 / 26,857,712 (1.489%): p50 37, p99.9  96, max 166, >199 = 0, >208 = 0
+#   val    300,000 / 11,398,271 (2.632%): p50 38, p99.9 102, max 178, >199 = 0, >208 = 0
+# Same harness re-run under 4dde119e… reproduced the known exhaustive p99.9 of
+# 99 to within one token (98), which is what validates the measurement.
+#
+# Why 256 and not 208, despite 0 sampled windows above 208:
+#   * Sampling cannot certify a fail-closed bound. Under 4dde119e… this harness's
+#     sampled max understated the known exhaustive max by 31 tokens on train
+#     (168 vs 199) and 13 on val (177 vs 190). Applying those same deficits to
+#     the d66ed168… samples extrapolates an exhaustive max of roughly 197-211,
+#     which STRADDLES 208.
+#   * Rule of three: 0 exceedances above 199 in 400,000 train draws only bounds
+#     the rate at <= 7.5e-6 (95%), i.e. up to ~201 of the 26.86M train windows
+#     could still exceed 199. Because tokenize_action_chunk RAISES rather than
+#     truncating, a single such window aborts the run.
+#   * FAST length is content-driven and non-smooth (an all-zero chunk yields 1
+#     token; a uniform-random one yields ~601), so a few-percent pad is not a
+#     valid extrapolation.
+# 256 is the next 16-aligned value above that straddle band: +78 tokens (+43.8%)
+# over the sampled max 178, and +45..59 tokens over the 197-211 extrapolation.
+#
+# Raising the cap is metric-neutral, so BOTH arms can share one value and the cap
+# never becomes a third confound: padded positions are emitted with mask=False,
+# ar_mask=0 and loss_mask=False, and the action objective divides by
+# shift_loss_mask.sum() -- i.e. CE and accuracy are normalized over valid tokens
+# only. The cost is ~+3% total sequence length.
+#
+# Arm B's population under 4dde119e… is exactly what cap 208 was exhaustively
+# proven on, so 256 is strictly slack there; it is held identical to Arm A purely
+# to keep the A/B comparison clean.
+#
+# GATE (not a blocker for the bounded smoke, required before the long run):
+#   /mnt/bn/navigation-hl/mlx/users/chenjunting/h20_fastce_scan/run_exhaustive_gate.sh W 256 64
+_H20_FAST_ACTION_TOKEN_MAX_LEN = 256
+
 
 def _make_b1k_subtask_data_config(episodes_index: list[int] | None = None) -> LeRobotB1KDataConfig:
     """Shared B1K data config with subtask annotations.
@@ -1010,5 +1090,106 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         streaming_anchor_stride=4,
         epoch_anchor_offsets=[0, 1, 2, 3],
         project_name="pi05_ki_a100",
+    ),
+    # ------------------------------------------------------------------
+    # Formal 4x8 NVIDIA_H20 BF16 Variant A pair: two warm-start packages.
+    #
+    # This is a controlled two-arm experiment. Everything is held identical --
+    # model, objective (fast_ce), FAST capacity, data root, schedule, B8/GA1
+    # global batch 256, stride-12 three-pass rotation with offsets (0, 4, 8), the
+    # fixed 104,912-step budget -- EXCEPT the warm-start package.
+    #
+    #   h20_bf16          Arm A "comet base": pi05-b1kpt50-cs32 + its own assets
+    #                     (norm_stats d66ed168…). Team Comet's B1K fine-tune;
+    #                     this is the weight set our verified RGBWrapper easy-8
+    #                     baseline (mean q 0.347044) actually served.
+    #   h20_pi05base_bf16 Arm B "pi05 base": pi05_base_pytorch + its own assets
+    #                     (norm_stats 4dde119e…). The pretrain cont2 trained from.
+    #
+    # Each arm pairs weights with the normalization they were fit under, which is
+    # the intended design. It also means the arms differ in TWO coupled variables
+    # (weights AND action normalization), so the comparison ranks base *packages*
+    # rather than isolating the weights. Measured divergence between the two
+    # weight sets is substantial (~20.7% mean relative difference over probe
+    # tensors; action_out_proj 15.3%, gemma_expert.lm_head 141%), while the tied
+    # vocab embedding is nearly identical (0.0032%) -- so near-identical initial
+    # token-embedding statistics between arms are expected and are NOT evidence
+    # of a failed load.
+    #
+    # Both arms share _H20_FAST_ACTION_TOKEN_MAX_LEN so capacity cannot become a
+    # third confound; see that constant for the sampled-scan provenance and why
+    # it is 256 rather than 208.
+    #
+    # Neither arm may reference saiwenresearch: the H20 pool does not mount it.
+    # ------------------------------------------------------------------
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        base_checkpoint_path=_HL_COMET_B1K_FT_CKPT,
+        base_assets_dir=f"{_HL_COMET_B1K_FT_CKPT}/assets",
+        action_repr="fast_ce",
+        action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
+        precision="bfloat16",
+    ),
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        base_checkpoint_path=_HL_PI05_BASE_CKPT,
+        base_assets_dir=f"{_HL_PI05_BASE_CKPT}/assets",
+        action_repr="fast_ce",
+        action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
+        precision="bfloat16",
+    ),
+    # Bounded H20 smoke pair. These exist because the formal contract in
+    # train_accelerate.py hard-pins num_train_steps=104,912, so a short run
+    # cannot use the formal config names. They keep B8/GA1 -- the whole point is
+    # to measure the real after-backward memory peak and prove NCCL init, the
+    # warm start and finite loss/grad at the formal per-GPU batch -- but drop to
+    # stride 1 and a single-digit optimizer-step budget. FAST capacity is held at
+    # the formal value so the smoke exercises the same fail-closed data contract
+    # instead of masking a formal overflow.
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16_smoke",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        base_checkpoint_path=_HL_COMET_B1K_FT_CKPT,
+        base_assets_dir=f"{_HL_COMET_B1K_FT_CKPT}/assets",
+        num_train_steps=8,
+        num_train_epochs=None,
+        warmup_steps=1,
+        peak_lr=1e-5,
+        decay_steps=8,
+        decay_lr=0.0,
+        batch_size_per_gpu=8,
+        gradient_accumulation_steps=1,
+        save_interval=8,
+        val_log_interval=8,
+        val_num_batches=1,
+        log_interval=1,
+        streaming_anchor_stride=1,
+        action_repr="fast_ce",
+        action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
+        precision="bfloat16",
+    ),
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16_smoke",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        base_checkpoint_path=_HL_PI05_BASE_CKPT,
+        base_assets_dir=f"{_HL_PI05_BASE_CKPT}/assets",
+        num_train_steps=8,
+        num_train_epochs=None,
+        warmup_steps=1,
+        peak_lr=1e-5,
+        decay_steps=8,
+        decay_lr=0.0,
+        batch_size_per_gpu=8,
+        gradient_accumulation_steps=1,
+        save_interval=8,
+        val_log_interval=8,
+        val_num_batches=1,
+        log_interval=1,
+        streaming_anchor_stride=1,
+        action_repr="fast_ce",
+        action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
+        precision="bfloat16",
     ),
 ]
