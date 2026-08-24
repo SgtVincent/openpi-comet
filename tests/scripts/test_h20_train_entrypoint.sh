@@ -4,27 +4,17 @@
 #
 # Scope: pure CPU, no GPU, no training, no occupier processes, no residue.
 #
-# WHY THESE ASSERTIONS ARE NOT COSMETIC
-# Every property checked here corresponds to a defect that was measured, not
-# imagined, while bringing this entrypoint up:
+# The entrypoint is deliberately MINIMAL: set env, free_gpu, call the proven
+# keepalive wrapper. These tests protect two things:
 #
-#   * `set -u` -> sourcing extra_bashrc.sh aborts at its line 33 (PROMPT_COMMAND
-#     unbound in a non-interactive pod) BEFORE use_gpu/free_gpu are defined, this
-#     script exits, and all 32 H20 are released.
-#   * no LAUNCHING sentinel -> the 60 s supervisor restores occupancy during the
-#     launcher's >450 s CPU preflight, and the launcher's own assert_no_occupiers
-#     then kills the run.
-#   * no watchdog -> if the supervisor dies, the allocation survives but
-#     utilization sits at zero and the 30%/3-hour reaper takes all 32 cards.
-#   * tag-only occ_count -> over-counts (measured 1 -> 2 with a live
-#     `pkill -f "$GPU_OCCUPY_TAG"`, which free_gpu ends in), so the supervisor
-#     concludes occupiers exist and never starts them. Same reaper outcome.
-#   * any `exit` on a bad-input path -> releases 32 GPUs instead of holding them.
-#
-# Two families:
-#   A. Static contract checks on the script text.
-#   B. Behavioural checks of the extracted occ_count predicate against real
-#      processes, including the free_gpu pkill case.
+#   1. The properties whose absence costs 32 H20 — each corresponds to a defect
+#      that was measured, not imagined.
+#   2. That the removed complexity STAYS removed. An earlier version added a 60 s
+#      occupancy supervisor; it raced the launcher's assert_no_occupiers, which
+#      needed a launch sentinel, which needed three-way phase logic, which needed a
+#      watchdog because the supervisor had become a single point of failure. Three
+#      of those four existed only to manage the first. The wrapper already provides
+#      keepalive-on-failure plus OCCUPIER_AUTO_RESTART, so none of it is needed.
 #
 # Usage:
 #   bash tests/scripts/test_h20_train_entrypoint.sh
@@ -35,6 +25,7 @@ set -uo pipefail
 REPO_ROOT_REAL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENTRYPOINT_REL="scripts/h20_train_entrypoint.sh"
 ENTRYPOINT="${REPO_ROOT_REAL}/${ENTRYPOINT_REL}"
+WRAPPER_REL="scripts/run_pi05_skillbridge_lq_keepalive_on_failure.sh"
 LAUNCHER_REL="scripts/run_pi05_ki_formal_A_fast_bf16_4x8_h20.sh"
 
 PASS=0
@@ -44,143 +35,141 @@ SKIP=0
 ok()   { printf 'PASS  %s\n' "$*"; PASS=$((PASS + 1)); }
 bad()  { printf 'FAIL  %s\n' "$*"; FAIL=$((FAIL + 1)); }
 skip() { printf 'SKIP  %s\n' "$*"; SKIP=$((SKIP + 1)); }
-
 have() { grep -qF -- "$1" "${ENTRYPOINT}"; }
 
-printf '== A. static contract ==\n'
-
-[[ -f "${ENTRYPOINT}" ]] && ok "entrypoint exists at ${ENTRYPOINT_REL}" \
-  || { bad "entrypoint missing at ${ENTRYPOINT_REL}"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
-
+printf '== existence ==\n'
+if [[ -f "${ENTRYPOINT}" ]]; then
+  ok "entrypoint exists at ${ENTRYPOINT_REL}"
+else
+  bad "entrypoint missing at ${ENTRYPOINT_REL}"
+  printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+  exit 1
+fi
 bash -n "${ENTRYPOINT}" 2>/dev/null && ok "bash -n clean" || bad "bash -n failed"
 
-# --- the set -u kill -------------------------------------------------------
+printf '\n== an exit costs 32 H20 ==\n'
 if grep -qE '^set .*-[a-z]*u' "${ENTRYPOINT}"; then
-  bad "script enables -u; sourcing extra_bashrc.sh will abort and RELEASE 32 GPUs"
+  bad "-u enabled; sourcing extra_bashrc.sh aborts at its line 33 on unbound PROMPT_COMMAND, before use_gpu/free_gpu exist, and RELEASES 32 GPUs"
 else
-  ok "-u absent (mandatory: -u kills the source of extra_bashrc.sh)"
+  ok "-u absent (its presence kills the source of extra_bashrc.sh)"
 fi
 if grep -qE '^set .*-[a-z]*e' "${ENTRYPOINT}"; then
-  bad "script enables -e; any unexpected non-zero exits and releases 32 GPUs"
+  bad "-e enabled; any unexpected non-zero exits and releases 32 GPUs"
 else
   ok "-e absent"
 fi
 have 'set -o pipefail' && ok "pipefail enabled" || bad "pipefail missing"
 have 'PROMPT_COMMAND="${PROMPT_COMMAND:-}"' \
-  && ok "PROMPT_COMMAND guard present (belt-and-braces for the -u trap)" \
-  || bad "PROMPT_COMMAND guard missing"
-grep -q 'Do not "harmonise"' "${ENTRYPOINT}" \
-  && ok "comment warns against harmonising strictness with tool scripts" \
-  || bad "missing the rationale comment; a future cleanup will re-add -u"
-
-# --- never exits -----------------------------------------------------------
-# An `exit` anywhere at top level is a released allocation. Subshell exits are
-# fine (the launcher subshell uses `exit 2` on a failed cd), so only flag
-# unindented top-level ones.
+  && ok "PROMPT_COMMAND guard present" || bad "PROMPT_COMMAND guard missing"
+grep -q 'robustness beats strictness' "${ENTRYPOINT}" \
+  && ok "rationale comment present (a future cleanup would otherwise re-add -u)" \
+  || bad "no rationale comment explaining why -u/-e are absent"
 if grep -nE '^exit ' "${ENTRYPOINT}"; then
   bad "top-level 'exit' found; this releases 32 GPUs"
 else
-  ok "no top-level exit (bad input must fall into keepalive, not exit)"
+  ok "no top-level exit"
 fi
-have 'while true; do' && ok "terminal keepalive loop present" || bad "no keepalive loop"
-[[ "$(tail -1 "${ENTRYPOINT}" | tr -d '[:space:]')" == "done" ]] \
-  && ok "last line is the keepalive 'done' (paste truncation is detectable)" \
-  || bad "last line is not 'done'; truncation would be silent"
-have 'FATAL launcher not found' \
-  && ok "missing launcher logs and falls through rather than exiting" \
-  || bad "missing-launcher path does not fall through to keepalive"
+# The defensive tail must be the final construct, so paste truncation is visible.
+last="$(tail -1 "${ENTRYPOINT}")"
+[[ "${last}" == *done ]] \
+  && ok "last line ends with 'done' (truncation is detectable): ${last}" \
+  || bad "last line does not end with 'done': ${last}"
+have 'while true; do sleep 300; done' \
+  && ok "defensive infinite hold present" || bad "no defensive hold"
 
-# --- occupancy handoff -----------------------------------------------------
-have ': > "$LAUNCHING"' && ok "launch sentinel is raised" || bad "no launch sentinel"
-sent_line="$(grep -n ': > "\$LAUNCHING"' "${ENTRYPOINT}" | head -1 | cut -d: -f1)"
-free_line="$(grep -n 'free_gpu >>"\$HB" 2>&1 || true' "${ENTRYPOINT}" | awk -F: -v s="${sent_line:-0}" '$1>s {print $1; exit}')"
-if [[ -n "${sent_line}" && -n "${free_line}" && "${sent_line}" -lt "${free_line}" ]]; then
-  ok "sentinel raised BEFORE the handoff free_gpu (line ${sent_line} < ${free_line})"
-else
-  bad "sentinel/handoff ordering wrong (sentinel=${sent_line:-none} handoff=${free_line:-none})"
-fi
-have 'PHASE="LAUNCHING"' && ok "supervisor has a LAUNCHING phase" || bad "no LAUNCHING phase"
-have 'PHASE="TRAINING"' && ok "supervisor has a TRAINING phase" || bad "no TRAINING phase"
-have 'PHASE="HOLDING"'  && ok "supervisor has a HOLDING phase"  || bad "no HOLDING phase"
-# LAUNCHING must be tested first, otherwise HOLDING re-occupies mid-launch.
-l_line="$(grep -n 'PHASE="LAUNCHING"' "${ENTRYPOINT}" | head -1 | cut -d: -f1)"
-h_line="$(grep -n 'PHASE="HOLDING"' "${ENTRYPOINT}" | head -1 | cut -d: -f1)"
-if [[ -n "$l_line" && -n "$h_line" && "$l_line" -lt "$h_line" ]]; then
-  ok "LAUNCHING takes priority over HOLDING (line $l_line < $h_line)"
-else
-  bad "HOLDING is evaluated before LAUNCHING; supervisor will kill its own launch"
-fi
-have 'kill -0 "$SUPERVISOR_PID"' \
-  && ok "supervisor watchdog present (it is the last line of defence)" \
-  || bad "no watchdog; a dead supervisor means 0% util and a reaped job"
-have 'run_arm${H20_ARM}' && ok "run dir is arm-scoped" || bad "run dir not arm-scoped"
-have 'podfacts_' && ok "in-pod podfacts probe present (SSH/WebShell are broken)" \
-  || bad "no podfacts probe"
+printf '\n== delegation, not reimplementation ==\n'
+have 'free_gpu' \
+  && ok "free_gpu present — the one genuine difference from a clean-node start" \
+  || bad "no free_gpu; the launcher's assert_no_occupiers will refuse to start"
+have 'KEEPALIVE_ON_SUCCESS=1' \
+  && ok "wrapper asked to hold on success as well as failure" \
+  || bad "wrapper not asked to hold on success"
+have 'run_pi05_skillbridge_lq_keepalive_on_failure.sh' \
+  && ok "delegates keepalive to the proven wrapper" \
+  || bad "does not call the keepalive wrapper"
+have 'use_gpu' \
+  && ok "re-occupies if the wrapper ever returns (never idle at 0% util)" \
+  || bad "no defensive re-occupy; a returning wrapper would be reaped at 0% util"
 
-# --- env-driven identity ---------------------------------------------------
-have 'H20_ARM="${H20_ARM:-A}"'      && ok "H20_ARM from env, default A"    || bad "H20_ARM default wrong"
+printf '\n== removed complexity stays removed ==\n'
+for removed in 'supervisor()' 'LAUNCHING' 'kill -0' 'occ_count()'; do
+  if grep -qF -- "${removed}" "${ENTRYPOINT}"; then
+    bad "re-introduced '${removed}'; the wrapper already owns keepalive + OCCUPIER_AUTO_RESTART"
+  else
+    ok "'${removed}' stays removed"
+  fi
+done
+# Coarse proxy for "did the subsystem come back". The precise guard is the
+# removed-machinery loop above; this only catches wholesale regrowth.
+# Baseline 144 lines: 110 for the simplified house-pattern entrypoint plus ~34 for
+# the loud provenance check (a deliberate, reviewed addition, not creep). Raise this
+# only for a reviewed addition — and if you are raising it because a supervisor came
+# back, do not raise it.
+lines="$(wc -l < "${ENTRYPOINT}")"
+if [[ "${lines}" -le 160 ]]; then
+  ok "entrypoint is ${lines} lines (house pattern: env, free_gpu, call a repo script)"
+else
+  bad "entrypoint has grown to ${lines} lines; a subsystem has probably crept back"
+fi
+
+printf '\n== identity comes from the environment ==\n'
+have 'H20_ARM="${H20_ARM:-A}"'       && ok "H20_ARM from env, default A"     || bad "H20_ARM default wrong"
 have 'H20_MODE="${H20_MODE:-smoke}"' && ok "H20_MODE from env, default smoke" || bad "H20_MODE default wrong"
-if grep -qE '^OPENPI_EXPECTED_CODE_COMMIT=[0-9a-f]{40}' "${ENTRYPOINT}"; then
-  bad "SHA is hardcoded; it must come from the job config so the two cannot drift"
+if grep -qE '^(export )?OPENPI_EXPECTED_CODE_COMMIT=[0-9a-f]{40}' "${ENTRYPOINT}"; then
+  bad "SHA hardcoded in the script; it must come from the job config so the two cannot drift"
 else
-  ok "SHA not hardcoded (comes from the environment, as the launcher expects)"
+  ok "SHA not hardcoded (supplied by the job config)"
 fi
-# REPO_ROOT must be derived from the script's own location, which is the whole
-# point of moving the entrypoint into the repo.
-have 'BASH_SOURCE[0]' && ok "REPO_ROOT derived from the script's own location" \
-  || bad "REPO_ROOT not self-derived; a moved worktree breaks the run"
+have 'BASH_SOURCE[0]' \
+  && ok "REPO_ROOT derived from the script's own location (the point of living in the repo)" \
+  || bad "REPO_ROOT not self-derived; a moved worktree would break the run"
+have 'podfacts_' \
+  && ok "in-pod podfacts probe present (SSH and WebShell are both unavailable here)" \
+  || bad "no podfacts probe; the W&B credential is unobtainable any other way"
 
-# --- occ_count predicate ---------------------------------------------------
-if grep -q 'gpu_occupy_(torch_mm\[.\]py|stub\[.\]sh)' "${ENTRYPOINT}"; then
-  ok "occ_count uses the two-condition predicate (matches assert_no_occupiers)"
+printf '\n== provenance check is loud, and covers the dirty case ==\n'
+# It cannot exit (that costs 32 GPUs), so the log is its only channel and a
+# mismatch must not look like a match. It must also distinguish DIRTY: a pin can be
+# true about HEAD while uncommitted edits are what actually execute — exactly the
+# false-assurance that nearly shipped.
+have 'PROVENANCE=MISMATCH' && ok "emits PROVENANCE=MISMATCH" || bad "no MISMATCH state"
+have 'PROVENANCE=DIRTY'    && ok "emits PROVENANCE=DIRTY (pin true about HEAD, false about the code)" || bad "no DIRTY state"
+have 'PROVENANCE=UNSET'    && ok "emits PROVENANCE=UNSET" || bad "no UNSET state"
+have 'PROVENANCE=OK'       && ok "emits PROVENANCE=OK" || bad "no OK state"
+grep -q 'PROVENANCE MISMATCH -- THE PINNED COMMIT IS NOT CHECKED OUT' "${ENTRYPOINT}" \
+  && ok "mismatch is unmistakable in the log, not a neutral line" \
+  || bad "mismatch is not visually distinct from a match"
+have 'provenance_$(hostname).txt' \
+  && ok "writes a dedicated status file (monitor need not parse the log)" \
+  || bad "no machine-readable provenance status file"
+have 'status --porcelain --untracked-files=all' \
+  && ok "checks worktree cleanliness, not just HEAD" \
+  || bad "does not detect the dirty case"
+
+printf '\n== the contract is asserted downstream, not duplicated here ==\n'
+# Re-exporting B8/GA1/stride/offsets would be inert: the launcher defaults and
+# asserts the batch contract, and train_accelerate.py setdefaults the anchor vars
+# then validates them. Duplicating it just creates two places to drift.
+for dup in 'BATCH_SIZE_PER_GPU=' 'GRADIENT_ACCUMULATION_STEPS=' 'FRAME_ANCHOR_STRIDE=' 'NUM_TRAIN_STEPS='; do
+  if grep -qE "^(export )?${dup}" "${ENTRYPOINT}"; then
+    bad "duplicates '${dup}' which is already asserted downstream — two places to drift"
+  else
+    ok "'${dup}' not duplicated (asserted by the launcher / trainer)"
+  fi
+done
+if [[ -f "${REPO_ROOT_REAL}/${WRAPPER_REL}" ]]; then
+  grep -q 'OCCUPIER_AUTO_RESTART' "${REPO_ROOT_REAL}/${WRAPPER_REL}" \
+    && ok "wrapper really does restart dead occupiers (so no supervisor is needed)" \
+    || bad "wrapper lacks OCCUPIER_AUTO_RESTART; delegation assumption is wrong"
 else
-  bad "occ_count is tag-only; it over-counts and the supervisor then never occupies"
+  skip "wrapper not found; cannot verify the delegation assumption"
 fi
 if [[ -f "${REPO_ROOT_REAL}/${LAUNCHER_REL}" ]]; then
-  grep -q 'gpu_occupy_(torch_mm\[.\]py|stub\[.\]sh)' "${REPO_ROOT_REAL}/${LAUNCHER_REL}" \
-    && ok "launcher uses the same predicate (the two agree)" \
-    || bad "launcher predicate differs from the supervisor's"
+  grep -q 'assert_no_occupiers' "${REPO_ROOT_REAL}/${LAUNCHER_REL}" \
+    && ok "launcher does gate on occupiers (so free_gpu is genuinely required)" \
+    || bad "launcher has no occupier gate; free_gpu may be unnecessary"
 else
-  skip "launcher not found; cannot cross-check the predicate"
-fi
-
-printf '\n== B. occ_count behaviour against real processes ==\n'
-
-# Extract the real function and exercise it. Runs from a FILE so the harness's own
-# argv cannot contain the unbracketed tag and self-match — a trap that produced a
-# false positive during development.
-OCC_FN="$(mktemp)"; trap 'rm -f "${OCC_FN}"' EXIT
-sed -n '/^occ_count() {/,/^}/p' "${ENTRYPOINT}" > "${OCC_FN}"
-if [[ ! -s "${OCC_FN}" ]]; then
-  skip "could not extract occ_count; behavioural checks skipped"
-else
-  RUNNER="$(mktemp)"
-  cat "${OCC_FN}" > "${RUNNER}"
-  cat >> "${RUNNER}" <<'INNER'
-echo "BASELINE=$(occ_count)"
-# free_gpu ends in `pkill -f "$GPU_OCCUPY_TAG"`, so its argv carries the tag but
-# NOT the occupier script name. A tag-only count reports this as an occupier.
-bash -c 'exec -a "pkill -f __GPU_OCCUPY__torch_mm_512" sleep 4' >/dev/null 2>&1 &
-P=$!; sleep 1
-echo "WITH_PKILL=$(occ_count)"
-kill $P 2>/dev/null; wait $P 2>/dev/null
-# A genuine occupier carries BOTH the tag and the script name.
-bash -c 'exec -a "python gpu_occupy_torch_mm.py __GPU_OCCUPY__torch_mm_512 0" sleep 4' >/dev/null 2>&1 &
-R=$!; sleep 1
-echo "WITH_REAL=$(occ_count)"
-kill $R 2>/dev/null; wait $R 2>/dev/null
-INNER
-  OUT="$(bash "${RUNNER}" 2>/dev/null)"
-  rm -f "${RUNNER}"
-  base="$(sed -n 's/^BASELINE=//p' <<<"${OUT}")"
-  pk="$(sed -n 's/^WITH_PKILL=//p' <<<"${OUT}")"
-  rl="$(sed -n 's/^WITH_REAL=//p' <<<"${OUT}")"
-  [[ "${base}" == "0" ]] && ok "baseline count is 0 (no self-match)" \
-    || bad "baseline count is ${base}, expected 0"
-  [[ "${pk}" == "0" ]] && ok "free_gpu's pkill is NOT counted (the real over-count path)" \
-    || bad "pkill inflated the count to ${pk}; supervisor would refuse to occupy"
-  [[ "${rl}" -ge 1 ]] 2>/dev/null && ok "a genuine occupier IS counted (${rl})" \
-    || bad "genuine occupier not counted (got ${rl}); supervisor would double-start"
+  skip "launcher not found; cannot verify the free_gpu requirement"
 fi
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

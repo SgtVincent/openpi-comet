@@ -2,52 +2,46 @@
 # ============================================================================
 # H20 Variant A (FAST-CE) training entrypoint — 4 x 8 NVIDIA_H20.
 #
-# This is the Merlin job's MAIN COMMAND. If it exits, the 32-GPU allocation is
-# RELEASED. Every design choice below follows from that single fact.
+# Merlin job main command. Follows the house pattern proven by job
+# 6fc66189eb6c5c88: set env, then call a repo script. Nothing more.
 #
-# It lives in the repo (rather than as a loose NAS file) so that:
-#   * it is covered by the provenance of the code it pins — an entrypoint that
-#     asserts a 40-char SHA while living outside the repo can drift from that
-#     code with nothing detecting it;
-#   * REPO_ROOT is derived from this script's own location instead of an absolute
-#     NAS path to a worktree another session could remove;
-#   * it is reachable from the branch, the tag and the provenance bundle.
+#   H20_ARM=A|B                       default A   (A = comet base, B = pi05 base)
+#   H20_MODE=smoke|formal             default smoke
+#   OPENPI_EXPECTED_CODE_COMMIT=<sha> required; supplied by the job config
 #
-# INVOCATION (console 入口指令 pastes a small shim that calls this):
-#   OPENPI_EXPECTED_CODE_COMMIT=<40-char sha>   # required; from the job config
-#   H20_ARM=A|B                                 # default A  (A=comet base, B=pi05 base)
-#   H20_MODE=smoke|formal                       # default smoke
+# WHY THIS IS SHORT
+# An earlier version added a 60 s occupancy supervisor. That supervisor raced the
+# launcher's assert_no_occupiers, which needed a launch sentinel, which needed
+# three-way phase logic, which needed a watchdog because the supervisor had become
+# a single point of failure. Three of those four existed only to manage the first.
+# The supervisor is gone and they went with it.
 #
-# The SHA is taken from the ENVIRONMENT, not hardcoded here, so the pinned commit
-# lives in the job config — the same convention the launcher itself uses.
+# The actual requirement — "if training fails, fall back to the matmul occupiers so
+# the cards are not released" — is already met by
+# run_pi05_skillbridge_lq_keepalive_on_failure.sh, which with KEEPALIVE_ON_SUCCESS=1
+# holds the allocation after success or failure, restarts dead occupiers
+# (OCCUPIER_AUTO_RESTART=1) and never returns. That is the keepalive, already
+# written and already proven. Do not reimplement it here.
 #
-# GUARANTEES
-#   (1) never exits, so the allocation is not released even after training ends
-#       or fails
-#   (2) GPU utilization stays above the platform 30% / 3-hour kill line during
-#       every protected low-utilization gap: allocation->launch, the multi-minute
-#       CPU preflight, dataset cache build, model init, validation, checkpointing,
-#       and after the run
-#   (3) occupiers are handed off ONLY for the window training needs the devices,
-#       and restored as soon as training is no longer resident
-#   (4) occupancy decisions come from LIVE evidence (ps / nvidia-smi), never from
-#       a shared PID file, and only tagged occupiers are ever stopped
-#   (5) a NAS heartbeat, because SSH and WebShell are both unavailable on this job
+# The one genuine difference from a clean-node start: this job is converted from a
+# hold job that currently has 32 tagged occupiers running, and the launcher
+# hard-fails via assert_no_occupiers. Hence one `free_gpu` before launching.
+#
+# Per-arm paths, the norm_stats digest assertion, B8/GA1, stride 12 and offsets
+# 0,4,8 are NOT re-exported here: the launcher already derives and asserts them
+# from OPENPI_H20_ARM, and train_accelerate.py setdefaults the anchor vars and then
+# validates them. Duplicating a contract that is already asserted downstream just
+# creates two places to drift.
 # ============================================================================
 
-# NOTE: `-u` is DELIBERATELY ABSENT, and `-e` must never be added.
-# With `-u`, sourcing extra_bashrc.sh aborts at its line 33
-# (`export PROMPT_COMMAND="history -a; ...; ${PROMPT_COMMAND}"` — PROMPT_COMMAND is
-# an interactive-shell variable and is unset in a job pod). The source then dies
-# BEFORE use_gpu/free_gpu are defined, this script exits, the trial ends, and all
-# 32 H20 are released. Verified empirically. It also masquerades as a platform
-# fault, which sends diagnosis in the wrong direction.
-#
-# The correct strictness depends on what an exit COSTS. Here it costs 32 GPUs, so
-# robustness beats strictness. Contrast a tool script that holds no GPUs, where
-# `set -euo pipefail` is right. Do not "harmonise" the two.
+# `-u` is DELIBERATELY ABSENT and `-e` must never be added. With `-u`, sourcing
+# extra_bashrc.sh aborts at its line 33 (PROMPT_COMMAND is an interactive-shell
+# variable, unset in a job pod) BEFORE use_gpu/free_gpu are defined; this script
+# then exits, the trial ends, and all 32 H20 are released. Verified empirically,
+# and it masquerades as a platform fault. An exit here costs 32 GPUs, so
+# robustness beats strictness.
 set -o pipefail
-export PROMPT_COMMAND="${PROMPT_COMMAND:-}"   # belt-and-braces
+export PROMPT_COMMAND="${PROMPT_COMMAND:-}"
 
 source /mnt/bn/behavior-data-hl/chenjunting/repo/extra_bashrc.sh
 
@@ -56,190 +50,95 @@ export http_proxy="$proxy"; export https_proxy="$proxy"
 export HTTP_PROXY="$proxy"; export HTTPS_PROXY="$proxy"
 export no_proxy=".byted.org"; export NO_PROXY=".byted.org"
 
-H20_ARM="${H20_ARM:-A}"
-H20_MODE="${H20_MODE:-smoke}"
+export H20_ARM="${H20_ARM:-A}"
+export H20_MODE="${H20_MODE:-smoke}"
+export OPENPI_H20_ARM="$H20_ARM"
+export OPENPI_H20_MODE="$H20_MODE"
 
-# Derived from this script's own location: the durability win of living in the repo.
 _SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${_SELF}")/.." 2>/dev/null && pwd)}"
-LAUNCHER="${REPO_ROOT}/scripts/run_pi05_ki_formal_A_fast_bf16_4x8_h20.sh"
+export REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${_SELF}")/.." 2>/dev/null && pwd)}"
+export LAUNCHER="${REPO_ROOT}/scripts/run_pi05_ki_formal_A_fast_bf16_4x8_h20.sh"
+WRAPPER="${REPO_ROOT}/scripts/run_pi05_skillbridge_lq_keepalive_on_failure.sh"
 
-RUN_BASE="${H20_RUN_BASE:-/mnt/bn/navigation-hl/mlx/users/chenjunting/h20_fastce}"
-RUN_DIR="${RUN_BASE}/run_arm${H20_ARM}"
+RUN_DIR="${H20_RUN_BASE:-/mnt/bn/navigation-hl/mlx/users/chenjunting/h20_fastce}/run_arm${H20_ARM}"
 mkdir -p "$RUN_DIR" 2>/dev/null || true
-NODE="$(hostname)"
-HB="$RUN_DIR/hb_${NODE}.log"
-ST="$RUN_DIR/status_${NODE}.txt"
-LAUNCHING="$RUN_DIR/.launching_${NODE}"
-TRAIN_LOG="$RUN_DIR/train_${H20_MODE}_${NODE}.log"
-PODFACTS="$RUN_DIR/podfacts_${NODE}.txt"
+LOG="$RUN_DIR/entrypoint_$(hostname).log"
+echo "[h20] $(date -u +%FT%TZ) arm=$H20_ARM mode=$H20_MODE commit=${OPENPI_EXPECTED_CODE_COMMIT:-<unset>} repo=$REPO_ROOT" >>"$LOG" 2>&1
 
-NGPU="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)"
-case "$NGPU" in ''|*[!0-9]*) NGPU=0 ;; esac
-
-log() { echo "[h20-fastce] $(date -u +%FT%TZ) node=$NODE $*" >>"$HB" 2>/dev/null; }
-
-# Occupier accounting uses the SAME two-condition predicate as the launcher's
-# assert_no_occupiers: the tag AND the occupier script name.
-#
-#  (a) Agreement. The launcher refuses to start if IT sees an occupier, so this
-#      count must match what the launcher counts. Those two disagreeing about what
-#      an occupier IS is its own latent bug class.
-#  (b) Over-counting is the DANGEROUS direction: if this over-reports, the
-#      supervisor concludes occupiers already exist, does NOT start them,
-#      utilization sits at zero, and the 30% / 3-hour reaper takes all 32 cards.
-#
-# The over-count path is real, not theoretical: extra_bashrc.sh's `free_gpu` ends
-# in `pkill -f "$GPU_OCCUPY_TAG"`, so while that pkill lives its argv carries the
-# tag. Measured with a live pkill: tag-only count = 2, two-condition count = 0.
-# The bracket class prevents this pipeline from matching its own command line.
-occ_count() {
-  ps -eo args= 2>/dev/null \
-    | awk '/[_]_GPU_OCCUPY__torch_mm_512/ && /gpu_occupy_(torch_mm[.]py|stub[.]sh)/' \
-    | wc -l
-}
-train_alive() { ps -eo args= 2>/dev/null | grep -q "[t]rain_accelerate.py"; }
-
-log "entrypoint start arm=$H20_ARM mode=$H20_MODE ngpu=$NGPU repo_root=$REPO_ROOT"
-log "pinned commit from env: ${OPENPI_EXPECTED_CODE_COMMIT:-<unset -- launcher will refuse>}"
-
-# ---- in-pod dependency probe (results on NAS within seconds) ----------------
-# SSH and WebShell are both broken on this job, so these facts cannot be checked
-# from outside. The launcher mandates WANDB_MODE=online, and a wandb.init blocking
-# on a missing credential is indistinguishable from a training hang — so we learn
-# it here rather than misdiagnosing a stall hours later. We do NOT silently switch
-# to offline: formal runs are required to log to W&B.
+# ---- in-pod probe: answers two unknowns we cannot check any other way -------
+# SSH and WebShell are both unavailable on this job family, so these facts are
+# unobtainable from outside. The launcher mandates WANDB_MODE=online, and a
+# wandb.init blocking on a missing credential is indistinguishable from a training
+# hang — this way we learn it in seconds instead of misreading a stall. The FAST
+# tokenizer is the one dependency with no H20 precedent. We do NOT switch to
+# offline: formal runs are required to log to W&B.
 {
-  echo "=== pod facts $(date -u +%FT%TZ) node=$NODE ==="
-  echo "-- arm=$H20_ARM mode=$H20_MODE ngpu=$NGPU"
-  echo "-- wandb env:"; env | grep -i '^WANDB' || echo "   (no WANDB_* in env)"
-  echo "-- netrc api.wandb.ai entries:"
-  for f in /home/tiger/.netrc /root/.netrc "$HOME/.netrc"; do
-    [ -f "$f" ] && echo "   $f -> $(grep -c 'api.wandb.ai' "$f" 2>/dev/null || echo 0) match(es)"
+  echo "=== pod facts $(date -u +%FT%TZ) $(hostname) arm=$H20_ARM mode=$H20_MODE ==="
+  env | grep -i '^WANDB' || echo "(no WANDB_* in env)"
+  for f in /home/tiger/.netrc /root/.netrc; do
+    [ -f "$f" ] && echo "$f -> $(grep -c 'api.wandb.ai' "$f" 2>/dev/null || echo 0) api.wandb.ai match(es)"
   done
-  echo "-- FAST tokenizer (no H20 precedent; staged for this run):"
-  ls -la "${RUN_BASE}/fast_tokenizer/" 2>&1 | head -12
-  echo "-- repo root / trainer:"
-  ls -la "${REPO_ROOT}/scripts/train_accelerate.py" 2>&1 | tail -1
-  echo "-- worktree commit:"; git -C "$REPO_ROOT" rev-parse HEAD 2>&1
-  echo "-- expected commit  : ${OPENPI_EXPECTED_CODE_COMMIT:-<unset>}"
-  echo "-- preflight python import:"
+  ls -la "${H20_RUN_BASE:-/mnt/bn/navigation-hl/mlx/users/chenjunting/h20_fastce}/fast_tokenizer/" 2>&1 | head -8
+  echo "worktree HEAD: $(git -C "$REPO_ROOT" rev-parse HEAD 2>&1)"
+  echo "expected     : ${OPENPI_EXPECTED_CODE_COMMIT:-<unset>}"
   /mnt/bn/behavior-data-hl/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python -c \
-    "import transformers; from transformers import GemmaForCausalLM; print('   transformers', transformers.__version__, 'GemmaForCausalLM OK')" 2>&1 | tail -3
-} > "$PODFACTS" 2>&1
-_WCRED="$(grep -c 'api.wandb.ai' /home/tiger/.netrc 2>/dev/null || echo 0)"
-case "$_WCRED" in ''|*[!0-9]*) _WCRED=0 ;; esac
-if [ "$_WCRED" -eq 0 ] && [ -z "${WANDB_API_KEY:-}" ]; then
-  log "WARN no W&B credential in-pod -> wandb.init may stall; treat an early stall as wandb-suspect first"
+    "import transformers; from transformers import GemmaForCausalLM; print('transformers', transformers.__version__, 'GemmaForCausalLM OK')" 2>&1 | tail -2
+} > "$RUN_DIR/podfacts_$(hostname).txt" 2>&1
+
+# ---- provenance check: LOUD on mismatch ------------------------------------
+# This cannot exit (an exit releases 32 H20), so logging is its only channel —
+# which means a mismatch must be unmistakable rather than a neutral line that looks
+# like the match case. It is also written to a dedicated status file so a monitor
+# can see it without parsing the log.
+#
+# Note what this does and does not prove: it compares HEAD to the pinned SHA. It
+# does NOT prove the working tree is clean, so a pin can be "correct" about HEAD
+# while uncommitted edits are what actually execute. The launcher's own clean-tree
+# gate is what closes that, and it runs before training.
+_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo UNKNOWN)"
+_DIRTY="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all 2>/dev/null | wc -l)"
+PROV="$RUN_DIR/provenance_$(hostname).txt"
+if [ "${OPENPI_EXPECTED_CODE_COMMIT:-}" = "" ]; then
+  echo "PROVENANCE=UNSET head=$_HEAD dirty=$_DIRTY" > "$PROV" 2>&1
+  echo "[h20] !!! WARN OPENPI_EXPECTED_CODE_COMMIT IS UNSET -- the launcher will refuse to start" >>"$LOG" 2>&1
+elif [ "$_HEAD" != "$OPENPI_EXPECTED_CODE_COMMIT" ]; then
+  echo "PROVENANCE=MISMATCH head=$_HEAD expected=$OPENPI_EXPECTED_CODE_COMMIT dirty=$_DIRTY" > "$PROV" 2>&1
+  echo "[h20] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >>"$LOG" 2>&1
+  echo "[h20] !!! PROVENANCE MISMATCH -- THE PINNED COMMIT IS NOT CHECKED OUT" >>"$LOG" 2>&1
+  echo "[h20] !!!   expected $OPENPI_EXPECTED_CODE_COMMIT" >>"$LOG" 2>&1
+  echo "[h20] !!!   HEAD     $_HEAD" >>"$LOG" 2>&1
+  echo "[h20] !!! The launcher will refuse to start. Cards are retained by keepalive." >>"$LOG" 2>&1
+  echo "[h20] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >>"$LOG" 2>&1
+elif [ "$_DIRTY" -ne 0 ]; then
+  echo "PROVENANCE=DIRTY head=$_HEAD dirty=$_DIRTY" > "$PROV" 2>&1
+  echo "[h20] !!! WARN commit matches but the worktree has $_DIRTY uncommitted change(s):" >>"$LOG" 2>&1
+  echo "[h20] !!!   the pin would be true about HEAD and false about the code that runs." >>"$LOG" 2>&1
+  echo "[h20] !!!   The launcher's clean-tree gate will refuse to start." >>"$LOG" 2>&1
 else
-  log "W&B credential present in-pod (netrc matches=$_WCRED)"
+  echo "PROVENANCE=OK head=$_HEAD dirty=0" > "$PROV" 2>&1
+  echo "[h20] provenance OK: HEAD == pinned commit, worktree clean" >>"$LOG" 2>&1
 fi
 
-# ---- occupancy supervisor --------------------------------------------------
-# Three-way, with LAUNCHING taking priority over HOLDING. It never touches a
-# business process: the only thing it can stop is a tagged occupier, and only via
-# free_gpu, whose pkill is tag-scoped.
-supervisor() {
-  while true; do
-    TS="$(date -u +%FT%TZ)"
-    N="$(occ_count)"; case "$N" in ''|*[!0-9]*) N=0 ;; esac
-    UTIL="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | paste -sd, -)"
-    MEM="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | paste -sd, -)"
-    if [ -f "$LAUNCHING" ]; then
-      # RACE FIX. The launcher runs its whole CPU preflight and only THEN calls
-      # assert_no_occupiers, which hard-fails if ANY tagged occupier exists.
-      # Measured: the warm-start keymap check alone takes 261 s cold and the full
-      # preflight exceeds 450 s — many 60 s supervisor cycles. Without this branch
-      # the supervisor restores occupancy mid-launch and kills our own run with
-      # "GPU keepalive occupiers still running". The cost is NOT reading the
-      # 14.5 GB checkpoint (only its header is parsed); it is importing the
-      # openpi/transformers stack off NFS and building the 4.1B-param module graph.
-      # ~8 min at low util is ~4% of a 3-hour averaging window, so it cannot trip
-      # the reaper.
-      PHASE="LAUNCHING"
-      if [ "$N" -gt 0 ]; then
-        log "$TS launch window active -> stopping tagged occupiers so assert_no_occupiers can pass"
-        free_gpu >>"$HB" 2>&1 || true
-        N=0
-      fi
-    elif train_alive; then
-      # Training owns the devices. Do NOT start occupiers: they would contend for
-      # HBM and could OOM the run. Low util here is an expected protected gap
-      # (cache build / init / validation / checkpoint), not something to mask.
-      PHASE="TRAINING"
-      if [ "$N" -gt 0 ]; then
-        log "$TS occupiers present while training resident -> free_gpu (tag-scoped)"
-        free_gpu >>"$HB" 2>&1 || true
-        N=0
-      fi
-    else
-      PHASE="HOLDING"
-      if [ "$N" -lt "$NGPU" ]; then
-        log "$TS occ=$N/$NGPU no training resident -> (re)start occupiers"
-        use_gpu >>"$HB" 2>&1 || log "use_gpu returned nonzero"
-        N="$(occ_count)"; case "$N" in ''|*[!0-9]*) N=0 ;; esac
-      fi
-    fi
-    printf '%s node=%s phase=%s occ=%s/%s util=%s mem=%s train_alive=%s arm=%s mode=%s\n' \
-      "$TS" "$NODE" "$PHASE" "$N" "$NGPU" "$UTIL" "$MEM" \
-      "$(train_alive && echo yes || echo no)" "$H20_ARM" "$H20_MODE" > "$ST" 2>/dev/null
-    LN="$(wc -l <"$HB" 2>/dev/null || echo 0)"
-    case "$LN" in ''|*[!0-9]*) LN=0 ;; esac
-    if [ "$LN" -gt 6000 ]; then tail -1200 "$HB" >"$HB.tmp" 2>/dev/null && mv "$HB.tmp" "$HB"; fi
-    sleep 60
-  done
-}
+# ---- hand the GPUs to training --------------------------------------------
+# This job is converted from a hold job with 32 tagged occupiers running, and the
+# launcher's assert_no_occupiers refuses to start while any exist. free_gpu is
+# tag-scoped (its pkill matches only the occupier tag) so it cannot touch a
+# business process. This is the only occupancy action the entrypoint takes; the
+# wrapper owns occupancy from here on.
+echo "[h20] stopping tagged occupiers so assert_no_occupiers can pass" >>"$LOG" 2>&1
+free_gpu >>"$LOG" 2>&1 || true
+sleep 5
 
-# Occupy immediately: allocation->launch is itself a protected gap.
-log "starting occupiers for the allocation->launch gap"
-use_gpu >>"$HB" 2>&1 || log "use_gpu returned nonzero"
-supervisor &
-SUPERVISOR_PID=$!
-log "supervisor started pid=$SUPERVISOR_PID"
+# ---- launch: the wrapper owns keepalive and never returns ------------------
+export OPENPI_KI_TRAINING_INNER=1
+export KEEPALIVE_DISABLE=0 KEEPALIVE_ON_SUCCESS=1 STRICT_GPU_COUNT=0
+echo "[h20] launching via $WRAPPER (KEEPALIVE_ON_SUCCESS=1)" >>"$LOG" 2>&1
+bash "$WRAPPER" >>"$LOG" 2>&1
+echo "[h20] wrapper returned rc=$? -- it normally never does; holding anyway" >>"$LOG" 2>&1
 
-# ---- launch ---------------------------------------------------------------
-# A missing or unreadable launcher must NOT exit: log it and fall through to the
-# terminal keepalive, which retains the allocation with occupiers running.
-if [ ! -f "$LAUNCHER" ]; then
-  log "FATAL launcher not found: $LAUNCHER -- falling into keepalive, allocation retained"
-else
-  log "handing GPUs to training: raising launch sentinel, then stopping tagged occupiers"
-  : > "$LAUNCHING"
-  free_gpu >>"$HB" 2>&1 || true
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    N="$(occ_count)"; case "$N" in ''|*[!0-9]*) N=0 ;; esac
-    [ "$N" -eq 0 ] && break
-    sleep 2
-  done
-  log "occupiers now $(occ_count)/$NGPU; launching arm=$H20_ARM mode=$H20_MODE"
-  (
-    cd "$REPO_ROOT" || exit 2
-    export OPENPI_KI_TRAINING_INNER=1
-    export KEEPALIVE_DISABLE=0 KEEPALIVE_ON_SUCCESS=1 STRICT_GPU_COUNT=0
-    export OPENPI_H20_ARM="$H20_ARM"
-    export OPENPI_H20_MODE="$H20_MODE"
-    export REPO_ROOT="$REPO_ROOT"
-    export LAUNCHER="$LAUNCHER"
-    bash "${REPO_ROOT}/scripts/run_pi05_skillbridge_lq_keepalive_on_failure.sh"
-  ) >>"$TRAIN_LOG" 2>&1
-  TRAIN_RC=$?
-  rm -f "$LAUNCHING"
-  log "training wrapper returned rc=$TRAIN_RC"
-fi
-
-# ---- terminal keepalive with supervisor watchdog ---------------------------
-# Do not release the allocation regardless of outcome. The supervisor sees no
-# resident trainer and re-occupies within one 60 s cycle.
-log "entering terminal keepalive (allocation retained; supervisor owns occupancy)"
-while true; do
-  # The supervisor is the ONLY thing restoring occupancy once training is gone.
-  # If it died the allocation would survive (this loop never exits) but utilization
-  # would sit at zero and the 30% / 3-hour reaper would take all 32 cards.
-  if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
-    log "supervisor pid=$SUPERVISOR_PID is gone -> respawning"
-    supervisor &
-    SUPERVISOR_PID=$!
-    log "supervisor respawned pid=$SUPERVISOR_PID"
-  fi
-  sleep 300
-done
+# ---- defensive tail -------------------------------------------------------
+# The wrapper is not supposed to return. If it ever does, neither exit (that
+# releases 32 H20) nor idle at 0% utilization (the 30% / 3-hour reaper would then
+# take them). Re-occupy and hold.
+use_gpu >>"$LOG" 2>&1 || true
+while true; do sleep 300; done
