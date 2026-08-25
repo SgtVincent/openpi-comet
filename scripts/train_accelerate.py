@@ -435,23 +435,22 @@ _FORMAL_B1K_CONFIG_CONTRACTS = {
         "pytorch_training_precision": "float32",
         "accelerate_mixed_precision": "no",
     },
-    # Formal 4x8 NVIDIA_H20 BF16 Variant A pair. Same B8/GA1 x world32 = global
-    # batch 256 contract as the original bf16 formal config, so both arms inherit
-    # the identical stride-12 three-pass rotation with offsets (0, 4, 8) and the
-    # fixed 104,912-step budget. The two entries differ only in warm-start
-    # package (comet B1K fine-tune vs pi05 pretrain, each paired with its own
-    # norm_stats), which this contract intentionally does not constrain -- it
-    # pins schedule, batch and data population, not which weights you start from.
+    # Formal 4x8 NVIDIA_H20 BF16 Variant A pair. B32/GA1 x world32 = global
+    # batch 1024. The two entries differ only in warm-start package (comet B1K
+    # fine-tune vs pi05 pretrain, each paired with its own norm_stats), which
+    # this contract intentionally does not constrain -- it pins batch shape and
+    # precision, not which weights you start from, and no longer pins a step
+    # budget or an anchor stride: those are derived from the config at runtime.
     "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16": {
         "pytorch_model_name": "pi05_ki_joint_fast",
-        "batch_size_per_gpu": 8,
+        "batch_size_per_gpu": 32,
         "gradient_accumulation_steps": 1,
         "pytorch_training_precision": "bfloat16",
         "accelerate_mixed_precision": "bf16",
     },
     "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16": {
         "pytorch_model_name": "pi05_ki_joint_fast",
-        "batch_size_per_gpu": 8,
+        "batch_size_per_gpu": 32,
         "gradient_accumulation_steps": 1,
         "pytorch_training_precision": "bfloat16",
         "accelerate_mixed_precision": "bf16",
@@ -470,8 +469,6 @@ _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS = {
     "pi05_ki_joint_fast_b1k-full_task-ki_on_a100_bf16",
     "pi05_ki_joint_query_b1k-full_task-ki_on_a100_bf16",
 }
-_FORMAL_B1K_PASS_SPECS = ((0, 34_982), (4, 34_971), (8, 34_959))
-_FORMAL_B1K_PASS_BOUNDARIES = (34_982, 69_953, 104_912)
 _FORMAL_B1K_DATASET_ENV_KEYS = (
     "OPENPI_B1K_ANCHOR_STRIDE",
     "OPENPI_B1K_ANCHOR_OFFSET",
@@ -481,14 +478,6 @@ _FORMAL_B1K_DATASET_ENV_KEYS = (
 
 def _is_formal_b1k_mode(config) -> bool:
     return getattr(config, "name", None) in _FORMAL_B1K_CONFIG_CONTRACTS
-
-
-def _set_formal_b1k_pass_offset(offset: int) -> None:
-    if offset not in {spec[0] for spec in _FORMAL_B1K_PASS_SPECS}:
-        raise ValueError(f"Unsupported formal B1K pass offset: {offset}")
-    os.environ["OPENPI_B1K_ANCHOR_STRIDE"] = "12"
-    os.environ["OPENPI_B1K_ANCHOR_OFFSET"] = str(offset)
-    os.environ["OPENPI_B1K_DROP_INCOMPLETE_HORIZON"] = "1"
 
 
 @contextmanager
@@ -557,19 +546,6 @@ def _train_b1k_anchor_env(stride: int, offset: int = 0):
                 os.environ[key] = saved
 
 
-def _formal_b1k_pass_for_step(global_step: int) -> tuple[int, int, int, int, int]:
-    if not 0 <= global_step < _FORMAL_B1K_PASS_BOUNDARIES[-1]:
-        raise ValueError(f"Formal B1K global_step out of range: {global_step}")
-    pass_start = 0
-    for pass_index, ((offset, pass_steps), pass_end) in enumerate(
-        zip(_FORMAL_B1K_PASS_SPECS, _FORMAL_B1K_PASS_BOUNDARIES, strict=True)
-    ):
-        if global_step < pass_end:
-            return pass_index, offset, pass_steps, pass_start, pass_end
-        pass_start = pass_end
-    raise AssertionError("unreachable formal B1K pass lookup")
-
-
 def _close_training_iterator(iterator) -> None:
     if iterator is None:
         return
@@ -599,15 +575,15 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
         return
 
     contract = _FORMAL_B1K_CONFIG_CONTRACTS[config.name]
+    # Only genuine protocol invariants are pinned to literals here. Resource
+    # parameters (batch shape) come from the per-config contract above, and the
+    # schedule is checked for INTERNAL CONSISTENCY below rather than against
+    # remembered constants -- a value assertion on a derived quantity has to be
+    # edited every time the batch or stride changes, and editing it is exactly
+    # how a stale budget gets frozen back in.
     expected_fields = {
         **contract,
-        "num_train_steps": 104_912,
-        "save_interval": 10_000,
         "checkpoint_policy": "step",
-        "rolling_checkpoint_interval": 10_000,
-        "val_log_interval": 1_000,
-        "val_num_batches": 20,
-        "streaming_anchor_stride": 12,
         "overwrite": False,
         "wandb_enabled": True,
         "project_name": "pi05_ki",
@@ -619,8 +595,6 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
                 f"Formal B1K requires {field}={expected!r}; got {actual!r}. "
                 "Runtime overrides are not supported."
             )
-    if getattr(config, "num_train_epochs", None) is not None:
-        raise ValueError("Formal B1K requires num_train_epochs=None and the fixed 104,912-step budget")
     if bool(getattr(config, "resume", False)):
         raise ValueError(
             "Formal B1K resume is unsupported: checkpoints are weights/evaluation artifacts, "
@@ -644,34 +618,76 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
         if base_config.skill_bridge.enabled:
             raise ValueError(f"Formal B1K {label} data requires Skill Bridge disabled")
 
+    # ---- Schedule CONSISTENCY (not remembered values) ----
+    # The budget is derived at runtime from the dataset and the global batch, so
+    # there is no correct literal to compare against here. What must hold is
+    # that the pieces agree with each other and with the epoch-based budget.
     schedule = config.lr_schedule
-    schedule_values = (
-        int(schedule.warmup_steps),
-        float(schedule.peak_lr),
-        int(schedule.decay_steps),
-        float(schedule.decay_lr),
-    )
-    if schedule_values != (1_000, 1e-5, 104_912, 0.0):
+    warmup_steps = int(schedule.warmup_steps)
+    decay_steps = int(schedule.decay_steps)
+    peak_lr = float(schedule.peak_lr)
+    epochs = getattr(config, "num_train_epochs", None)
+    provided_steps = int(config.num_train_steps)
+
+    if epochs is None:
+        # LEGACY fixed-budget form, still used by the on_bf16 / on_v100_fp32
+        # families. Consistency only: the budget must be positive and the cosine
+        # decay must span exactly that budget. No remembered literal.
+        if provided_steps <= 0:
+            raise ValueError(
+                "Formal B1K with num_train_epochs=None requires num_train_steps > 0; "
+                f"got {provided_steps}"
+            )
+        if decay_steps != provided_steps:
+            raise ValueError(
+                f"Formal B1K fixed-budget form requires decay_steps == num_train_steps; "
+                f"got decay_steps={decay_steps}, num_train_steps={provided_steps}"
+            )
+        if warmup_steps >= provided_steps:
+            raise ValueError(
+                f"Formal B1K requires warmup_steps < num_train_steps; "
+                f"got {warmup_steps} >= {provided_steps}"
+            )
+    else:
+        # DERIVED form: budget comes from epochs x steps_per_epoch at runtime, so
+        # the step fields must be sentinels. A literal here would cap or decouple
+        # the derived budget and silently change coverage.
+        if int(epochs) <= 0:
+            raise ValueError(f"Formal B1K requires num_train_epochs >= 1; got {epochs!r}")
+        if provided_steps != 0:
+            raise ValueError(
+                "Formal B1K epoch-derived form requires num_train_steps=0 (derive from "
+                f"epochs x steps_per_epoch); got {provided_steps}. A non-zero value caps the "
+                "derived budget and would silently truncate coverage."
+            )
+        if decay_steps != 0:
+            raise ValueError(
+                "Formal B1K epoch-derived form requires decay_steps=0 so it is auto-set to the "
+                f"derived num_train_steps; got {decay_steps}. A literal decouples LR decay from "
+                "the real budget."
+            )
+    if float(schedule.decay_lr) != 0.0:
+        raise ValueError(f"Formal B1K requires decay_lr=0; got {schedule.decay_lr!r}")
+    if warmup_steps <= 0:
+        raise ValueError(f"Formal B1K requires warmup_steps > 0; got {warmup_steps}")
+    if peak_lr <= 0.0:
+        raise ValueError(f"Formal B1K requires peak_lr > 0; got {peak_lr}")
+
+    stride = int(getattr(config, "streaming_anchor_stride", 1))
+    if stride < 1:
+        raise ValueError(f"Formal B1K requires streaming_anchor_stride >= 1; got {stride}")
+    if getattr(config, "epoch_anchor_offsets", None) is not None:
         raise ValueError(
-            "Formal B1K requires warmup=1000, peak_lr=1e-5, decay_steps=104912, decay_lr=0; "
-            f"got {schedule_values}"
+            "Formal B1K no longer uses per-epoch anchor offsets: the offset rotation was an "
+            "unnecessary decomposition of a single stride-N sweep and required mid-training "
+            "dataloader rebuilds. Set streaming_anchor_stride and leave offsets unset."
         )
 
-    os.environ.setdefault("FRAME_ANCHOR_STRIDE", "12")
-    os.environ.setdefault("FRAME_ANCHOR_OFFSETS", "0,4,8")
-    if os.environ["FRAME_ANCHOR_STRIDE"] != "12":
-        raise ValueError("Formal B1K requires FRAME_ANCHOR_STRIDE=12")
-    try:
-        frame_offsets = tuple(int(value) for value in os.environ["FRAME_ANCHOR_OFFSETS"].split(","))
-    except ValueError as exc:
-        raise ValueError("Formal B1K FRAME_ANCHOR_OFFSETS must be exactly 0,4,8") from exc
-    if frame_offsets != (0, 4, 8):
-        raise ValueError(
-            f"Formal B1K FRAME_ANCHOR_OFFSETS must be exactly (0, 4, 8); got {frame_offsets}"
-        )
-
+    # The dataset captures stride/offset from the environment at construction
+    # time, so the stride the trainer will actually use is derived from the
+    # config rather than pinned to a literal. Offset 0 with no rotation.
     formal_dataset_defaults = {
-        "OPENPI_B1K_ANCHOR_STRIDE": "12",
+        "OPENPI_B1K_ANCHOR_STRIDE": str(stride),
         "OPENPI_B1K_ANCHOR_OFFSET": "0",
         "OPENPI_B1K_DROP_INCOMPLETE_HORIZON": "1",
     }
@@ -682,7 +698,7 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
 
     os.environ.setdefault("OPENPI_PERSISTENT_WORKERS", "0")
     if os.environ["OPENPI_PERSISTENT_WORKERS"] != "0":
-        raise ValueError("Formal B1K requires OPENPI_PERSISTENT_WORKERS=0 so every pass rebuilds workers")
+        raise ValueError("Formal B1K requires OPENPI_PERSISTENT_WORKERS=0")
 
     if accelerator is not None:
         if int(accelerator.num_processes) != 32:
@@ -699,10 +715,21 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
             * int(accelerator.num_processes)
             * int(accelerator.gradient_accumulation_steps)
         )
-        if effective_global_batch != 256:
+        expected_global_batch = (
+            int(contract["batch_size_per_gpu"])
+            * int(accelerator.num_processes)
+            * int(contract["gradient_accumulation_steps"])
+        )
+        # Consistency, not a remembered constant: the runtime batch shape must
+        # match the per-config contract. Raising the batch is a one-line change
+        # to the contract, and this check still fails closed if the launcher and
+        # the config disagree.
+        if effective_global_batch != expected_global_batch:
             raise ValueError(
-                "Formal B1K requires effective global batch 256; "
-                f"got {effective_global_batch}"
+                f"Formal B1K effective global batch {effective_global_batch} does not match the "
+                f"contract's {expected_global_batch} "
+                f"(B{contract['batch_size_per_gpu']} x W{accelerator.num_processes} x "
+                f"GA{contract['gradient_accumulation_steps']})"
             )
         if contract["pytorch_training_precision"] == "float32":
             if accelerator.distributed_type != DistributedType.DEEPSPEED:
@@ -3712,10 +3739,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             )
 
     # Build the training loader under the config's streaming anchor stride.
-    # The formal B1K pass loop overrides this per-pass via
-    # _set_formal_b1k_pass_offset; for all other configs the stride comes from
-    # config.streaming_anchor_stride. Epoch-anchor-offset configs build the
-    # first epoch with offset[0] and rebuild at each epoch boundary.
+    # The stride always comes from config.streaming_anchor_stride. Epoch-anchor-
+    # offset configs build the first epoch with offset[0] and rebuild at each
+    # epoch boundary; the formal B1K path sets no offsets and so builds once.
     epoch_offsets = getattr(config, "epoch_anchor_offsets", None)
     initial_offset = int(epoch_offsets[0]) if epoch_offsets else 0
     with _train_b1k_anchor_env(
@@ -3765,9 +3791,23 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     # the nearest complete anchor (incomplete trailing horizons are dropped,
     # matching ``_streaming_drop_incomplete_horizon`` semantics). The grad-accum
     # division is applied AFTER the stride reduction, so the effective optimizer
-    # steps per epoch == (microbatches // stride) // grad_accum. The formal B1K
-    # control uses a fixed 104,912-step budget (epochs=None) and is left
-    # untouched; this adjustment only affects epoch-based runs.
+    # steps per epoch == (microbatches // stride) // grad_accum.
+    #
+    # KNOWN OVERSHOOT, quantified. ``len(dataset)`` is inherited from
+    # LeRobotDataset and is the RAW frame count: it is unaware of both the stride
+    # and of ``drop_incomplete_horizon``. Dividing by the stride recovers the
+    # stride reduction but NOT the horizon rejection, so this estimate exceeds
+    # the true count of horizon-eligible anchors. For the B1K train population
+    # (107,696,389 raw frames, action_horizon 32, first 180 sorted episodes of
+    # each of the 50 tasks) the exact eligible count at stride 4 is 26,857,712
+    # versus 26,924,097 for raw//4 -- an overshoot of 66,385 anchors, 0.247%.
+    # At global batch 1024 that is 26,293 estimated versus 26,228 exact, i.e.
+    # the last ~65 steps re-read the head of the sweep rather than extending it.
+    # This is a duplicate-exposure rounding effect, not a coverage loss, and it
+    # is bounded by one stride-pass worth of horizon tails. Deriving the exact
+    # value would require replicating the dataset's eligibility predicate here,
+    # which would drift from the dataset itself; the estimate is used instead and
+    # the discrepancy is logged so it can never be silent.
     streaming_stride = int(getattr(config, "streaming_anchor_stride", 1))
     if streaming_stride > 1 and config.num_train_epochs is not None:
         effective_micro = max(1, steps_per_epoch_micro // streaming_stride)
@@ -3778,7 +3818,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             logging.info(
                 "Streaming anchor stride=%s: steps_per_epoch reduced from %s to %s "
                 "(raw_micro=%s, effective_micro=%s//%s=%s, grad_accum=%s) "
-                "so one epoch == one pass over unique anchors",
+                "so one epoch == one pass over unique anchors; this is an UPPER BOUND "
+                "because len(dataset) is horizon-unaware (see comment above)",
                 streaming_stride,
                 steps_per_epoch,
                 effective_steps_per_epoch,
@@ -3790,13 +3831,49 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             )
         steps_per_epoch = effective_steps_per_epoch
 
-    if _is_formal_b1k_mode(config) and is_main:
-        logging.info(
-            "Formal B1K lean contract: offsets=(0,4,8), pass_steps=(34982,34971,34959), "
-            "boundaries=(34982,69953,104912), theoretical_eligible=26857712, consumed=26857472, "
-            "global_batch_drop=240, exposure=24.9383588896% of 107696389 anchors. "
-            "Coverage is approximate; checkpoints are weights/eval artifacts and resume is unsupported."
-        )
+    # ---- Batch-invariant cadences, derived where global_batch is known ----
+    # A cadence expressed in optimizer steps silently changes meaning when the
+    # global batch changes ("every 1000 steps" is 4x rarer in sample terms at 4x
+    # the batch). When the config states the cadence in SAMPLES we convert here,
+    # so raising the batch preserves how often we validate/checkpoint per sample.
+    global_batch = (
+        int(config.batch_size_per_gpu)
+        * int(accelerator.num_processes)
+        * int(accelerator.gradient_accumulation_steps)
+    )
+    for samples_field, steps_field in (
+        ("val_interval_samples", "val_log_interval"),
+        ("save_interval_samples", "save_interval"),
+    ):
+        samples = getattr(config, samples_field, None)
+        if samples is None:
+            continue
+        if int(samples) <= 0:
+            raise ValueError(f"{samples_field} must be positive when set; got {samples!r}")
+        derived = max(1, int(samples) // global_batch)
+        previous = int(getattr(config, steps_field))
+        object.__setattr__(config, steps_field, derived)
+        if is_main:
+            logging.info(
+                "Derived %s=%s from %s=%s // global_batch=%s (config literal was %s)",
+                steps_field,
+                derived,
+                samples_field,
+                int(samples),
+                global_batch,
+                previous,
+            )
+    # rolling_checkpoint_interval tracks save_interval unless explicitly set.
+    if getattr(config, "save_interval_samples", None) is not None:
+        rolling = int(getattr(config, "rolling_checkpoint_interval", 0) or 0)
+        if rolling != int(config.save_interval):
+            object.__setattr__(config, "rolling_checkpoint_interval", int(config.save_interval))
+            if is_main:
+                logging.info(
+                    "Aligned rolling_checkpoint_interval=%s to derived save_interval (was %s)",
+                    int(config.save_interval),
+                    rolling,
+                )
 
     if config.num_train_epochs is not None:
         if config.num_train_epochs <= 0:
@@ -3826,6 +3903,72 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             object.__setattr__(config, "save_interval", target_steps)
             if is_main:
                 logging.info("save_at_epoch_end_only enabled: save_interval=%s", target_steps)
+
+    # ---- Resolved recipe: derivation consistency + one auditable log line ----
+    # These are consistency assertions, not remembered values. They are the
+    # replacement for the deleted literal gates (warmup/peak_lr/decay_steps/
+    # num_train_steps == fixed tuple), which had to be hand-edited on every
+    # batch or stride change and so froze a stale budget back in each time.
+    resolved_epochs = getattr(config, "num_train_epochs", None)
+    resolved_steps = int(config.num_train_steps)
+    resolved_decay = int(config.lr_schedule.decay_steps) or resolved_steps
+    resolved_warmup = int(config.lr_schedule.warmup_steps)
+    if steps_per_epoch <= 0:
+        raise RuntimeError(f"steps_per_epoch must be positive; got {steps_per_epoch}")
+    if resolved_steps <= 0:
+        raise RuntimeError(f"num_train_steps must be positive after derivation; got {resolved_steps}")
+    if resolved_epochs is not None and resolved_steps != int(resolved_epochs) * steps_per_epoch:
+        raise RuntimeError(
+            f"Budget inconsistency: num_train_steps={resolved_steps} != "
+            f"num_train_epochs={resolved_epochs} x steps_per_epoch={steps_per_epoch}"
+        )
+    # The strict schedule-span assertions are scoped to the formal B1K protocol.
+    # Elsewhere a decay_steps that differs from num_train_steps is a tolerated
+    # (warned + auto-corrected) condition further down, and several exploratory
+    # configs rely on that -- e.g. the long-baseline pair uses
+    # num_train_steps=200 with decay_steps=500. Promoting that to a hard failure
+    # here would break configs this refactor is not about.
+    if _is_formal_b1k_mode(config):
+        if resolved_decay != resolved_steps:
+            raise RuntimeError(
+                f"Formal B1K: decay_steps={resolved_decay} must equal "
+                f"num_train_steps={resolved_steps} so the cosine schedule spans exactly the budget"
+            )
+        if resolved_warmup >= resolved_steps:
+            raise RuntimeError(
+                f"Formal B1K: warmup_steps={resolved_warmup} must be < "
+                f"num_train_steps={resolved_steps}"
+            )
+    if is_main:
+        # Single line so the whole recipe can be audited from the log without
+        # reading the config. num_train_epochs and steps_per_epoch are both
+        # present on purpose: without epochs, the discriminating relation
+        # num_train_steps == epochs x steps_per_epoch cannot be evaluated, and a
+        # checker that silently skips it would certify a hardcoded budget as
+        # "derived". samples_per_step is included so throughput (samples/s) can
+        # be computed from any two log timestamps.
+        logging.info(
+            "RESOLVED_RECIPE config=%s stride=%s batch_size_per_gpu=%s world=%s grad_accum=%s "
+            "global_batch=%s samples_per_step=%s num_train_epochs=%s steps_per_epoch=%s "
+            "num_train_steps=%s decay_steps=%s warmup_steps=%s peak_lr=%.6g "
+            "val_log_interval=%s save_interval=%s total_samples=%s",
+            config.name,
+            streaming_stride,
+            int(config.batch_size_per_gpu),
+            int(accelerator.num_processes),
+            int(accelerator.gradient_accumulation_steps),
+            global_batch,
+            global_batch,
+            resolved_epochs,
+            steps_per_epoch,
+            resolved_steps,
+            resolved_decay,
+            resolved_warmup,
+            float(config.lr_schedule.peak_lr),
+            int(config.val_log_interval),
+            int(config.save_interval),
+            resolved_steps * global_batch,
+        )
 
     checkpoint_policy = getattr(config, "checkpoint_policy", _CHECKPOINT_POLICY_STEP)
     if checkpoint_policy == _CHECKPOINT_POLICY_EPOCH_WITH_ROLLING:
@@ -4344,80 +4487,52 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     )
 
     last_epoch_logged = None
-    formal_b1k_mode = _is_formal_b1k_mode(config)
-    formal_pass_index = None
-    formal_pass_offset = None
-    formal_pass_start = 0
-    formal_pass_end = int(config.num_train_steps)
     train_iterator = None
-    epoch_anchor_index = 0 if (epoch_offsets is not None and not formal_b1k_mode) else None
+    epoch_anchor_index = 0 if epoch_offsets is not None else None
     while global_step < int(config.num_train_steps):
-        if formal_b1k_mode:
-            next_pass_index, next_offset, pass_steps, pass_start, pass_end = _formal_b1k_pass_for_step(global_step)
-            if formal_pass_index != next_pass_index:
+        # Epoch-anchor-offset mode: rebuild the loader when a new epoch starts
+        # so the dataset captures the next offset from the env. The streaming
+        # dataset reads OPENPI_B1K_ANCHOR_OFFSET at construction time; merely
+        # calling iter(loader) would replay the same offset for every epoch.
+        #
+        # The formal B1K path deliberately does NOT set epoch_anchor_offsets and
+        # therefore never rebuilds. Its three stride-12 offset passes were
+        # removed because they union to exactly one stride-4 sweep, and each
+        # boundary performed a full mid-training
+        # `del loader; build_datasets(); accelerator.prepare()` -- the same
+        # fork-while-holding-flock path that has deadlocked in practice. That
+        # rebuild's 3-retry protection lives in `except` clauses and a deadlock
+        # never raises, so the retry was structurally blind to the failure it
+        # appeared to cover. One sweep, no mid-run rebuilds.
+        if epoch_offsets is not None:
+            current_epoch = global_step // steps_per_epoch
+            if current_epoch != epoch_anchor_index:
+                if current_epoch >= len(epoch_offsets):
+                    break
                 accelerator.wait_for_everyone()
                 _close_training_iterator(train_iterator)
                 train_iterator = None
-                if next_pass_index > 0:
-                    del loader
-                    gc.collect()
-                    _set_formal_b1k_pass_offset(next_offset)
+                del loader
+                gc.collect()
+                next_offset = int(epoch_offsets[current_epoch])
+                with _train_b1k_anchor_env(
+                    int(getattr(config, "streaming_anchor_stride", 1)),
+                    next_offset,
+                ):
                     loader, _ = build_datasets(config)
-                    loader = accelerator.prepare(loader)
-                formal_pass_index = next_pass_index
-                formal_pass_offset = next_offset
-                formal_pass_start = pass_start
-                formal_pass_end = pass_end
-                train_iterator = iter(loader)
-                accelerator.wait_for_everyone()
+                loader = accelerator.prepare(loader)
+                epoch_anchor_index = current_epoch
                 if is_main:
                     logging.info(
-                        "Formal B1K pass=%s offset=%s steps=%s global_range=[%s,%s): "
-                        "streaming stride=12 with approximate quarter exposure; exact unique coverage is not claimed",
-                        formal_pass_index,
-                        formal_pass_offset,
-                        pass_steps,
-                        formal_pass_start,
-                        formal_pass_end,
-                    )
-        else:
-            # Epoch-anchor-offset mode: rebuild the loader when a new epoch
-            # starts so the dataset captures the next offset from the env.
-            # The streaming dataset reads OPENPI_B1K_ANCHOR_OFFSET at
-            # construction time; merely calling iter(loader) would replay the
-            # same offset for every epoch. Formal B1K mode uses its own
-            # explicit multi-pass rebuild above and never enters this branch.
-            if epoch_offsets is not None and not formal_b1k_mode:
-                current_epoch = global_step // steps_per_epoch
-                if current_epoch != epoch_anchor_index:
-                    if current_epoch >= len(epoch_offsets):
-                        break
-                    accelerator.wait_for_everyone()
-                    _close_training_iterator(train_iterator)
-                    train_iterator = None
-                    del loader
-                    gc.collect()
-                    next_offset = int(epoch_offsets[current_epoch])
-                    with _train_b1k_anchor_env(
-                        int(getattr(config, "streaming_anchor_stride", 1)),
+                        "Epoch anchor offset rotated: epoch=%s offset=%s stride=%s",
+                        current_epoch + 1,
                         next_offset,
-                    ):
-                        loader, _ = build_datasets(config)
-                    loader = accelerator.prepare(loader)
-                    epoch_anchor_index = current_epoch
-                    if is_main:
-                        logging.info(
-                            "Epoch anchor offset rotated: epoch=%s offset=%s stride=%s",
-                            current_epoch + 1,
-                            next_offset,
-                            getattr(config, "streaming_anchor_stride", 1),
-                        )
-            train_iterator = iter(loader)
+                        getattr(config, "streaming_anchor_stride", 1),
+                    )
+        train_iterator = iter(loader)
 
         for observation, actions in train_iterator:
             if global_step >= int(config.num_train_steps):
-                break
-            if formal_b1k_mode and global_step >= formal_pass_end:
                 break
             if epoch_anchor_index is not None and global_step >= (epoch_anchor_index + 1) * steps_per_epoch:
                 break
@@ -5128,14 +5243,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             "grad_norm_total": grad_norm_value,
                             **extra_metrics,
                         }
-                        if formal_b1k_mode:
-                            info_dict.update(
-                                {
-                                    "formal_pass_index": float(formal_pass_index),
-                                    "formal_pass_offset": float(formal_pass_offset),
-                                    "formal_pass_step": float(global_step - formal_pass_start),
-                                }
-                            )
                         # Per-param-group LRs for π0.5-KI joint query model.
                         if is_pi05_ki_joint:
                             for pg in optimizer.param_groups:
@@ -5252,14 +5359,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 }
                                 if avg_loss_scale is not None:
                                     log_payload["loss_scale"] = avg_loss_scale
-                                if formal_b1k_mode:
-                                    log_payload.update(
-                                        {
-                                            "formal/pass_index": float(formal_pass_index),
-                                            "formal/pass_offset": float(formal_pass_offset),
-                                            "formal/pass_step": float(global_step - formal_pass_start),
-                                        }
-                                    )
 
                                 # --- π0.5-KI structured metrics ---
                                 if is_pi05_ki_joint:
@@ -5371,12 +5470,26 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         )
 
                     # ---- Epoch-end validation with slow metrics (flow_l1) ----
+                    # Restricted to epoch-expressed budgets, and skipped on the
+                    # final step because the post-loop "final validation" below
+                    # already covers it with slow metrics.
+                    #
+                    # Both conditions preserve pre-refactor behaviour exactly.
+                    # The old guard was `not formal_b1k_mode`, which suppressed
+                    # this for ALL formal configs. The legacy fixed-budget formal
+                    # configs (on_bf16 / on_v100_fp32) have num_train_epochs=None
+                    # and so are still suppressed by the first condition; the
+                    # single-epoch H20 formal run's only boundary is its last
+                    # step and so is suppressed by the second. Multi-epoch
+                    # non-formal runs (e.g. a100, 4 epochs) keep firing at
+                    # epochs 1..n-1 as before.
                     if (
-                        not formal_b1k_mode
-                        and val_loader is not None
+                        val_loader is not None
+                        and config.num_train_epochs is not None
                         and steps_per_epoch > 0
                         and global_step % steps_per_epoch == 0
                         and global_step > 0
+                        and global_step < int(config.num_train_steps)
                     ):
                         # Flush training metrics before epoch-end validation writes.
                         _metrics_buffer_flush()
@@ -5395,14 +5508,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             slow_metrics=True,
                             val_label="val_epoch_end",
                         )
-
-                    if formal_b1k_mode:
-                        if global_step > formal_pass_end:
-                            raise RuntimeError(
-                                f"Formal B1K pass {formal_pass_index} overshot boundary {formal_pass_end}: {global_step}"
-                            )
-                        if global_step == formal_pass_end:
-                            break
 
     _close_training_iterator(train_iterator)
 

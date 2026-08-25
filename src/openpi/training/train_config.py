@@ -142,6 +142,18 @@ class TrainConfig:
     # construction. Default 1 preserves pre-existing behavior.
     streaming_anchor_stride: int = 1
 
+    # ---- Batch-invariant cadences (opt-in) ----
+    # ``save_interval`` and ``val_log_interval`` are expressed in OPTIMIZER
+    # STEPS, so their meaning silently changes whenever the global batch
+    # changes: "every 1000 steps" becomes 4x rarer in sample terms when the
+    # batch is raised 4x. When these ``*_samples`` fields are set the trainer
+    # derives the step interval at runtime as
+    # ``max(1, samples // global_batch)``, holding the cadence fixed in samples
+    # across any batch or world-size change. Default None leaves the
+    # step-valued fields authoritative, so existing configs are unchanged.
+    val_interval_samples: int | None = None
+    save_interval_samples: int | None = None
+
     # Per-epoch anchor offsets for streaming-anchor training. When set, the
     # trainer rebuilds the training dataloader at each epoch boundary with
     # ``OPENPI_B1K_ANCHOR_OFFSET`` set to the corresponding entry. The list

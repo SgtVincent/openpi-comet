@@ -18,9 +18,14 @@
 # isolate the weights.
 #
 # Contract (identical in both arms):
-#   * B8/GPU × world 32 × GA1 = global batch 256   (matches the cont2 contract
-#     already proven on this exact 4×8 H20 / soil-hl / group 947 hardware)
-#   * stride 12, three passes, anchor offsets 0/4/8, fixed 104,912-step budget
+#   * B32/GPU × world 32 × GA1 = global batch 1024. Batch shape is taken from the
+#     registered TrainConfig; this launcher asserts agreement rather than pinning
+#     a literal, so raising the batch is a one-line config change.
+#   * stride 4, ONE sweep, no anchor offsets. The former "stride 12, three
+#     passes, offsets 0/4/8" decomposed a single stride-4 epoch: {0,4,8} mod 12
+#     unions to exactly {0} mod 4. The step budget is DERIVED at runtime as
+#     num_train_epochs × steps_per_epoch, so it rescales with batch and stride
+#     instead of being a fixed literal (was: 104,912).
 #   * BF16, DeepSpeed ZeRO-2, optimizer NOT offloaded, gradient checkpointing ON
 #   * action_token_max_len=256 — shared by both arms so capacity can never be a
 #     third confound. SAMPLED (not exhaustive) bound under d66ed168; see the
@@ -32,8 +37,8 @@
 #
 # MODES
 #   OPENPI_H20_MODE=smoke   bounded 8-optimizer-step run on the *_smoke config,
-#                           same B8/GA1 so the measured memory peak is real.
-#   OPENPI_H20_MODE=formal  the 104,912-step budget (default).
+#                           B8/GA1 stride 1 (deliberately not the formal batch).
+#   OPENPI_H20_MODE=formal  the epoch-derived budget (default).
 #
 # CPU/read-only preflight (no GPU, no output, no occupier action):
 #   OPENPI_LAUNCH_PREFLIGHT_ONLY=1 OPENPI_H20_ARM=A \
@@ -165,7 +170,7 @@ MASTER_PORT="${_MASTER_PORT%%,*}"
 # ---- Precision & batch contract --------------------------------------------
 PYTORCH_TRAINING_PRECISION="${PYTORCH_TRAINING_PRECISION:-bfloat16}"
 ACCELERATE_MIXED_PRECISION="${ACCELERATE_MIXED_PRECISION:-bf16}"
-BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
+BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-32}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 if [[ "${MODE}" == "smoke" ]]; then
@@ -173,8 +178,13 @@ if [[ "${MODE}" == "smoke" ]]; then
   VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-4}"
   VAL_NUM_BATCHES="${VAL_NUM_BATCHES:-1}"
 else
-  SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
-  VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-1000}"
+  # Formal: these are only fallbacks for the CLI flags. The formal configs set
+  # val_interval_samples / save_interval_samples, and train_accelerate.py
+  # re-derives both from the resolved global batch, so a step-valued cadence
+  # here cannot silently change meaning when the batch changes. Values below
+  # are the batch-1024 equivalents of the historical 1000/10000 at batch 256.
+  SAVE_INTERVAL="${SAVE_INTERVAL:-2500}"
+  VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-250}"
   VAL_NUM_BATCHES="${VAL_NUM_BATCHES:-20}"
 fi
 
@@ -191,11 +201,13 @@ done
 
 [[ "${PYTORCH_TRAINING_PRECISION}" == "bfloat16" ]] || die "H20 formal requires BF16"
 [[ "${ACCELERATE_MIXED_PRECISION}" == "bf16" ]] || die "H20 formal requires Accelerate bf16"
-(( BATCH_SIZE_PER_GPU == 8 )) || die "H20 formal requires BATCH_SIZE_PER_GPU=8"
-(( GRADIENT_ACCUMULATION_STEPS == 1 )) || die "H20 formal requires GRADIENT_ACCUMULATION_STEPS=1"
 
+# Batch shape is NOT gated against a literal here. The registered TrainConfig is
+# the single source of truth and the Python preflight below asserts that these
+# launcher values equal the configured ones, so raising the batch is a one-line
+# config change and a launcher/config disagreement still fails closed.
 GLOBAL_BATCH_SIZE=$(( BATCH_SIZE_PER_GPU * TOTAL_GPUS * GRADIENT_ACCUMULATION_STEPS ))
-(( GLOBAL_BATCH_SIZE == 256 )) || die "global batch must be 256 (B8×W32×GA1), got ${GLOBAL_BATCH_SIZE}"
+(( GLOBAL_BATCH_SIZE > 0 )) || die "global batch must be positive, got ${GLOBAL_BATCH_SIZE}"
 
 # ---- W&B (fresh, no resume) ------------------------------------------------
 WANDB_MODE="${WANDB_MODE:-online}"
@@ -269,12 +281,20 @@ PY
 
 # ---- TrainConfig preflight -------------------------------------------------
 "${OPENPI_PREFLIGHT_PYTHON}" - "${EXPECTED_CONFIG}" "${EXPECTED_MODEL}" "${MODE}" \
-  "${BASE_PI05_CKPT}" "${B1K_DATASET_ROOT}" <<'PY'
+  "${BASE_PI05_CKPT}" "${B1K_DATASET_ROOT}" \
+  "${BATCH_SIZE_PER_GPU}" "${GRADIENT_ACCUMULATION_STEPS}" "${TOTAL_GPUS}" <<'PY'
 import sys
 from openpi.training.train_config import get_config
-name, model_name, mode, base_ckpt, data_root = sys.argv[1:]
+(
+    name, model_name, mode, base_ckpt, data_root,
+    launcher_batch, launcher_ga, launcher_world,
+) = sys.argv[1:]
+launcher_batch = int(launcher_batch)
+launcher_ga = int(launcher_ga)
+launcher_world = int(launcher_world)
 cfg = get_config(name)
 data_cfg = cfg.data[0]
+global_batch = cfg.batch_size_per_gpu * launcher_world * cfg.gradient_accumulation_steps
 checks = {
     "registered exact name": cfg.name == name,
     "expected model": cfg.pytorch_model_name == model_name,
@@ -283,8 +303,9 @@ checks = {
     "model dtype bfloat16": cfg.model.dtype == "bfloat16",
     "KI enabled": cfg.model.knowledge_insulation is True,
     "expert KV truncated": cfg.model.truncate_expert_kv is True,
-    "B8": cfg.batch_size_per_gpu == 8,
-    "GA1": cfg.gradient_accumulation_steps == 1,
+    # Consistency, not literals: the launcher must agree with the config.
+    "launcher batch == configured batch": launcher_batch == cfg.batch_size_per_gpu,
+    "launcher GA == configured GA": launcher_ga == cfg.gradient_accumulation_steps,
     "gradient checkpointing on": cfg.gradient_checkpointing is True,
     "FAST cap 256 (shared by both arms)": cfg.model.action_token_max_len == 256,
     "warm start points at this arm's package": str(cfg.pytorch_weight_path) == base_ckpt,
@@ -295,18 +316,29 @@ checks = {
     "no LQ path in data root": "saiwenresearch" not in str(data_cfg.base_config.behavior_dataset_root),
     "wandb enabled": cfg.wandb_enabled is True,
     "project pi05_ki": cfg.project_name == "pi05_ki",
-    "peak1e-5": cfg.lr_schedule.peak_lr == 1e-5,
-    "no epoch budget": cfg.num_train_epochs is None,
+    "peak_lr positive": cfg.lr_schedule.peak_lr > 0,
 }
 if mode == "formal":
+    # The budget is DERIVED at runtime (num_train_steps = epochs x
+    # steps_per_epoch, computed from the dataset and the global batch), so there
+    # is no correct step literal to assert here. Assert the derivation is armed
+    # and self-consistent instead. A literal would have to be re-edited on every
+    # batch/stride change, and editing it is how a stale budget gets frozen in.
     checks.update({
-        "104912 steps": cfg.num_train_steps == 104_912,
-        "stride12": cfg.streaming_anchor_stride == 12,
-        "save10k": cfg.save_interval == 10_000,
-        "val1k": cfg.val_log_interval == 1_000,
+        "epoch-expressed budget": cfg.num_train_epochs is not None and cfg.num_train_epochs >= 1,
+        "steps derived at runtime (num_train_steps==0)": cfg.num_train_steps == 0,
+        "decay derived at runtime (decay_steps==0)": cfg.lr_schedule.decay_steps == 0,
+        "decay_lr 0": cfg.lr_schedule.decay_lr == 0.0,
+        "warmup positive": cfg.lr_schedule.warmup_steps > 0,
+        "anchor stride explicit and >=1": cfg.streaming_anchor_stride >= 1,
+        "no per-epoch anchor offsets (offset machinery removed)":
+            getattr(cfg, "epoch_anchor_offsets", None) is None,
+        # Cadences must be batch-invariant, i.e. expressed in samples.
+        "val cadence expressed in samples": cfg.val_interval_samples is not None,
+        "save cadence expressed in samples": cfg.save_interval_samples is not None,
+        "val cadence divides into >=1 step": cfg.val_interval_samples // global_batch >= 1,
+        "save cadence divides into >=1 step": cfg.save_interval_samples // global_batch >= 1,
         "val20": cfg.val_num_batches == 20,
-        "warmup1000": cfg.lr_schedule.warmup_steps == 1_000,
-        "decay104912": cfg.lr_schedule.decay_steps == 104_912,
     })
 else:
     checks.update({
@@ -328,9 +360,20 @@ else:
 failed = [label for label, ok in checks.items() if not ok]
 if failed:
     raise SystemExit(f"ERROR: config {name!r} failed: " + "; ".join(failed))
+if mode == "formal":
+    budget = f"epochs={cfg.num_train_epochs} steps=DERIVED_AT_RUNTIME"
+    cadence = (
+        f"val={cfg.val_interval_samples}samples->{cfg.val_interval_samples // global_batch}steps "
+        f"save={cfg.save_interval_samples}samples->{cfg.save_interval_samples // global_batch}steps"
+    )
+else:
+    budget = f"steps={cfg.num_train_steps}"
+    cadence = f"val={cfg.val_log_interval}steps save={cfg.save_interval}steps"
 print(
     f"H20_CONFIG_PREFLIGHT_OK name={name} model={model_name} mode={mode} "
-    f"B8xW32xGA1=256 steps={cfg.num_train_steps} stride={cfg.streaming_anchor_stride} cap=256"
+    f"B{cfg.batch_size_per_gpu}xW{launcher_world}xGA{cfg.gradient_accumulation_steps}="
+    f"{global_batch} {budget} stride={cfg.streaming_anchor_stride} "
+    f"peak_lr={cfg.lr_schedule.peak_lr:g} warmup={cfg.lr_schedule.warmup_steps} {cadence} cap=256"
 )
 PY
 
@@ -378,11 +421,11 @@ info "============================================================"
 info "formal H20 arm=${ARM} (${ARM_LABEL}) mode=${MODE} config=${EXPECTED_CONFIG}"
 info "code_commit=${ACTUAL_COMMIT} openpi=${OPENPI_IMPORT_PATH}"
 info "topology=${NUM_NODES}x${GPUS_PER_NODE} world=${TOTAL_GPUS} rank=${NODE_RANK} gpu_model=${GPU_MODEL:-unset}"
-info "BF16 ZeRO-2 no-optimizer-offload B8/GPU GA1 global_batch=${GLOBAL_BATCH_SIZE} gradient_checkpointing=on"
+info "BF16 ZeRO-2 no-optimizer-offload B${BATCH_SIZE_PER_GPU}/GPU GA${GRADIENT_ACCUMULATION_STEPS} global_batch=${GLOBAL_BATCH_SIZE} gradient_checkpointing=on"
 info "warm_start=${BASE_PI05_CKPT} (${ACTUAL_WEIGHTS_BYTES} B)"
 info "norm_stats=${NORM_STATS_PATH} sha256=${ACTUAL_NORM_STATS_SHA256:0:16}…"
 info "FAST cap=256 (SAMPLED bound under d66ed168; exhaustive gate required before the long run)"
-info "WARNING: world32 B8/GA1 no-offload peak on H20 is UNMEASURED; bounded smoke required first"
+info "WARNING: world32 B${BATCH_SIZE_PER_GPU}/GA${GRADIENT_ACCUMULATION_STEPS} no-offload peak on H20 is UNMEASURED at this batch; OOM would be a training crash (keepalive-covered), not a lost allocation"
 info "wandb_project=${WANDB_PROJECT} output_root=${PERSISTENT_OUTPUT_ROOT}"
 info "============================================================"
 

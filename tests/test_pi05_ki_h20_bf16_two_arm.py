@@ -9,12 +9,14 @@ tests exist mainly to protect the *controlled* part of "controlled experiment":
   * each arm's weights are paired with the ``assets`` that ship beside them
   * neither arm references saiwenresearch, which the H20 pool cannot mount
   * the arms differ in exactly the fields we intend, and nothing else
-  * B8 x W32 x GA1 = 256 and the formal contract table agrees with the configs
+  * the formal arms declare B32 x W32 x GA1 = 1024 and an epoch-DERIVED budget,
+    and the trainer's formal contract table agrees with the registered configs
   * the launcher gates on H20 (not A100) and runs the per-device BF16 preflight
 """
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import json
 from pathlib import Path
@@ -33,9 +35,27 @@ _ARM_A = "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16"
 _ARM_B = "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16"
 _ARM_A_SMOKE = f"{_ARM_A}_smoke"
 _ARM_B_SMOKE = f"{_ARM_B}_smoke"
+_FORMAL = (_ARM_A, _ARM_B)
+_SMOKE = (_ARM_A_SMOKE, _ARM_B_SMOKE)
 _ALL = (_ARM_A, _ARM_B, _ARM_A_SMOKE, _ARM_B_SMOKE)
 
 _EXPECTED_CAP = 256
+
+# World size of the formal 4x8 topology. Not a config field, so it stays a
+# literal here, exactly as the launcher's TOTAL_GPUS does.
+_WORLD = 32
+
+# The formal recipe, expressed the way the configs express it. num_train_steps and
+# decay_steps are 0 SENTINELS: the budget is derived at runtime as
+# num_train_epochs x steps_per_epoch, so there is no step literal to pin. The
+# cadences are in samples so they keep their meaning across batch changes.
+_FORMAL_STRIDE = 4
+_FORMAL_BATCH_PER_GPU = 32
+_FORMAL_GLOBAL_BATCH = 1024
+_FORMAL_VAL_SAMPLES = 256_000
+_FORMAL_SAVE_SAMPLES = 2_560_000
+_FORMAL_WARMUP = 250
+_FORMAL_PEAK_LR = 2e-5
 
 
 @pytest.mark.parametrize("name", _ALL)
@@ -50,17 +70,39 @@ def test_variant_a_shape(name: str) -> None:
     assert cfg.model.truncate_expert_kv is True
     assert cfg.gradient_checkpointing is True
     assert cfg.wandb_enabled is True
-    # A fixed-step budget: the formal B1K contract rejects an epoch budget, and
-    # the smokes must not silently acquire one either.
-    assert cfg.num_train_epochs is None
+    # Budget FORM, per arm, and neither may drift into the other's:
+    #   formal -> epoch-expressed, with the step fields left as 0 sentinels so the
+    #             trainer derives them from the dataset and the global batch.
+    #   smoke  -> a small fixed step budget; it must never acquire an epoch budget,
+    #             which would make the bounded memory probe unbounded.
+    if name in _FORMAL:
+        assert cfg.num_train_epochs == 1
+        assert cfg.num_train_steps == 0
+        assert cfg.lr_schedule.decay_steps == 0
+    else:
+        assert cfg.num_train_epochs is None
+        assert cfg.num_train_steps > 0
 
 
-@pytest.mark.parametrize("name", _ALL)
-def test_global_batch_is_256(name: str) -> None:
+@pytest.mark.parametrize(
+    ("name", "expected_per_gpu", "expected_global"),
+    [
+        (_ARM_A, _FORMAL_BATCH_PER_GPU, _FORMAL_GLOBAL_BATCH),
+        (_ARM_B, _FORMAL_BATCH_PER_GPU, _FORMAL_GLOBAL_BATCH),
+        # The smokes deliberately keep B8: the smoke exists to produce a real
+        # measured memory peak for a batch that has already been run, so lowering
+        # or raising it would break comparability with the earlier bounded runs.
+        (_ARM_A_SMOKE, 8, 256),
+        (_ARM_B_SMOKE, 8, 256),
+    ],
+)
+def test_global_batch_matches_each_arms_declared_shape(
+    name: str, expected_per_gpu: int, expected_global: int
+) -> None:
     cfg = get_config(name)
-    assert cfg.batch_size_per_gpu == 8
+    assert cfg.batch_size_per_gpu == expected_per_gpu
     assert cfg.gradient_accumulation_steps == 1
-    assert cfg.batch_size_per_gpu * 32 * cfg.gradient_accumulation_steps == 256
+    assert cfg.batch_size_per_gpu * _WORLD * cfg.gradient_accumulation_steps == expected_global
 
 
 def test_cap_is_identical_across_all_four_configs() -> None:
@@ -124,13 +166,39 @@ def test_the_two_formal_arms_differ_only_in_the_warm_start_package() -> None:
     assert a["model"] == b["model"]
 
 
-def test_formal_arms_carry_the_cont2_schedule() -> None:
-    for name in (_ARM_A, _ARM_B):
+def test_formal_arms_carry_the_derived_single_sweep_recipe() -> None:
+    """Both arms must carry one identical, epoch-derived stride-4 recipe.
+
+    Nothing here is a step budget. ``num_train_steps`` and ``decay_steps`` are 0
+    sentinels: the trainer derives ``num_train_steps = num_train_epochs x
+    steps_per_epoch`` from the dataset and the resolved global batch, and auto-sets
+    ``decay_steps`` to it. Asserting the sentinels is what proves the derivation is
+    ARMED -- a literal in either field would cap the budget or decouple the cosine
+    decay from it, which is exactly the failure the sentinels exist to prevent.
+
+    The two cadences are asserted in samples AND in their derived step equivalents,
+    because a sample-valued cadence that rounds to zero steps would silently
+    disable validation or checkpointing.
+    """
+    for name in _FORMAL:
         cfg = get_config(name)
-        assert cfg.num_train_steps == 104_912
-        assert cfg.streaming_anchor_stride == 12
-        assert cfg.save_interval == 10_000
-        assert cfg.val_log_interval == 1_000
+        # Derivation armed, not a remembered budget.
+        assert cfg.num_train_epochs == 1
+        assert cfg.num_train_steps == 0
+        assert cfg.lr_schedule.decay_steps == 0
+        # One single sweep: a stride with no per-epoch offset rotation, so the
+        # trainer never rebuilds the loader mid-run.
+        assert cfg.streaming_anchor_stride == _FORMAL_STRIDE
+        assert cfg.epoch_anchor_offsets is None
+        # Batch-invariant cadences. The step-valued save_interval /
+        # val_log_interval fields are placeholders that train_accelerate.py
+        # overwrites from these, so they are deliberately not asserted here.
+        assert cfg.val_interval_samples == _FORMAL_VAL_SAMPLES
+        assert cfg.save_interval_samples == _FORMAL_SAVE_SAMPLES
+        global_batch = cfg.batch_size_per_gpu * _WORLD * cfg.gradient_accumulation_steps
+        assert global_batch == _FORMAL_GLOBAL_BATCH
+        assert cfg.val_interval_samples // global_batch == 250
+        assert cfg.save_interval_samples // global_batch == 2_500
         assert cfg.val_num_batches == 20
         assert cfg.project_name == "pi05_ki"
         sched = cfg.lr_schedule
@@ -139,18 +207,26 @@ def test_formal_arms_carry_the_cont2_schedule() -> None:
             float(sched.peak_lr),
             int(sched.decay_steps),
             float(sched.decay_lr),
-        ) == (1_000, 1e-5, 104_912, 0.0)
+        ) == (_FORMAL_WARMUP, _FORMAL_PEAK_LR, 0, 0.0)
 
 
-def test_smoke_arms_are_bounded_but_keep_the_formal_per_gpu_batch() -> None:
-    """The smoke exists to measure real memory, so B8 must not be reduced."""
-    for name in (_ARM_A_SMOKE, _ARM_B_SMOKE):
+def test_smoke_arms_are_bounded_and_keep_the_b8_memory_probe() -> None:
+    """The smoke exists to measure real memory at B8, so B8 must not be changed.
+
+    B8 is no longer the formal per-GPU batch (the formal arms now run B32), but the
+    smoke keeps it deliberately: its purpose is a bounded, already-proven-shape run,
+    and it must also keep the step-valued cadence rather than the formal
+    sample-valued one, which would round to a single step at this batch.
+    """
+    for name in _SMOKE:
         cfg = get_config(name)
         assert 0 < cfg.num_train_steps <= 16
         assert cfg.streaming_anchor_stride == 1
         assert cfg.batch_size_per_gpu == 8
         assert cfg.gradient_accumulation_steps == 1
         assert cfg.model.action_token_max_len == _EXPECTED_CAP
+        assert cfg.val_interval_samples is None
+        assert cfg.save_interval_samples is None
 
 
 def test_smoke_must_actually_reach_validation() -> None:
@@ -322,16 +398,31 @@ def test_fast_eval_metrics_honours_deterministic_flow_the_same_way() -> None:
 
 
 def test_formal_contract_table_registers_both_arms_consistently() -> None:
-    """The trainer's formal table must agree with the registered configs."""
+    """The trainer's formal table must agree with the registered configs.
+
+    The table is now the single source of truth for the batch SHAPE (the trainer no
+    longer pins a global-batch literal; it compares the runtime shape against this
+    table), so the interesting property is agreement in both directions rather than
+    either side matching a remembered number. The table entry is parsed out and
+    compared field by field, so a batch raised on one side only fails here.
+    """
     source = (_REPO_ROOT / "scripts" / "train_accelerate.py").read_text()
-    for name in (_ARM_A, _ARM_B):
-        assert f'"{name}": {{' in source, f"{name} missing from formal contract table"
-        cfg = get_config(name)
-        assert cfg.batch_size_per_gpu == 8
-        assert cfg.gradient_accumulation_steps == 1
-    # The smokes must NOT be in the formal table: that table pins 104,912 steps.
     formal_block = source.split("_FORMAL_B1K_CONFIG_CONTRACTS = {", 1)[1].split("\n}", 1)[0]
-    for name in (_ARM_A_SMOKE, _ARM_B_SMOKE):
+    table = ast.literal_eval("{" + formal_block + "}")
+
+    for name in _FORMAL:
+        assert f'"{name}": {{' in source, f"{name} missing from formal contract table"
+        entry = table[name]
+        cfg = get_config(name)
+        assert entry["batch_size_per_gpu"] == cfg.batch_size_per_gpu == _FORMAL_BATCH_PER_GPU
+        assert entry["gradient_accumulation_steps"] == cfg.gradient_accumulation_steps == 1
+        assert entry["pytorch_model_name"] == cfg.pytorch_model_name
+        assert entry["pytorch_training_precision"] == cfg.pytorch_training_precision
+        assert entry["accelerate_mixed_precision"] == cfg.accelerate_mixed_precision
+    # The smokes must NOT be in the formal table: it is the formal protocol
+    # contract (episode split, W32, no resume, W&B required), which a bounded
+    # single-node memory probe cannot and should not satisfy.
+    for name in _SMOKE:
         assert name not in formal_block, f"{name} must not be a formal contract"
 
 
@@ -391,8 +482,18 @@ def test_launcher_enforces_the_key_invariants() -> None:
     assert "^[0-9a-f]{40}$" in text
     assert "status --porcelain --untracked-files=all" in text
     assert "openpi import does not resolve inside the pinned tree" in text
-    # batch contract
-    assert "global batch must be 256 (B8×W32×GA1)" in text
+    # batch contract. The launcher no longer gates on a literal global batch: the
+    # registered TrainConfig is the single source of truth, and the launcher's
+    # Python preflight asserts its own values agree with it. Assert the agreement
+    # checks themselves are present -- dropping them would let a launcher/config
+    # disagreement reach 32 GPUs, which the old literal gate existed to prevent.
+    assert "launcher batch == configured batch" in text
+    assert "launcher GA == configured GA" in text
+    assert "global batch must be positive" in text
+    # And the derivation must stay armed in the formal-mode preflight.
+    assert "steps derived at runtime (num_train_steps==0)" in text
+    assert "decay derived at runtime (decay_steps==0)" in text
+    assert "no per-epoch anchor offsets (offset machinery removed)" in text
     # occupier handoff
     assert "__GPU_OCCUPY__torch_mm_512" in text
     # warm-start mapping is proven before GPUs are spent

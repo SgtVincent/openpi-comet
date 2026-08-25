@@ -394,11 +394,19 @@ if [[ "${OPENPI_PERSISTENT_WORKERS}" != "0" ]]; then
   echo "ERROR: formal lean B1K requires OPENPI_PERSISTENT_WORKERS=0 for pass rebuilds." >&2
   exit 2
 fi
-FRAME_ANCHOR_STRIDE="${FRAME_ANCHOR_STRIDE:-12}"
-FRAME_ANCHOR_OFFSETS="${FRAME_ANCHOR_OFFSETS:-0,4,8}"
+FRAME_ANCHOR_STRIDE="${FRAME_ANCHOR_STRIDE:-4}"
+FRAME_ANCHOR_OFFSETS="${FRAME_ANCHOR_OFFSETS:-0}"
 DROP_INCOMPLETE_ACTION_HORIZON="${DROP_INCOMPLETE_ACTION_HORIZON:-1}"
-if [[ "${FRAME_ANCHOR_STRIDE}" != "12" || "${FRAME_ANCHOR_OFFSETS}" != "0,4,8" ]]; then
-  echo "ERROR: formal lean B1K requires FRAME_ANCHOR_STRIDE=12 and FRAME_ANCHOR_OFFSETS=0,4,8." >&2
+# stride 4 / single offset, was stride 12 with offsets 0,4,8. The trainer no
+# longer rotates anchor offsets at pass boundaries; {0,4,8} mod 12 unions to
+# exactly {0} mod 4, so one stride-4 sweep covers the identical anchor set and
+# 26,857,712 // 256 == 104,912 keeps the step budget unchanged. Keeping stride
+# 12 with a single offset would silently cover only 1/12 of frames.
+# FRAME_ANCHOR_* are informational only: nothing reads them any more (the
+# trainer's consumer was removed with the offset machinery). OPENPI_B1K_ANCHOR_*
+# below are the variables the dataset actually reads.
+if [[ "${FRAME_ANCHOR_STRIDE}" != "4" || "${FRAME_ANCHOR_OFFSETS}" != "0" ]]; then
+  echo "ERROR: formal lean B1K requires FRAME_ANCHOR_STRIDE=4 and FRAME_ANCHOR_OFFSETS=0." >&2
   exit 2
 fi
 if [[ "${DROP_INCOMPLETE_ACTION_HORIZON}" != "1" ]]; then
@@ -406,7 +414,9 @@ if [[ "${DROP_INCOMPLETE_ACTION_HORIZON}" != "1" ]]; then
   exit 2
 fi
 export FRAME_ANCHOR_STRIDE FRAME_ANCHOR_OFFSETS DROP_INCOMPLETE_ACTION_HORIZON
-export OPENPI_B1K_ANCHOR_STRIDE="12"
+# Must match config.streaming_anchor_stride (4) or the trainer's formal contract
+# validator fails closed on the mismatch.
+export OPENPI_B1K_ANCHOR_STRIDE="4"
 export OPENPI_B1K_ANCHOR_OFFSET="0"
 export OPENPI_B1K_DROP_INCOMPLETE_HORIZON="1"
 export OPENPI_DATALOADER_TIMEOUT_S="${OPENPI_DATALOADER_TIMEOUT_S:-600}"

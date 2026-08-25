@@ -43,7 +43,15 @@ def test_formal_v100_configs_are_exactly_matched_outside_objective():
         assert config.gradient_accumulation_steps == 8
         assert config.num_train_steps == 104_912
         assert config.num_train_epochs is None
-        assert config.streaming_anchor_stride == 12
+        # Stride 4, not the historical 12, and this PRESERVES coverage rather than
+        # loosening it. The trainer no longer rotates anchor offsets at pass
+        # boundaries, and {0,4,8} mod 12 unions to exactly {0} mod 4, so one
+        # stride-4 sweep selects the identical anchor set the three stride-12
+        # passes selected; 26,857,712 // 256 == 104,912 leaves the step budget
+        # byte-identical. Keeping stride 12 with one fixed offset would have
+        # covered only 1/12 of frames and wrapped ~3x over that same subset.
+        assert config.streaming_anchor_stride == 4
+        assert config.epoch_anchor_offsets is None
         assert config.save_interval == 10_000
         assert config.checkpoint_policy == "step"
         assert config.rolling_checkpoint_interval == 10_000

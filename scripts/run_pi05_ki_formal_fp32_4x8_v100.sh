@@ -244,7 +244,12 @@ checks = {
     "GA8": config.gradient_accumulation_steps == 8,
     "104912 steps": config.num_train_steps == 104_912,
     "fixed-step mode": config.num_train_epochs is None,
-    "stride12": config.streaming_anchor_stride == 12,
+    # stride 4, not the historical 12. The trainer no longer rotates three
+    # stride-12 offsets (0,4,8) at pass boundaries; {0,4,8} mod 12 unions to
+    # exactly {0} mod 4, so stride 4 reproduces that anchor set in a single
+    # sweep and 26,857,712 // 256 == 104,912 keeps this budget exact. Keeping
+    # stride 12 here would cover only 1/12 of frames and wrap ~3x over it.
+    "stride4": config.streaming_anchor_stride == 4,
     "save10k": config.save_interval == 10_000,
     "val1k": config.val_log_interval == 1_000,
     "val20": config.val_num_batches == 20,
@@ -300,7 +305,7 @@ info "formal arm=${ARM} objective=${ARM_LABEL} config=${CONFIG_NAME}"
 info "code_commit=${ACTUAL_COMMIT} openpi.__file__=${OPENPI_IMPORT_PATH}"
 info "topology=${NUM_NODES}x${GPUS_PER_NODE} world=${TOTAL_GPUS} rank=${NODE_RANK}"
 info "FP32 ZeRO-2 CPU-offload B1/GPU GA8 global_batch=${GLOBAL_BATCH_SIZE}"
-info "steps=104912 passes=34982/34971/34959 boundaries=34982/69953/104912"
+info "steps=104912 = ONE stride-4 sweep (26,857,712 eligible anchors // global 256); offset passes removed"
 info "save=10000 validation=1000x20 W&B=online project=pi05_ki"
 info "output_root=${PERSISTENT_OUTPUT_ROOT} prefix_kv_reuse=DISABLED"
 info "============================================================"

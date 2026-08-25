@@ -124,6 +124,49 @@ _HL_PI05_BASE_CKPT = (
 #   h20_fastce_scan/run_exhaustive_gate.sh <P|W|/abs/path/norm_stats.json> <cap> <workers>
 _H20_FAST_ACTION_TOKEN_MAX_LEN = 256
 
+# Shared schedule/data recipe for the two H20 formal arms. Held in one place so
+# the A/B comparison cannot drift on anything except the warm-start package.
+#
+# Nothing here is a step budget: ``num_train_steps=0`` and ``decay_steps=0`` are
+# sentinels meaning "derive at runtime". train_accelerate.py computes
+#   steps_per_epoch = eligible_anchors // global_batch
+#   num_train_steps = num_train_epochs * steps_per_epoch
+#   decay_steps     = num_train_steps            (auto-set when <= 0)
+# so changing the batch or the stride rescales the budget automatically instead
+# of silently changing how much data a fixed step count covers.
+#
+# num_train_epochs=1 is ONE full stride-4 sweep. The previous recipe's three
+# stride-12 passes (offsets 0/4/8) union to exactly this same anchor set, so
+# this preserves the historical sample budget of 26,857,472 exactly while
+# removing the decomposition and its two mid-run dataloader rebuilds.
+#
+# peak_lr 2e-5 is sqrt scaling of the 1e-5 used at global batch 256
+# (1e-5 * sqrt(1024/256) = 2e-5). Sqrt rather than linear because the optimizer
+# is AdamW, whose update is normalized by the gradient RMS and is therefore
+# largely invariant to gradient scale -- the linear rule's SGD derivation does
+# not transfer. The deciding factor is risk asymmetry: too low still trains and
+# still answers the backbone question, too high risks divergence and warm-start
+# damage across days of 32 H20.
+#
+# The two cadences are expressed in SAMPLES, not steps, because a step-valued
+# cadence silently changes meaning when the batch changes. Both reproduce the
+# historical cadence exactly at the new batch:
+#   val  256,000 samples // 1024 =  250 steps  (was 1,000 steps @ 256)
+#   save 2,560,000 samples // 1024 = 2,500 steps  (was 10,000 steps @ 256)
+_H20_FORMAL_RECIPE = {
+    "batch_size_per_gpu": 32,
+    "gradient_accumulation_steps": 1,
+    "num_train_epochs": 1,
+    "num_train_steps": 0,
+    "decay_steps": 0,
+    "warmup_steps": 250,
+    "peak_lr": 2e-5,
+    "decay_lr": 0.0,
+    "streaming_anchor_stride": 4,
+    "val_interval_samples": 1_000 * 256,
+    "save_interval_samples": 10_000 * 256,
+}
+
 
 def _make_b1k_subtask_data_config(episodes_index: list[int] | None = None) -> LeRobotB1KDataConfig:
     """Shared B1K data config with subtask annotations.
@@ -687,8 +730,10 @@ def _make_pi05_ki_joint_full_task_set_config(
     save_interval: int = 10_000,
     val_log_interval: int = 1_000,
     val_num_batches: int = 20,
+    val_interval_samples: int | None = None,
+    save_interval_samples: int | None = None,
     log_interval: int = 10,
-    streaming_anchor_stride: int = 12,
+    streaming_anchor_stride: int = 1,
     action_repr: str = "query_mse",
     action_token_max_len: int = 64,
     precision: str = "bfloat16",
@@ -721,8 +766,11 @@ def _make_pi05_ki_joint_full_task_set_config(
     the Skill-Bridge variant runs with the standard stride-1 data loader and
     the caller's ``num_train_epochs`` / ``num_train_steps`` budget.
 
-    ``streaming_anchor_stride`` (default 12, matching the formal control) pins
-    the B1K chunk-streaming anchor stride for the *training* loader. It is
+    ``streaming_anchor_stride`` (default 1 == every frame is an anchor) pins
+    the B1K chunk-streaming anchor stride for the *training* loader. The
+    default is deliberately the identity: a stride is a data-subsampling
+    policy, so any config that subsamples must say so at its own call site
+    rather than inheriting it invisibly from this signature. It is
     stored on ``TrainConfig``; the trainer applies it by setting
     ``OPENPI_B1K_ANCHOR_STRIDE`` scoped to the train-loader construction. The
     validation loader always runs with the baseline stride-1 / no-drop
@@ -797,6 +845,8 @@ def _make_pi05_ki_joint_full_task_set_config(
         log_interval=log_interval,
         val_log_interval=val_log_interval,
         val_num_batches=val_num_batches,
+        val_interval_samples=val_interval_samples,
+        save_interval_samples=save_interval_samples,
         streaming_anchor_stride=streaming_anchor_stride,
         epoch_anchor_offsets=epoch_anchor_offsets,
     )
@@ -924,6 +974,21 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # This is the non-Skill-Bridge control (Tracking Run 2). Left untouched.
     _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
+        # stride/budget were previously inherited from the factory defaults.
+        # They are now explicit because the factory default became stride 1.
+        #
+        # stride is 4, NOT the historical 12. These configs used to rely on the
+        # trainer rotating three stride-12 offsets (0, 4, 8) at pass boundaries;
+        # that machinery is gone, and stride 12 with a single fixed offset would
+        # cover only 1/12 of frames and wrap ~3x over the same subset, silently
+        # cutting unique data to 33.3% with no visible effect on the loss curve.
+        # {0,4,8} mod 12 unions to exactly {0} mod 4, so stride 4 reproduces the
+        # old three-pass anchor set exactly, and one stride-4 sweep at global
+        # batch 256 is 26,857,712 // 256 = 104,912 steps -- identical to the
+        # budget below. Coverage and step count are both preserved exactly.
+        num_train_steps=104_912,
+        decay_steps=104_912,
+        streaming_anchor_stride=4,
     ),
     # Variant A of the same control: identical data, schedule, batch size, flow
     # expert and knowledge insulation, with the backbone action objective
@@ -934,6 +999,11 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_fast_b1k-full_task-ki_on_bf16",
         action_repr="fast_ce",
+        # See sibling above: previously implicit factory defaults, now explicit,
+        # and stride 4 rather than 12 for the same union-identity reason.
+        num_train_steps=104_912,
+        decay_steps=104_912,
+        streaming_anchor_stride=4,
     ),
     # Formal 4x8 V100 FP32 pair. B1/GPU x world32 x GA8 preserves the formal
     # global batch 256, optimizer-step budget, pass boundaries and exposure.
@@ -947,6 +1017,13 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         batch_size_per_gpu=1,
         gradient_accumulation_steps=8,
         action_repr="fast_ce",
+        # Previously implicit factory defaults, now explicit (factory default
+        # stride became 1), and stride 4 rather than 12: see the on_bf16 sibling
+        # above -- {0,4,8} mod 12 == {0} mod 4, so stride 4 reproduces the old
+        # three-pass coverage exactly and 104,912 steps is exactly one sweep.
+        num_train_steps=104_912,
+        decay_steps=104_912,
+        streaming_anchor_stride=4,
         # Exhaustive formal train population: 26,857,712 chunks, max 199 tokens
         # including BOS/EOS, p99.9=99, and 30,554 chunks >96. Cap 208 is the
         # smallest 16-aligned value >=199 (+9 tokens, 4.52% headroom); any input
@@ -967,6 +1044,13 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         batch_size_per_gpu=1,
         gradient_accumulation_steps=8,
         action_repr="query_mse",
+        # Previously implicit factory defaults, now explicit (factory default
+        # stride became 1), and stride 4 rather than 12: see the on_bf16 sibling
+        # above -- {0,4,8} mod 12 == {0} mod 4, so stride 4 reproduces the old
+        # three-pass coverage exactly and 104,912 steps is exactly one sweep.
+        num_train_steps=104_912,
+        decay_steps=104_912,
+        streaming_anchor_stride=4,
         precision="float32",
     ),
     # Matched 4x8 V100 FP32 debug pair. These deliberately use B1 and a five-
@@ -1098,9 +1182,28 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # Formal 4x8 NVIDIA_H20 BF16 Variant A pair: two warm-start packages.
     #
     # This is a controlled two-arm experiment. Everything is held identical --
-    # model, objective (fast_ce), FAST capacity, data root, schedule, B8/GA1
-    # global batch 256, stride-12 three-pass rotation with offsets (0, 4, 8), the
-    # fixed 104,912-step budget -- EXCEPT the warm-start package.
+    # model, objective (fast_ce), FAST capacity, data root, schedule, B32/GA1
+    # global batch 1024, a single stride-4 sweep, and the epoch-derived
+    # optimizer-step budget -- EXCEPT the warm-start package.
+    #
+    # DATA POLICY (was: "stride-12 three-pass rotation with offsets (0,4,8)").
+    # Those three passes were an unnecessary decomposition of ONE stride-4
+    # epoch: the anchor sets {0,4,8} mod 12 union to exactly {0} mod 4, so the
+    # rotation re-derived a stride-4 sweep in three pieces and paid for it with
+    # two mid-training dataloader rebuilds. Verified against the episode
+    # metadata (meta/episodes.jsonl, action_horizon=32, first 180 sorted
+    # episodes of each of the 50 tasks):
+    #   raw train frames                       107,696,389
+    #   horizon-eligible anchors @ stride 4      26,857,712
+    #   @ stride 12 offsets 0/4/8   8,955,603 + 8,952,584 + 8,949,525
+    #                                         =  26,857,712   (union delta 0)
+    #   //256 -> 34,982 + 34,971 + 34,959      =     104,912 steps  (old budget)
+    #   //1024 (one sweep)                     =      26,228 steps  (new budget)
+    # Both consume 26,857,472 samples, so the sample budget is UNCHANGED; only
+    # the decomposition and the batch differ. Sample ORDER does change
+    # (interleaved stride-4 rather than three offset-blocked sweeps), so step
+    # metrics are not bit-comparable with runs before this commit.
+    # ------------------------------------------------------------------
     #
     #   h20_bf16          Arm A "comet base": pi05-b1kpt50-cs32 + its own assets
     #                     (norm_stats d66ed168…). Team Comet's B1K fine-tune;
@@ -1133,6 +1236,7 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         action_repr="fast_ce",
         action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
         precision="bfloat16",
+        **_H20_FORMAL_RECIPE,
     ),
     _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16",
@@ -1142,6 +1246,7 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         action_repr="fast_ce",
         action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
         precision="bfloat16",
+        **_H20_FORMAL_RECIPE,
     ),
     # Bounded H20 smoke pair. These exist because the formal contract in
     # train_accelerate.py hard-pins num_train_steps=104,912, so a short run
