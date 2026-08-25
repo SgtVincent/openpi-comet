@@ -137,10 +137,14 @@ class _TwoPhaseUpdateController:
     microbatch, so using that wrapper twice would update and clear gradients
     after the backbone phase before the expert phase runs.
 
-    For DeepSpeed, this adapter drives the engine directly: both disjoint phase
-    backwards inherit the outer ``accelerator.sync_gradients`` boundary so
-    ZeRO-2 finalizes both parameter groups, while ``engine.step()`` is called
-    exactly once after both graphs only at that boundary. DeepSpeed performs
+    For DeepSpeed, this adapter drives the engine directly. Only the LAST phase
+    of an iteration may declare the ``accelerator.sync_gradients`` boundary:
+    DeepSpeed's ``set_gradient_accumulation_boundary`` contract requires False on
+    every backward except the final one, then a single True followed by one
+    ``engine.step()``. Under ZeRO-2 the gradient source is ``param.grad``, which
+    the boundary epilogue clears, so declaring a boundary on an earlier phase
+    discards that phase's gradients and its parameter group is committed with
+    zeros -- i.e. those parameters never move. DeepSpeed performs
     its real optimizer step and gradient clear inside ``engine.step()``. The
     non-DeepSpeed path deliberately retains Accelerate's normal backward and
     optimizer semantics.
@@ -157,18 +161,23 @@ class _TwoPhaseUpdateController:
     def is_deepspeed(self) -> bool:
         return self._is_deepspeed
 
-    def backward(self, loss: torch.Tensor) -> None:
-        """Backpropagate one phase under the outer accumulation boundary."""
+    def backward(self, loss: torch.Tensor, *, final_phase: bool = True) -> None:
+        """Backpropagate one phase under the outer accumulation boundary.
+
+        ``final_phase`` MUST be False for every phase except the last one in the
+        iteration; see the class docstring for why a second True silently zeroes
+        the earlier phase's parameter group under ZeRO-2.
+        """
 
         if not self._is_deepspeed:
             self._accelerator.backward(loss)
             return
 
-        # ZeRO-2 finalizes only parameters participating in a boundary
-        # backward. The two KI phases own disjoint groups, so both must inherit
-        # the outer boundary on the final accumulation microbatch. The update
-        # remains deferred until the single engine.step after both phases.
-        boundary = bool(self._accelerator.sync_gradients)
+        # Only the LAST phase may declare the accumulation boundary. ZeRO-2 reads
+        # param.grad, which the boundary epilogue clears, so declaring it on an
+        # earlier phase discards that phase's gradients. The update remains
+        # deferred until the single engine.step after both phases.
+        boundary = bool(self._accelerator.sync_gradients) and final_phase
         self._engine.set_gradient_accumulation_boundary(boundary)
         self._engine.backward(loss)
 
@@ -4557,9 +4566,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         continue
 
-                    # Backbone backward inherits the outer boundary so ZeRO-2
-                    # finalizes the backbone group, but no update happens yet.
-                    two_phase_update.backward(bb_loss)
+                    # Backbone is the FIRST phase, so it must NOT declare the
+                    # accumulation boundary: ZeRO-2's boundary epilogue clears
+                    # param.grad, which would discard these gradients before the
+                    # single engine.step below.
+                    two_phase_update.backward(bb_loss, final_phase=False)
 
                     # Capture scalar metrics only on rank 0. The old code called
                     # .item() for every component on all 64 ranks even though only
