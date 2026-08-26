@@ -1250,6 +1250,20 @@ def build_val_datasets(config: _config.TrainConfig):
                 drop_last=True,
                 pin_memory=torch.cuda.is_available(),
                 **({"prefetch_factor": 2} if int(config.num_workers) > 0 else {}),
+                # Keep the val workers alive across validations. This loader is
+                # built ONCE per run (build_val_datasets is called only at setup)
+                # but `_DeterministicValLoader.__iter__` re-enters it at every
+                # validation, so without this the workers are torn down and
+                # re-forked ~105 times x world_size x num_workers. This loader
+                # has no `multiprocessing_context`, so those are Linux fork()s,
+                # and each one is a chance to inherit a lock the parent happens
+                # to hold (a run died at step 5990 with a val worker blocked
+                # forever on wandb's SockClient._lock, taking all 32 ranks down
+                # via the NCCL watchdog). Persistent workers collapse that to a
+                # single fork per run. Safe here because the sampler is
+                # shuffle=False, so re-iteration replays the identical fixed
+                # order; PyTorch raises if this is set with num_workers=0.
+                **({"persistent_workers": True} if int(config.num_workers) > 0 else {}),
             )
             loader = _DeterministicValLoader(loader, val_dc, subset, coverage)
             return loader, val_dc
