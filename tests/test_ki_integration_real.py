@@ -26,7 +26,7 @@ Run with (requires transformers==4.53.2)::
 
     PYTHONNOUSERSITE=1 PYTHONPATH=src python -m pytest tests/test_ki_integration_real.py -v
 
-Test groups (8 groups, 22 tests):
+Test groups (9 groups, 24 tests):
   1. KI gap existence + _detach_kv_cache effectiveness (attached → detached)
   2. KI-OFF baseline: flow loss leaks to backbone KV projs
   3. CE loss → zero expert grads (already clean direction)
@@ -35,22 +35,25 @@ Test groups (8 groups, 22 tests):
   6. Optimizer groups: backbone/expert param sets disjoint
   7. Query MSE: grads reach backbone (query_head + query_emb) but not expert
   8. Combined loss + KI: correct gradient routing, zero cross-contamination
+  9. Train+GC expert suffix: exact prefix cache delivery and conditioning effect
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 
 import pytest
 import torch
-import torch.nn.functional as F
 from torch import nn
+import torch.nn.functional as F
 
 from openpi.models.gemma import Config
+from openpi.models_pytorch.cache_utils import PreserveCacheLen
+from openpi.models_pytorch.cache_utils import get_cache_seq_len
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 from openpi.models_pytorch.pi05_ki_joint_query import _detach_kv_cache
-
 
 # ===========================================================================
 #  Helpers
@@ -1106,3 +1109,119 @@ class TestCombinedLossKiCorrectRouting:
         _zero_all(model.parameters(), s["lm_head"].parameters(),
                   s["query_head"].parameters(), s["action_out"].parameters(),
                   [s["query_emb"]])
+
+
+class TestExpertPrefixCacheWithGradientCheckpointing:
+    """Real HF regression for the Phase-2 cached expert suffix path."""
+
+    @staticmethod
+    def _run_suffix(model, suffix, prefix_len, cache):
+        with PreserveCacheLen(cache) if cache is not None else contextlib.nullcontext():
+            return _expert_forward_with_cache(model, suffix, prefix_len, cache)
+
+    def test_train_gc_preserves_prefix_conditioning_and_expert_gradients(self, model, caplog):
+        batch_size, prefix_len, suffix_len, width = 1, 5, 3, 128
+        device = next(model.parameters()).device
+        prefix_a = torch.randn(batch_size, prefix_len, width, device=device)
+        prefix_b = prefix_a + torch.linspace(0.5, 1.5, width, device=device)
+        suffix = torch.randn(batch_size, suffix_len, width, device=device)
+
+        def build_cache(prefix):
+            cache = _build_prefix_cache(model, prefix)
+            assert cache is not None
+            assert all(get_cache_seq_len(cache, layer_idx=i) == prefix_len for i in range(len(cache.key_cache)))
+            return cache
+
+        expert = model.gemma_expert
+        expert_layers = list(expert.model.layers)
+        original_training = model.training
+        try:
+            model.train()
+            expert.gradient_checkpointing_disable()
+            reference = self._run_suffix(model, suffix, prefix_len, build_cache(prefix_a)).detach()
+
+            expert.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False, "preserve_rng_state": True}
+            )
+            assert expert.is_gradient_checkpointing
+            assert all(layer.gradient_checkpointing for layer in expert_layers)
+
+            cache_a = build_cache(prefix_a)
+            cache_tensors = [
+                (cache_a.key_cache[i].detach().clone(), cache_a.value_cache[i].detach().clone())
+                for i in range(len(expert_layers))
+            ]
+            seen_layers = set()
+
+            def make_cache_hook(layer_idx):
+                def assert_cache_present(_module, _args, kwargs):
+                    cache = kwargs.get("past_key_value")
+                    assert cache is cache_a, f"expert layer {layer_idx} did not receive the exact prefix cache"
+                    assert get_cache_seq_len(cache, layer_idx=layer_idx) == prefix_len
+                    expected_key, expected_value = cache_tensors[layer_idx]
+                    assert cache.key_cache[layer_idx].shape == expected_key.shape
+                    assert cache.value_cache[layer_idx].shape == expected_value.shape
+                    assert torch.equal(cache.key_cache[layer_idx], expected_key)
+                    assert torch.equal(cache.value_cache[layer_idx], expected_value)
+                    seen_layers.add(layer_idx)
+
+                return assert_cache_present
+
+            handles = [
+                layer.register_forward_pre_hook(make_cache_hook(i), with_kwargs=True)
+                for i, layer in enumerate(expert_layers)
+            ]
+            try:
+                caplog.clear()
+                rng_before = torch.get_rng_state()
+                gc_output = self._run_suffix(model, suffix, prefix_len, cache_a)
+                assert torch.equal(torch.get_rng_state(), rng_before)
+            finally:
+                for handle in handles:
+                    handle.remove()
+
+            cache_warning = "Caching is incompatible with gradient checkpointing in GemmaDecoderLayer"
+            assert sum(cache_warning in record.getMessage() for record in caplog.records) == 0
+            assert seen_layers == set(range(len(expert_layers)))
+            assert all(layer.gradient_checkpointing for layer in expert_layers)
+            assert all(get_cache_seq_len(cache_a, layer_idx=i) == prefix_len for i in range(len(expert_layers)))
+            assert torch.allclose(gc_output, reference, rtol=1e-5, atol=1e-6)
+
+            different_prefix = self._run_suffix(model, suffix, prefix_len, build_cache(prefix_b)).detach()
+            assert not torch.allclose(gc_output.detach(), different_prefix, rtol=1e-5, atol=1e-6)
+
+            no_cache_output = self._run_suffix(model, suffix, prefix_len, None).detach()
+            assert not torch.allclose(gc_output.detach(), no_cache_output, rtol=1e-5, atol=1e-6)
+
+            model.zero_grad(set_to_none=True)
+            gc_output.square().mean().backward()
+            expert_grads = [parameter.grad for parameter in expert.model.parameters() if parameter.requires_grad]
+            assert all(grad is None or torch.isfinite(grad).all() for grad in expert_grads)
+            assert any(grad is not None and grad.abs().max().item() > 0.0 for grad in expert_grads)
+        finally:
+            expert.gradient_checkpointing_disable()
+            model.train(original_training)
+            model.zero_grad(set_to_none=True)
+
+    def test_cached_suffix_exception_restores_expert_gc_state(self, model, monkeypatch):
+        expert = model.gemma_expert
+        expert_layers = list(expert.model.layers)
+        original_training = model.training
+        try:
+            model.train()
+            expert.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False, "preserve_rng_state": True}
+            )
+            cache = _build_prefix_cache(model, torch.randn(1, 2, 128))
+
+            def fail_forward(**_kwargs):
+                assert all(not layer.gradient_checkpointing for layer in expert_layers)
+                raise RuntimeError("intentional cached-suffix failure")
+
+            monkeypatch.setattr(expert.model, "forward", fail_forward)
+            with pytest.raises(RuntimeError, match="intentional cached-suffix failure"):
+                _expert_forward_with_cache(model, torch.randn(1, 1, 128), 2, cache)
+            assert all(layer.gradient_checkpointing for layer in expert_layers)
+        finally:
+            expert.gradient_checkpointing_disable()
+            model.train(original_training)

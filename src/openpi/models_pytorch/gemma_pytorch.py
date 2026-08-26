@@ -1,3 +1,4 @@
+import contextlib
 import math
 from typing import Literal
 
@@ -213,6 +214,41 @@ class PaliGemmaWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
+    @contextlib.contextmanager
+    def _expert_cached_suffix_forward(self, past_key_values):
+        """Keep a nonempty expert prefix cache intact under recursive HF GC.
+
+        Transformers 4.53 checkpointing is owned by each decoder layer. In
+        training mode its wrapper replaces a nonempty ``past_key_value`` with
+        ``None`` before the layer runs, silently removing PI05-KI Phase-2 prefix
+        conditioning. The cached suffix pass cannot use that layer-owned wrapper,
+        so disable only those expert layer flags for this one forward and restore
+        their exact state afterward. Backbone/Phase-1 and dual-stream forwards
+        keep their configured checkpointing policy.
+        """
+        layers = self.gemma_expert.model.layers
+        checkpoint_states = [
+            (layer, layer.gradient_checkpointing)
+            for layer in layers
+            if hasattr(layer, "gradient_checkpointing")
+        ]
+        must_bypass_layer_gc = (
+            past_key_values is not None
+            and self.training
+            and any(enabled for _layer, enabled in checkpoint_states)
+        )
+        if not must_bypass_layer_gc:
+            yield
+            return
+
+        try:
+            for layer, _enabled in checkpoint_states:
+                layer.gradient_checkpointing = False
+            yield
+        finally:
+            for layer, enabled in checkpoint_states:
+                layer.gradient_checkpointing = enabled
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -237,14 +273,15 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
-            )
+            with self._expert_cached_suffix_forward(past_key_values):
+                suffix_output = self.gemma_expert.model.forward(
+                    inputs_embeds=inputs_embeds[1],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                )
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
