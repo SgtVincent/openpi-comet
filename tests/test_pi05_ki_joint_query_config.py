@@ -623,6 +623,8 @@ def test_full_task_bf16_hl_contract():
 
 def test_full_task_bf16_launcher_contract():
     """HL launcher should retain full-task, cache, topology, and budget defaults."""
+    from openpi.training.train_config import get_config
+
     launcher = _FULL_TASK_BF16_LAUNCHER
     script = launcher.read_text()
 
@@ -645,10 +647,19 @@ def test_full_task_bf16_launcher_contract():
     assert 'GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"' in script
     assert 'WARMUP_STEPS="${WARMUP_STEPS:-1000}"' in script
     assert 'PEAK_LR="${PEAK_LR:-1e-5}"' in script
-    assert 'FRAME_ANCHOR_STRIDE="${FRAME_ANCHOR_STRIDE:-12}"' in script
-    assert 'FRAME_ANCHOR_OFFSETS="${FRAME_ANCHOR_OFFSETS:-0,4,8}"' in script
+    # Stride 4 / single offset 0, not the historical stride 12 / offsets 0,4,8.
+    # This PRESERVES the anchor set rather than loosening it: the trainer no longer
+    # rotates offsets at pass boundaries, and {0,4,8} mod 12 unions to exactly {0}
+    # mod 4, so one stride-4 sweep selects the same anchors the three stride-12
+    # passes selected, with 26,857,712 // 256 == 104,912 keeping the step budget
+    # identical. FRAME_ANCHOR_* are now informational; OPENPI_B1K_ANCHOR_STRIDE is
+    # the value the dataset actually reads and it must equal the config's stride,
+    # or the trainer's formal contract validator fails closed on the mismatch.
+    assert 'FRAME_ANCHOR_STRIDE="${FRAME_ANCHOR_STRIDE:-4}"' in script
+    assert 'FRAME_ANCHOR_OFFSETS="${FRAME_ANCHOR_OFFSETS:-0}"' in script
     assert 'DROP_INCOMPLETE_ACTION_HORIZON="${DROP_INCOMPLETE_ACTION_HORIZON:-1}"' in script
-    assert 'export OPENPI_B1K_ANCHOR_STRIDE="12"' in script
+    assert 'export OPENPI_B1K_ANCHOR_STRIDE="4"' in script
+    assert get_config(_FULL_TASK_BF16_CONFIG).streaming_anchor_stride == 4
     assert 'export OPENPI_B1K_ANCHOR_OFFSET="0"' in script
     assert 'export OPENPI_B1K_DROP_INCOMPLETE_HORIZON="1"' in script
     assert 'export OPENPI_PERSISTENT_WORKERS="${OPENPI_PERSISTENT_WORKERS:-0}"' in script

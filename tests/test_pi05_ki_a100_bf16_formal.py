@@ -68,6 +68,8 @@ def test_a100_configs_are_exactly_matched_outside_objective():
         assert cfg.streaming_anchor_stride == 4
         assert cfg.epoch_anchor_offsets == [0, 1, 2, 3]
         assert cfg.save_interval == 10_000
+        assert cfg.checkpoint_policy == "epoch_with_rolling"
+        assert cfg.rolling_checkpoint_interval == 10_000
         assert cfg.val_log_interval == 1_000
         assert cfg.val_num_batches == 20
         assert cfg.lr_schedule.warmup_steps == 1_000

@@ -1,5 +1,12 @@
 # ruff: noqa: SLF001 - focused tests intentionally exercise private lean-mode helpers.
-"""Focused CPU tests for the lean formal B1K stride-12 mode."""
+"""Focused CPU tests for the lean formal B1K streaming-anchor mode.
+
+The filename is historical: the formal families ran stride 12 with a rotating
+offset when it was written. They now run a single stride-4 sweep, which selects
+the same anchor set ({0,4,8} mod 12 == {0} mod 4) with the same step budget. The
+stride-12 values that remain below are dataset/env arithmetic FIXTURES, not
+config expectations.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ from pathlib import Path
 import sys
 from types import ModuleType
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -284,13 +292,60 @@ def trainer():
     return _load_train_accelerate()
 
 
+# The formal contract table holds two schedule FORMS, so one flat stub can no
+# longer describe every formal name:
+#
+#   LEGACY fixed budget (``_on_bf16``, ``_on_v100_fp32``) -- num_train_epochs is
+#       None and the 104,912-step budget is a literal, with decay_steps equal to
+#       it.
+#   DERIVED budget (``_on_h20_*_bf16``) -- num_train_epochs is set and
+#       num_train_steps / decay_steps are 0 sentinels meaning "compute from
+#       epochs x steps_per_epoch at runtime".
+#
+# BOTH forms now run stride 4, so the stride is no longer what distinguishes them.
+# The legacy families moved 12 -> 4 when the offset rotation was deleted: they had
+# relied on the trainer rotating offsets 0/4/8 across three stride-12 passes, and
+# {0,4,8} mod 12 unions to exactly {0} mod 4, so a single stride-4 sweep selects
+# the identical anchor set while 26,857,712 // 256 == 104,912 keeps their step
+# budget unchanged. Coverage preserved, not loosened.
+#
+# Both dicts mirror the registered configs; the real values are pinned against
+# get_config() by test_formal_config_exact_budget_and_online_wandb here, by
+# tests/test_pi05_ki_v100_fp32_formal.py for the FP32 pair, and by
+# tests/test_pi05_ki_h20_bf16_two_arm.py for the H20 pair.
+_LEGACY_FORMAL_SCHEDULE = {
+    "num_train_steps": 104_912,
+    "num_train_epochs": None,
+    "decay_steps": 104_912,
+    "warmup_steps": 1_000,
+    "peak_lr": 1e-5,
+    "streaming_anchor_stride": 4,
+}
+_DERIVED_FORMAL_SCHEDULE = {
+    "num_train_steps": 0,
+    "num_train_epochs": 1,
+    "decay_steps": 0,
+    "warmup_steps": 250,
+    "peak_lr": 2e-5,
+    "streaming_anchor_stride": 4,
+}
+
+
 def _formal_config_stub(
     *,
     name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
     resume=False,
     prepare_only=False,
 ):
-    is_v100 = name.endswith("_v100_fp32")
+    is_v100 = "_v100_fp32" in name
+    is_h20 = "_on_h20_" in name
+    schedule = _DERIVED_FORMAL_SCHEDULE if is_h20 else _LEGACY_FORMAL_SCHEDULE
+    if is_v100:
+        batch_size_per_gpu, gradient_accumulation_steps = 1, 8
+    elif is_h20:
+        batch_size_per_gpu, gradient_accumulation_steps = 32, 1
+    else:
+        batch_size_per_gpu, gradient_accumulation_steps = 8, 1
 
     def data_config(episodes):
         return SimpleNamespace(
@@ -306,27 +361,29 @@ def _formal_config_stub(
         pytorch_model_name=("pi05_ki_joint_fast" if "joint_fast" in name else "pi05_ki_joint_query"),
         data=[data_config(list(range(180)))],
         val_data=[data_config(list(range(180, 200)))],
-        batch_size_per_gpu=1 if is_v100 else 8,
-        gradient_accumulation_steps=8 if is_v100 else 1,
+        batch_size_per_gpu=batch_size_per_gpu,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        expected_global_batch=(256 if is_v100 else 1024 if is_h20 else 256),
         pytorch_training_precision="float32" if is_v100 else "bfloat16",
         accelerate_mixed_precision="no" if is_v100 else "bf16",
-        num_train_steps=104_912,
-        num_train_epochs=None,
+        num_train_steps=schedule["num_train_steps"],
+        num_train_epochs=schedule["num_train_epochs"],
         save_interval=10_000,
-        checkpoint_policy="step",
+        checkpoint_policy=("epoch_with_rolling" if is_h20 else "step"),
         rolling_checkpoint_interval=10_000,
         val_log_interval=1_000,
         val_num_batches=20,
-        streaming_anchor_stride=12,
+        streaming_anchor_stride=schedule["streaming_anchor_stride"],
+        epoch_anchor_offsets=None,
         overwrite=False,
         wandb_enabled=True,
         project_name="pi05_ki",
         resume=resume,
         prepare_hf_cache_only=prepare_only,
         lr_schedule=SimpleNamespace(
-            warmup_steps=1_000,
-            peak_lr=1e-5,
-            decay_steps=104_912,
+            warmup_steps=schedule["warmup_steps"],
+            peak_lr=schedule["peak_lr"],
+            decay_steps=schedule["decay_steps"],
             decay_lr=0.0,
         ),
     )
@@ -344,7 +401,16 @@ class _FakeDeepSpeedOptimizer:
 
 
 class _FakeDeepSpeedEngine:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        cpu_offload=False,
+        offload_device=None,
+        param_offload=None,
+        partial_offload=1.0,
+        stage=2,
+        version="0.18.8",
+    ):
         self.boundaries = []
         self.backward_phases = []
         self.gradients = {"backbone": 0, "expert": 0}
@@ -353,8 +419,32 @@ class _FakeDeepSpeedEngine:
         self.step_gradients = []
         self.step_calls = 0
         self.optimizer = _FakeDeepSpeedOptimizer(self)
+        self.optimizer.cpu_offload = cpu_offload
         self._boundary = None
         self._global_grad_norm = None
+        self._cpu_offload = cpu_offload
+        self._offload_device = offload_device or ("cpu" if cpu_offload else None)
+        self._param_offload = param_offload
+        self._partial_offload = partial_offload
+        self._stage = stage
+        self._version = version
+
+    def zero_optimization_stage(self):
+        return self._stage
+
+    def zero_offload_optimizer(self):
+        if self._offload_device is None:
+            return None
+        return SimpleNamespace(device=self._offload_device)
+
+    def zero_offload_param(self):
+        return self._param_offload
+
+    def zero_cpu_offload(self):
+        return self._cpu_offload
+
+    def zero_partial_offload(self):
+        return self._partial_offload
 
     def set_gradient_accumulation_boundary(self, boundary):
         self._boundary = bool(boundary)
@@ -364,9 +454,10 @@ class _FakeDeepSpeedEngine:
         self.backward_phases.append(phase)
         self.gradients[phase] += 1
         if self._boundary:
-            # Model CPU-offload ZeRO-2 behavior: only the parameter group
-            # participating in a boundary backward is finalized for update.
-            self.finalized_gradients[phase] = self.gradients[phase]
+            # The measured no-offload FT arm commits both accumulated groups at
+            # the final boundary. Optimizer-offload modes are rejected before
+            # this fake can execute a backward.
+            self.finalized_gradients = dict(self.gradients)
 
     def step(self):
         assert self._boundary is True
@@ -393,8 +484,24 @@ class _FakeOptimizer:
         self.zero_grad_calls += 1
 
 
-def _deepspeed_controller(trainer):
-    engine = _FakeDeepSpeedEngine()
+def _deepspeed_controller(
+    trainer,
+    *,
+    cpu_offload=False,
+    offload_device=None,
+    param_offload=None,
+    partial_offload=1.0,
+    stage=2,
+    version="0.18.8",
+):
+    engine = _FakeDeepSpeedEngine(
+        cpu_offload=cpu_offload,
+        offload_device=offload_device,
+        param_offload=param_offload,
+        partial_offload=partial_offload,
+        stage=stage,
+        version=version,
+    )
 
     def fail_pre_step_clip(*_args, **_kwargs):
         pytest.fail("DeepSpeed KI must not read the pre-step cached grad norm")
@@ -402,36 +509,44 @@ def _deepspeed_controller(trainer):
     accelerator = SimpleNamespace(
         distributed_type=trainer.DistributedType.DEEPSPEED,
         sync_gradients=False,
+        is_main_process=True,
         deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
         clip_grad_norm_=fail_pre_step_clip,
     )
-    return trainer._TwoPhaseUpdateController(accelerator), accelerator, engine
+    with mock.patch.object(trainer.importlib_metadata, "version", return_value=version):
+        controller = trainer._TwoPhaseUpdateController(accelerator)
+    return controller, accelerator, engine
 
 
-def test_disjoint_zero2_groups_require_both_boundary_backwards():
-    engine = _FakeDeepSpeedEngine()
+def test_disjoint_zero2_no_offload_requires_first_phase_false_boundary():
+    engine = _FakeDeepSpeedEngine(cpu_offload=False)
     engine.set_gradient_accumulation_boundary(False)
     engine.backward("backbone")
     engine.set_gradient_accumulation_boundary(True)
     engine.backward("expert")
     engine.step()
 
-    # This is the old [False, True] sequence seen in the GPU smoke: the
-    # backbone has raw gradients but never reaches the CPU optimizer state.
+    # Without optimizer offload, [False, True] retains both phases until one step.
+    assert engine.boundaries == [False, True]
     assert engine.step_calls == 1
-    assert engine.step_gradients == [{"backbone": 0, "expert": 1}]
-    assert engine.optimizer_moments == {"backbone": 0, "expert": 1}
+    assert engine.step_gradients == [{"backbone": 1, "expert": 1}]
+    assert engine.optimizer_moments == {"backbone": 1, "expert": 1}
 
 
+@pytest.mark.parametrize("stage", [1, 2])
 @pytest.mark.parametrize("grad_accum", [1, 8])
-def test_two_phase_deepspeed_updates_once_after_both_phases(trainer, grad_accum):
-    controller, accelerator, engine = _deepspeed_controller(trainer)
+def test_two_phase_deepspeed_no_offload_updates_once_after_both_phases(
+    trainer,
+    grad_accum,
+    stage,
+):
+    controller, accelerator, engine = _deepspeed_controller(trainer, stage=stage)
     optimizer_wrapper = SimpleNamespace()
 
     for microbatch in range(1, grad_accum + 1):
         accelerator.sync_gradients = microbatch == grad_accum
-        controller.backward("backbone")
-        assert engine.boundaries[-1] is accelerator.sync_gradients
+        controller.backward_first_phase("backbone")
+        assert engine.boundaries[-1] is False
         controller.backward("expert")
         assert engine.boundaries[-1] is accelerator.sync_gradients
         reported_grad_norm = controller.step_and_zero_grad(optimizer_wrapper)
@@ -445,7 +560,7 @@ def test_two_phase_deepspeed_updates_once_after_both_phases(trainer, grad_accum)
             assert trainer._grad_norm_to_float(reported_grad_norm) == pytest.approx((2 * grad_accum**2) ** 0.5)
 
     assert engine.backward_phases == ["backbone", "expert"] * grad_accum
-    assert engine.boundaries == [False, False] * (grad_accum - 1) + [True, True]
+    assert engine.boundaries == [False, False] * (grad_accum - 1) + [False, True]
     assert engine.step_calls == 1
     assert engine.step_gradients == [{"backbone": grad_accum, "expert": grad_accum}]
     assert engine.optimizer_moments == {"backbone": grad_accum, "expert": grad_accum}
@@ -462,14 +577,138 @@ def test_deepspeed_grad_norm_is_read_only_after_single_engine_step(trainer):
     assert engine.step_calls == 0
 
     accelerator.sync_gradients = True
-    controller.backward("backbone")
+    controller.backward_first_phase("backbone")
     controller.backward("expert")
     reported_grad_norm = controller.step_and_zero_grad(optimizer_wrapper)
 
-    assert engine.boundaries == [True, True]
+    assert engine.boundaries == [False, True]
     assert engine.step_calls == 1
     assert engine.optimizer.zero_grad_calls == 1
     assert trainer._grad_norm_to_float(reported_grad_norm) == pytest.approx(2**0.5)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"offload_device": "nvme"}, "optimizer offload device=nvme"),
+        ({"offload_device": "future"}, "Unknown DeepSpeed optimizer offload device"),
+        ({"cpu_offload": True}, "optimizer offload device=cpu"),
+    ],
+)
+def test_two_phase_deepspeed_fails_closed_outside_validated_scope(trainer, kwargs, message):
+    engine = _FakeDeepSpeedEngine(**kwargs)
+    accelerator = SimpleNamespace(
+        distributed_type=trainer.DistributedType.DEEPSPEED,
+        sync_gradients=False,
+        is_main_process=True,
+        deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+    )
+    with mock.patch.object(trainer.importlib_metadata, "version", return_value="0.18.8"):
+        with pytest.raises(RuntimeError, match=message):
+            trainer._TwoPhaseUpdateController(accelerator)
+    assert engine.backward_phases == []
+    assert engine.step_calls == 0
+
+
+@pytest.mark.parametrize("missing_api", ["zero_optimization_stage", "zero_offload_optimizer"])
+def test_two_phase_deepspeed_missing_runtime_api_fails_before_backward(trainer, missing_api):
+    engine = _FakeDeepSpeedEngine()
+    setattr(engine, missing_api, None)
+    accelerator = SimpleNamespace(
+        distributed_type=trainer.DistributedType.DEEPSPEED,
+        sync_gradients=False,
+        is_main_process=True,
+        deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+    )
+    with mock.patch.object(trainer.importlib_metadata, "version", return_value="0.18.8"):
+        with pytest.raises(RuntimeError, match="missing two-phase policy APIs"):
+            trainer._TwoPhaseUpdateController(accelerator)
+    assert engine.backward_phases == []
+
+
+def test_two_phase_deepspeed_missing_metadata_fails_before_backward(trainer):
+    engine = _FakeDeepSpeedEngine()
+    accelerator = SimpleNamespace(
+        distributed_type=trainer.DistributedType.DEEPSPEED,
+        sync_gradients=False,
+        is_main_process=True,
+        deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+    )
+    with mock.patch.object(
+        trainer.importlib_metadata,
+        "version",
+        side_effect=trainer.importlib_metadata.PackageNotFoundError("deepspeed"),
+    ):
+        with pytest.raises(RuntimeError, match="runtime metadata is unavailable"):
+            trainer._TwoPhaseUpdateController(accelerator)
+    assert engine.backward_phases == []
+
+
+def test_two_phase_deepspeed_missing_offload_device_fails_before_backward(trainer):
+    engine = _FakeDeepSpeedEngine()
+    engine.zero_offload_optimizer = lambda: SimpleNamespace(device=None)
+    accelerator = SimpleNamespace(
+        distributed_type=trainer.DistributedType.DEEPSPEED,
+        sync_gradients=False,
+        is_main_process=True,
+        deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+    )
+    with mock.patch.object(trainer.importlib_metadata, "version", return_value="0.18.8"):
+        with pytest.raises(RuntimeError, match="offload device is unavailable"):
+            trainer._TwoPhaseUpdateController(accelerator)
+    assert engine.backward_phases == []
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("version", ["0.18.8", "0.19.0"])
+def test_two_phase_cpu_offload_guard_is_actionable_and_exact(trainer, stage, version):
+    with pytest.raises(RuntimeError) as exc_info:
+        _deepspeed_controller(trainer, cpu_offload=True, stage=stage, version=version)
+    assert str(exc_info.value) == (
+        "PI05-KI two-phase training requires multiple engine.backward calls per optimizer step, "
+        f"but DeepSpeed {version} ZeRO-{stage} optimizer offload device=cpu is unsupported by the installed "
+        "runtime. Use reviewed no-offload; do not enable this mode until a runtime containing DeepSpeed "
+        "PR #7981 is source-fingerprint and effect validated. Standard single-backward gradient accumulation "
+        "is unaffected."
+    )
+
+
+def test_two_phase_allows_other_versions_without_optimizer_offload(trainer):
+    controller, _accelerator, engine = _deepspeed_controller(
+        trainer,
+        version="0.19.0",
+    )
+    assert controller.is_deepspeed
+    assert engine.boundaries == []
+
+
+def test_two_phase_allows_zero3_and_param_offload_outside_target_predicate(trainer):
+    controller, _accelerator, engine = _deepspeed_controller(
+        trainer,
+        stage=3,
+        param_offload=object(),
+    )
+    assert controller.is_deepspeed
+    assert engine.boundaries == []
+
+
+def test_two_phase_allows_stage2_param_offload_without_optimizer_offload(trainer):
+    controller, _accelerator, engine = _deepspeed_controller(
+        trainer,
+        stage=2,
+        param_offload=object(),
+        partial_offload=0.5,
+    )
+    assert controller.is_deepspeed
+    assert engine.boundaries == []
+
+
+def test_two_phase_guard_is_scoped_to_the_multi_backward_controller(trainer):
+    """Standard single-backward DeepSpeed code never constructs this guard."""
+
+    source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
+    assert source.count("_TwoPhaseUpdateController(accelerator)") == 1
+    assert "if is_pi05_ki_joint else None" in source
 
 
 def test_two_phase_non_deepspeed_retains_standard_optimizer_semantics(trainer):
@@ -509,19 +748,24 @@ def test_two_phase_non_deepspeed_retains_standard_optimizer_semantics(trainer):
 
 
 def test_all_formal_ab_names_share_pass_wandb_and_resume_guards(trainer, monkeypatch):
-    names = tuple(trainer._FORMAL_B1K_CONFIG_CONTRACTS)
-    assert names == (
+    names = tuple(trainer._FORMAL_B1K_CONFIGS)
+    assert set(names) == {
         "pi05_ki_joint_fast_b1k-full_task-ki_on_bf16",
         "pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
         "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32",
+        "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32_validation10",
         "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32",
-    )
+        "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16",
+        "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16",
+    }
     for name in names:
         config = _formal_config_stub(name=name)
         accelerator = SimpleNamespace(
             num_processes=32,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
-            distributed_type=trainer.DistributedType.DEEPSPEED if name.endswith("_v100_fp32") else "NO",
+            distributed_type=(
+                trainer.DistributedType.DEEPSPEED if "_v100_fp32" in name else "NO"
+            ),
             state=SimpleNamespace(
                 deepspeed_plugin=SimpleNamespace(
                     deepspeed_config={
@@ -533,12 +777,7 @@ def test_all_formal_ab_names_share_pass_wandb_and_resume_guards(trainer, monkeyp
                 )
             ),
         )
-        for key in (
-            *_STREAMING_ENV_KEYS,
-            "FRAME_ANCHOR_STRIDE",
-            "FRAME_ANCHOR_OFFSETS",
-            "OPENPI_PERSISTENT_WORKERS",
-        ):
+        for key in (*_STREAMING_ENV_KEYS, "OPENPI_PERSISTENT_WORKERS"):
             monkeypatch.delenv(key, raising=False)
         trainer._validate_formal_b1k_contract(config, accelerator=accelerator)
         assert trainer._is_formal_b1k_mode(config)
@@ -560,12 +799,7 @@ def test_formal_v100_rejects_deepspeed_contract_drift(
     trainer, monkeypatch, distributed_type, zero_stage, offload_device, message
 ):
     config = _formal_config_stub(name="pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32")
-    for key in (
-        *_STREAMING_ENV_KEYS,
-        "FRAME_ANCHOR_STRIDE",
-        "FRAME_ANCHOR_OFFSETS",
-        "OPENPI_PERSISTENT_WORKERS",
-    ):
+    for key in (*_STREAMING_ENV_KEYS, "OPENPI_PERSISTENT_WORKERS"):
         monkeypatch.delenv(key, raising=False)
     accelerator = SimpleNamespace(
         num_processes=32,
@@ -586,7 +820,23 @@ def test_formal_v100_rejects_deepspeed_contract_drift(
         trainer._validate_formal_b1k_contract(config, accelerator=accelerator)
 
 
-def test_formal_validation_sets_exact_dataset_contract(trainer, monkeypatch):
+@pytest.mark.parametrize(
+    ("name", "stride_override", "expected_stride"),
+    [
+        # Both real formal families now declare stride 4 (see the schedule dicts
+        # above for why the legacy pair moved 12 -> 4 without changing coverage).
+        ("pi05_ki_joint_query_b1k-full_task-ki_on_bf16", None, "4"),
+        ("pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16", None, "4"),
+        # Because both real families agree on 4, a case that agreed with them would
+        # pass even if the validator had hardcoded "4". The override proves what the
+        # deleted literal gate cannot: the exported stride is DERIVED from
+        # config.streaming_anchor_stride, whatever that value is.
+        ("pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16", 7, "7"),
+    ],
+)
+def test_formal_validation_sets_exact_dataset_contract(
+    trainer, monkeypatch, name, stride_override, expected_stride
+):
     for key in (
         *_STREAMING_ENV_KEYS,
         "FRAME_ANCHOR_STRIDE",
@@ -594,31 +844,75 @@ def test_formal_validation_sets_exact_dataset_contract(trainer, monkeypatch):
         "OPENPI_PERSISTENT_WORKERS",
     ):
         monkeypatch.delenv(key, raising=False)
-    accelerator = SimpleNamespace(num_processes=32, gradient_accumulation_steps=1)
+    config = _formal_config_stub(name=name)
+    if stride_override is not None:
+        config.streaming_anchor_stride = stride_override
+    accelerator = SimpleNamespace(
+        num_processes=32,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+    )
 
-    trainer._validate_formal_b1k_contract(_formal_config_stub(), accelerator=accelerator)
+    trainer._validate_formal_b1k_contract(config, accelerator=accelerator)
 
-    assert os.environ["FRAME_ANCHOR_STRIDE"] == "12"
-    assert os.environ["FRAME_ANCHOR_OFFSETS"] == "0,4,8"
-    assert os.environ["OPENPI_B1K_ANCHOR_STRIDE"] == "12"
+    assert os.environ["OPENPI_B1K_ANCHOR_STRIDE"] == expected_stride
     assert os.environ["OPENPI_B1K_ANCHOR_OFFSET"] == "0"
     assert os.environ["OPENPI_B1K_DROP_INCOMPLETE_HORIZON"] == "1"
     assert os.environ["OPENPI_PERSISTENT_WORKERS"] == "0"
+    # The FRAME_ANCHOR_* env contract was removed together with the offset
+    # rotation it configured. Assert it stays removed: silently re-exporting it
+    # would resurrect a second, unread source of truth for the stride.
+    assert "FRAME_ANCHOR_STRIDE" not in os.environ
+    assert "FRAME_ANCHOR_OFFSETS" not in os.environ
+
+
+def _set_dotted(config, field, value):
+    target = config
+    *parents, leaf = field.split(".")
+    for parent in parents:
+        target = getattr(target, parent)
+    setattr(target, leaf, value)
+
+
+_LEGACY_FORMAL_NAME = "pi05_ki_joint_query_b1k-full_task-ki_on_bf16"
+_DERIVED_FORMAL_NAME = "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16"
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
+    ("name", "field", "value", "message"),
     [
-        ("resume", True, "resume is unsupported"),
-        ("batch_size_per_gpu", 4, "batch_size_per_gpu=8"),
-        ("num_train_steps", 1, "num_train_steps=104912"),
-        ("wandb_enabled", False, "wandb_enabled=True"),
+        (_LEGACY_FORMAL_NAME, "resume", True, "resume is unsupported"),
+        (_LEGACY_FORMAL_NAME, "wandb_enabled", False, "wandb_enabled=True"),
+        # The literal "num_train_steps == 104912" gate is gone. Drift is now
+        # caught as an INCONSISTENCY: moving the budget without moving the cosine
+        # decay is what actually breaks the schedule, and it is still rejected.
+        (
+            _LEGACY_FORMAL_NAME,
+            "num_train_steps",
+            1,
+            "decay_steps == num_train_steps",
+        ),
+        (_LEGACY_FORMAL_NAME, "lr_schedule.decay_steps", 50_000, "decay_steps == num_train_steps"),
+        (_LEGACY_FORMAL_NAME, "lr_schedule.decay_lr", 1e-7, "decay_lr=0"),
+        # Derived form: the step fields must stay sentinels, because any literal
+        # there caps or decouples the runtime-derived budget.
+        (_DERIVED_FORMAL_NAME, "num_train_steps", 104_912, "requires num_train_steps=0"),
+        (_DERIVED_FORMAL_NAME, "lr_schedule.decay_steps", 104_912, "requires decay_steps=0"),
+        (_DERIVED_FORMAL_NAME, "num_train_epochs", 0, "num_train_epochs >= 1"),
+        (_DERIVED_FORMAL_NAME, "streaming_anchor_stride", 0, "streaming_anchor_stride >= 1"),
+        # The offset rotation was deleted; a config that still asks for it must
+        # fail closed rather than be silently ignored.
+        (
+            _DERIVED_FORMAL_NAME,
+            "epoch_anchor_offsets",
+            [0, 4, 8],
+            "no longer uses per-epoch anchor offsets",
+        ),
     ],
 )
-def test_formal_validation_rejects_contract_drift(trainer, monkeypatch, field, value, message):
-    config = _formal_config_stub()
-    setattr(config, field, value)
-    for key in (*_STREAMING_ENV_KEYS, "FRAME_ANCHOR_STRIDE", "FRAME_ANCHOR_OFFSETS"):
+def test_formal_validation_rejects_contract_drift(trainer, monkeypatch, name, field, value, message):
+    config = _formal_config_stub(name=name)
+    _set_dotted(config, field, value)
+    for key in _STREAMING_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("OPENPI_PERSISTENT_WORKERS", "0")
     with pytest.raises(ValueError, match=message):
@@ -641,63 +935,37 @@ def test_validation_dataset_env_is_cleared_then_restored(trainer, monkeypatch):
     assert {key: os.environ[key] for key in expected} == expected
 
 
-def test_formal_pass_boundaries_are_continuous_and_require_two_rebuilds(trainer):
-    transitions = []
-    counts = [0, 0, 0]
-    previous_pass = None
-    for global_step in range(104_912):
-        pass_index, offset, pass_steps, pass_start, pass_end = trainer._formal_b1k_pass_for_step(global_step)
-        counts[pass_index] += 1
-        if pass_index != previous_pass:
-            transitions.append((pass_index, offset, pass_steps, pass_start, pass_end))
-            previous_pass = pass_index
-
-    assert transitions == [
-        (0, 0, 34_982, 0, 34_982),
-        (1, 4, 34_971, 34_982, 69_953),
-        (2, 8, 34_959, 69_953, 104_912),
-    ]
-    assert counts == [34_982, 34_971, 34_959]
-    assert len(transitions) - 1 == 2
-    with pytest.raises(ValueError, match="out of range"):
-        trainer._formal_b1k_pass_for_step(104_912)
-
-
-def _gloo_pass_counter_worker(rank, world_size, init_file, pass_specs, queue):
-    torch.distributed.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world_size,
-        init_method=f"file://{init_file}",
+# The three-pass offset rotation is gone, and with it the two tests that drove it:
+# test_formal_pass_boundaries_are_continuous_and_require_two_rebuilds (which walked
+# the per-step pass lookup across all 104,912 steps) and
+# test_two_rank_gloo_pass_counters_finish_without_collective_hang (which proved the
+# per-pass collectives could not hang). Both depended on the pass-spec tables and
+# pass-lookup helpers that no longer exist, and the mid-training loader rebuild
+# whose collective safety the gloo test guarded is no longer performed on the formal
+# path at all. What replaces them is the pair of invariants below: the pass-rotation
+# machinery must stay deleted, and the formal path must stay rotation-free so no
+# mid-run rebuild can reappear. The check is by NAME PATTERN rather than by a list
+# of identifiers, so a near-name reintroduction is caught too.
+def test_formal_pass_rotation_machinery_is_gone_and_the_formal_path_is_rebuild_free(trainer):
+    leftovers = sorted(
+        attr for attr in vars(trainer) if "FORMAL_B1K_PASS" in attr or "formal_b1k_pass" in attr
     )
-    local_counts = []
-    for _offset, steps in pass_specs:
-        counter = 0
-        for _ in range(steps):
-            counter += 1
-        value = torch.tensor(counter, dtype=torch.int64)
-        torch.distributed.all_reduce(value)
-        assert value.item() == counter * world_size
-        local_counts.append(counter)
-    gathered = [None] * world_size
-    torch.distributed.all_gather_object(gathered, local_counts)
-    if rank == 0:
-        queue.put(gathered)
-    torch.distributed.destroy_process_group()
+    assert leftovers == [], f"pass-rotation machinery reappeared in the trainer: {leftovers}"
 
+    from openpi.training.train_config import get_config
 
-def test_two_rank_gloo_pass_counters_finish_without_collective_hang(trainer, tmp_path):
-    context = torch.multiprocessing.get_context("fork")
-    queue = context.SimpleQueue()
-    init_file = tmp_path / "gloo-init"
-    torch.multiprocessing.start_processes(
-        _gloo_pass_counter_worker,
-        args=(2, str(init_file), trainer._FORMAL_B1K_PASS_SPECS, queue),
-        nprocs=2,
-        join=True,
-        start_method="fork",
-    )
-    assert queue.get() == [[34_982, 34_971, 34_959], [34_982, 34_971, 34_959]]
+    for name in (
+        "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16",
+        "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16",
+    ):
+        config = get_config(name)
+        # No offsets == no epoch-boundary loader rebuild: the rebuild branch in
+        # train_loop is entered only when epoch_anchor_offsets is not None.
+        assert config.epoch_anchor_offsets is None, name
+        assert config.streaming_anchor_stride >= 1, name
+
+    source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
+    assert "if epoch_offsets is not None:" in source
 
 
 def test_required_wandb_world1_success_and_failure(trainer, monkeypatch):
@@ -758,7 +1026,12 @@ def test_formal_scheduler_edges(trainer):
 def test_formal_runtime_wandb_logging_limitation_is_explicit():
     trainer_source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
     assert "runtime log calls intentionally remain best-effort" in trainer_source
-    assert "exact unique coverage is not claimed" in trainer_source
+    # The coverage claim must stay honest. The old per-pass log said "exact unique
+    # coverage is not claimed"; the single-sweep path states the same limitation
+    # about the quantity it now derives -- steps_per_epoch is computed from a
+    # horizon-unaware len(dataset) and is therefore an upper bound.
+    assert "this is an UPPER BOUND " in trainer_source
+    assert "because len(dataset) is horizon-unaware" in trainer_source
     assert "loader, _ = build_datasets(config)" in trainer_source
     assert "loader = accelerator.prepare(loader)" in trainer_source
     assert "_close_training_iterator(train_iterator)" in trainer_source
@@ -772,6 +1045,12 @@ def test_formal_config_exact_budget_and_online_wandb():
     assert config.gradient_accumulation_steps == 1
     assert config.num_train_steps == 104_912
     assert config.num_train_epochs is None
+    # Stride 4 with no offset rotation, and the same 104,912-step budget. This is
+    # the coverage-preserving replacement for the three stride-12 offset passes:
+    # {0,4,8} mod 12 == {0} mod 4, and 26,857,712 // 256 == 104,912. Stride 12 with
+    # a single offset would silently reduce unique coverage to 1/12 of frames.
+    assert config.streaming_anchor_stride == 4
+    assert config.epoch_anchor_offsets is None
     assert config.wandb_enabled is True
     assert config.project_name == "pi05_ki"
     assert config.lr_schedule.warmup_steps == 1_000

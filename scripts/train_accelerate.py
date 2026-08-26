@@ -134,16 +134,16 @@ class _TwoPhaseUpdateController:
 
     Accelerate 1.13's DeepSpeed wrapper calls ``engine.step()`` from every
     synced ``accelerator.backward()``. The KI loop has two backwards per outer
-    microbatch, so using that wrapper twice would update and clear gradients
-    after the backbone phase before the expert phase runs.
+    microbatch, so this adapter drives the engine directly and defers the one
+    real update until both graphs have been freed.
 
-    For DeepSpeed, this adapter drives the engine directly: both disjoint phase
-    backwards inherit the outer ``accelerator.sync_gradients`` boundary so
-    ZeRO-2 finalizes both parameter groups, while ``engine.step()`` is called
-    exactly once after both graphs only at that boundary. DeepSpeed performs
-    its real optimizer step and gradient clear inside ``engine.step()``. The
-    non-DeepSpeed path deliberately retains Accelerate's normal backward and
-    optimizer semantics.
+    The installed DeepSpeed runtime does not have verified support for multiple
+    disjoint backwards with ZeRO-1/2 optimizer offload before a single engine
+    step, so that exact combination is rejected before model execution. This is
+    not a blanket rejection of gradient accumulation: standard single-backward
+    training never instantiates this controller. ZeRO-3, no optimizer offload,
+    and parameter-only offload retain the existing controller semantics. The
+    non-DeepSpeed path retains normal Accelerate semantics.
     """
 
     def __init__(self, accelerator) -> None:
@@ -152,22 +152,86 @@ class _TwoPhaseUpdateController:
         self._engine = (
             accelerator.deepspeed_engine_wrapped.engine if self._is_deepspeed else None
         )
+        if self._is_deepspeed:
+            stage, offload_device, deepspeed_version = self._validate_deepspeed_two_phase_capability()
+            if getattr(accelerator, "is_main_process", True):
+                logging.getLogger().info(
+                    "DeepSpeed two-phase capability: version=%s zero_stage=%s "
+                    "optimizer_offload_device=%s boundary_policy=existing",
+                    deepspeed_version,
+                    stage,
+                    offload_device,
+                )
+
+    def _validate_deepspeed_two_phase_capability(self) -> tuple[int, str, str]:
+        """Reject only unverified ZeRO-1/2 optimizer-offload multi-backward."""
+
+        try:
+            deepspeed_version = importlib_metadata.version("deepspeed")
+        except importlib_metadata.PackageNotFoundError as exc:
+            raise RuntimeError("DeepSpeed runtime metadata is unavailable") from exc
+
+        required = ("zero_optimization_stage", "zero_offload_optimizer")
+        missing = [name for name in required if not callable(getattr(self._engine, name, None))]
+        if missing:
+            raise RuntimeError(f"DeepSpeed engine is missing two-phase policy APIs: {missing}")
+
+        try:
+            stage = int(self._engine.zero_optimization_stage())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("DeepSpeed ZeRO stage is unavailable") from exc
+
+        # ZeRO-3 is outside the measured defect predicate. Do not classify or
+        # reject its optimizer/parameter offload policy here.
+        if stage not in {1, 2}:
+            return stage, "outside-target", deepspeed_version
+
+        offload_config = self._engine.zero_offload_optimizer()
+        if offload_config is None:
+            device = "none"
+        else:
+            raw_device = getattr(offload_config, "device", None)
+            if raw_device is None:
+                raise RuntimeError("DeepSpeed optimizer offload device is unavailable")
+            device = str(getattr(raw_device, "value", raw_device)).lower()
+            device = device.removeprefix("offloaddeviceenum.")
+        if device not in {"none", "cpu", "nvme"}:
+            raise RuntimeError(f"Unknown DeepSpeed optimizer offload device: {device}")
+
+        if device in {"cpu", "nvme"}:
+            raise RuntimeError(
+                "PI05-KI two-phase training requires multiple engine.backward calls per optimizer step, "
+                f"but DeepSpeed {deepspeed_version} ZeRO-{stage} optimizer offload device={device} is "
+                "unsupported by the installed runtime. Use reviewed no-offload; do not enable this mode "
+                "until a runtime containing DeepSpeed PR #7981 is source-fingerprint and effect validated. "
+                "Standard single-backward gradient accumulation is unaffected."
+            )
+        return stage, device, deepspeed_version
 
     @property
     def is_deepspeed(self) -> bool:
         return self._is_deepspeed
 
-    def backward(self, loss: torch.Tensor) -> None:
-        """Backpropagate one phase under the outer accumulation boundary."""
+    def backward_first_phase(self, loss: torch.Tensor) -> None:
+        """Backpropagate the first phase without declaring an update boundary."""
 
         if not self._is_deepspeed:
             self._accelerator.backward(loss)
             return
 
-        # ZeRO-2 finalizes only parameters participating in a boundary
-        # backward. The two KI phases own disjoint groups, so both must inherit
-        # the outer boundary on the final accumulation microbatch. The update
-        # remains deferred until the single engine.step after both phases.
+        # The measured no-optimizer-offload path must retain both disjoint
+        # phases until the final boundary. Optimizer-offload runtimes that need
+        # the inverse sequence are rejected by the constructor.
+        self._engine.set_gradient_accumulation_boundary(False)
+        self._engine.backward(loss)
+
+    def backward(self, loss: torch.Tensor) -> None:
+        """Backpropagate the final phase under the outer accumulation boundary."""
+
+        if not self._is_deepspeed:
+            self._accelerator.backward(loss)
+            return
+
         boundary = bool(self._accelerator.sync_gradients)
         self._engine.set_gradient_accumulation_boundary(boundary)
         self._engine.backward(loss)
@@ -397,42 +461,32 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         return None
 
 
-_FORMAL_B1K_CONFIG_CONTRACTS = {
-    "pi05_ki_joint_fast_b1k-full_task-ki_on_bf16": {
-        "pytorch_model_name": "pi05_ki_joint_fast",
-        "batch_size_per_gpu": 8,
-        "gradient_accumulation_steps": 1,
-        "pytorch_training_precision": "bfloat16",
-        "accelerate_mixed_precision": "bf16",
-    },
-    "pi05_ki_joint_query_b1k-full_task-ki_on_bf16": {
-        "pytorch_model_name": "pi05_ki_joint_query",
-        "batch_size_per_gpu": 8,
-        "gradient_accumulation_steps": 1,
-        "pytorch_training_precision": "bfloat16",
-        "accelerate_mixed_precision": "bf16",
-    },
-    "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32": {
-        "pytorch_model_name": "pi05_ki_joint_fast",
-        "batch_size_per_gpu": 1,
-        "gradient_accumulation_steps": 8,
-        "pytorch_training_precision": "float32",
-        "accelerate_mixed_precision": "no",
-    },
-    "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32": {
-        "pytorch_model_name": "pi05_ki_joint_query",
-        "batch_size_per_gpu": 1,
-        "gradient_accumulation_steps": 8,
-        "pytorch_training_precision": "float32",
-        "accelerate_mixed_precision": "no",
-    },
+# Names that opt into the formal B1K protocol. Recipe values live only in the
+# registered TrainConfig; this set selects invariant validation without copying
+# batch, precision, schedule, or cadence literals into the trainer.
+_FORMAL_B1K_CHECKPOINT_POLICIES = {
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_bf16": "step",
+    "pi05_ki_joint_query_b1k-full_task-ki_on_bf16": "step",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32": "step",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32_validation10": "step",
+    "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32": "step",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16": "epoch_with_rolling",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16": "epoch_with_rolling",
+}
+_FORMAL_B1K_CONFIGS = set(_FORMAL_B1K_CHECKPOINT_POLICIES)
+# H20 shares the A100 memory policy: ZeRO-2 with the optimizer resident on GPU.
+# H20 carries ~96 GB HBM3 versus A100-40GB, so if no-offload is safe on A100 it
+# is safe here; the bounded smoke still has to produce the real measured peak.
+_H20_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS = {
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16_smoke",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16_smoke",
 }
 _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS = {
     "pi05_ki_joint_fast_b1k-full_task-ki_on_a100_bf16",
     "pi05_ki_joint_query_b1k-full_task-ki_on_a100_bf16",
 }
-_FORMAL_B1K_PASS_SPECS = ((0, 34_982), (4, 34_971), (8, 34_959))
-_FORMAL_B1K_PASS_BOUNDARIES = (34_982, 69_953, 104_912)
 _FORMAL_B1K_DATASET_ENV_KEYS = (
     "OPENPI_B1K_ANCHOR_STRIDE",
     "OPENPI_B1K_ANCHOR_OFFSET",
@@ -441,15 +495,63 @@ _FORMAL_B1K_DATASET_ENV_KEYS = (
 
 
 def _is_formal_b1k_mode(config) -> bool:
-    return getattr(config, "name", None) in _FORMAL_B1K_CONFIG_CONTRACTS
+    return getattr(config, "name", None) in _FORMAL_B1K_CONFIGS
 
 
-def _set_formal_b1k_pass_offset(offset: int) -> None:
-    if offset not in {spec[0] for spec in _FORMAL_B1K_PASS_SPECS}:
-        raise ValueError(f"Unsupported formal B1K pass offset: {offset}")
-    os.environ["OPENPI_B1K_ANCHOR_STRIDE"] = "12"
-    os.environ["OPENPI_B1K_ANCHOR_OFFSET"] = str(offset)
-    os.environ["OPENPI_B1K_DROP_INCOMPLETE_HORIZON"] = "1"
+def _validate_profile_recipe_unchanged(config, *, world_size: int | None = None) -> None:
+    """Reject mutation by comparing one effective recipe on both sides."""
+    from openpi.training.launcher_profile import materialize_effective_recipe
+    from openpi.training.train_config import TrainConfig
+    from openpi.training.train_config import get_config
+
+    # Lightweight unit-test stubs exercise the protocol's arithmetic branches;
+    # pristine-profile equality applies to real CLI-produced TrainConfig values.
+    if not isinstance(config, TrainConfig):
+        return
+    pristine = get_config(config.name)
+    if pristine.name != config.name:
+        raise ValueError(
+            f"formal profile {config.name!r} is not registered exactly; refusing fallback"
+        )
+    if world_size is not None:
+        pristine = materialize_effective_recipe(pristine, world_size=world_size)
+    fields = (
+        "pytorch_model_name",
+        "pytorch_training_precision",
+        "accelerate_mixed_precision",
+        "batch_size_per_gpu",
+        "gradient_accumulation_steps",
+        "expected_global_batch",
+        "num_train_steps",
+        "num_train_epochs",
+        "num_workers",
+        "save_interval",
+        "val_log_interval",
+        "val_num_batches",
+        "val_interval_samples",
+        "save_interval_samples",
+        "streaming_anchor_stride",
+        "epoch_anchor_offsets",
+        "checkpoint_policy",
+        "rolling_checkpoint_interval",
+        "gradient_checkpointing",
+        "project_name",
+        "wandb_enabled",
+    )
+    for field in fields:
+        actual = getattr(config, field)
+        expected = getattr(pristine, field)
+        if actual != expected:
+            raise ValueError(
+                f"Formal B1K profile {config.name!r} requires effective {field}={expected!r}; "
+                f"got {actual!r}. Direct recipe overrides are not supported; define a "
+                "registered profile."
+            )
+    if config.lr_schedule != pristine.lr_schedule:
+        raise ValueError(
+            f"Formal B1K profile {config.name!r} requires its registered lr_schedule; "
+            "direct schedule overrides are not supported"
+        )
 
 
 @contextmanager
@@ -518,19 +620,6 @@ def _train_b1k_anchor_env(stride: int, offset: int = 0):
                 os.environ[key] = saved
 
 
-def _formal_b1k_pass_for_step(global_step: int) -> tuple[int, int, int, int, int]:
-    if not 0 <= global_step < _FORMAL_B1K_PASS_BOUNDARIES[-1]:
-        raise ValueError(f"Formal B1K global_step out of range: {global_step}")
-    pass_start = 0
-    for pass_index, ((offset, pass_steps), pass_end) in enumerate(
-        zip(_FORMAL_B1K_PASS_SPECS, _FORMAL_B1K_PASS_BOUNDARIES, strict=True)
-    ):
-        if global_step < pass_end:
-            return pass_index, offset, pass_steps, pass_start, pass_end
-        pass_start = pass_end
-    raise AssertionError("unreachable formal B1K pass lookup")
-
-
 def _close_training_iterator(iterator) -> None:
     if iterator is None:
         return
@@ -559,16 +648,14 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
     if not _is_formal_b1k_mode(config):
         return
 
-    contract = _FORMAL_B1K_CONFIG_CONTRACTS[config.name]
+    world_size = None if accelerator is None else int(accelerator.num_processes)
+    _validate_profile_recipe_unchanged(config, world_size=world_size)
+
+    # Only cross-profile protocol invariants are literals here. Batch shape,
+    # precision, schedule, stride, and cadences are owned by TrainConfig and are
+    # checked for internal/runtime consistency below.
     expected_fields = {
-        **contract,
-        "num_train_steps": 104_912,
-        "save_interval": 10_000,
-        "checkpoint_policy": "step",
-        "rolling_checkpoint_interval": 10_000,
-        "val_log_interval": 1_000,
-        "val_num_batches": 20,
-        "streaming_anchor_stride": 12,
+        "checkpoint_policy": _FORMAL_B1K_CHECKPOINT_POLICIES[config.name],
         "overwrite": False,
         "wandb_enabled": True,
         "project_name": "pi05_ki",
@@ -580,8 +667,6 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
                 f"Formal B1K requires {field}={expected!r}; got {actual!r}. "
                 "Runtime overrides are not supported."
             )
-    if getattr(config, "num_train_epochs", None) is not None:
-        raise ValueError("Formal B1K requires num_train_epochs=None and the fixed 104,912-step budget")
     if bool(getattr(config, "resume", False)):
         raise ValueError(
             "Formal B1K resume is unsupported: checkpoints are weights/evaluation artifacts, "
@@ -605,34 +690,76 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
         if base_config.skill_bridge.enabled:
             raise ValueError(f"Formal B1K {label} data requires Skill Bridge disabled")
 
+    # ---- Schedule CONSISTENCY (not remembered values) ----
+    # The budget is derived at runtime from the dataset and the global batch, so
+    # there is no correct literal to compare against here. What must hold is
+    # that the pieces agree with each other and with the epoch-based budget.
     schedule = config.lr_schedule
-    schedule_values = (
-        int(schedule.warmup_steps),
-        float(schedule.peak_lr),
-        int(schedule.decay_steps),
-        float(schedule.decay_lr),
-    )
-    if schedule_values != (1_000, 1e-5, 104_912, 0.0):
+    warmup_steps = int(schedule.warmup_steps)
+    decay_steps = int(schedule.decay_steps)
+    peak_lr = float(schedule.peak_lr)
+    epochs = getattr(config, "num_train_epochs", None)
+    provided_steps = int(config.num_train_steps)
+
+    if epochs is None:
+        # LEGACY fixed-budget form, still used by the on_bf16 / on_v100_fp32
+        # families. Consistency only: the budget must be positive and the cosine
+        # decay must span exactly that budget. No remembered literal.
+        if provided_steps <= 0:
+            raise ValueError(
+                "Formal B1K with num_train_epochs=None requires num_train_steps > 0; "
+                f"got {provided_steps}"
+            )
+        if decay_steps != provided_steps:
+            raise ValueError(
+                f"Formal B1K fixed-budget form requires decay_steps == num_train_steps; "
+                f"got decay_steps={decay_steps}, num_train_steps={provided_steps}"
+            )
+        if warmup_steps >= provided_steps:
+            raise ValueError(
+                f"Formal B1K requires warmup_steps < num_train_steps; "
+                f"got {warmup_steps} >= {provided_steps}"
+            )
+    else:
+        # DERIVED form: budget comes from epochs x steps_per_epoch at runtime, so
+        # the step fields must be sentinels. A literal here would cap or decouple
+        # the derived budget and silently change coverage.
+        if int(epochs) <= 0:
+            raise ValueError(f"Formal B1K requires num_train_epochs >= 1; got {epochs!r}")
+        if provided_steps != 0:
+            raise ValueError(
+                "Formal B1K epoch-derived form requires num_train_steps=0 (derive from "
+                f"epochs x steps_per_epoch); got {provided_steps}. A non-zero value caps the "
+                "derived budget and would silently truncate coverage."
+            )
+        if decay_steps != 0:
+            raise ValueError(
+                "Formal B1K epoch-derived form requires decay_steps=0 so it is auto-set to the "
+                f"derived num_train_steps; got {decay_steps}. A literal decouples LR decay from "
+                "the real budget."
+            )
+    if float(schedule.decay_lr) != 0.0:
+        raise ValueError(f"Formal B1K requires decay_lr=0; got {schedule.decay_lr!r}")
+    if warmup_steps <= 0:
+        raise ValueError(f"Formal B1K requires warmup_steps > 0; got {warmup_steps}")
+    if peak_lr <= 0.0:
+        raise ValueError(f"Formal B1K requires peak_lr > 0; got {peak_lr}")
+
+    stride = int(getattr(config, "streaming_anchor_stride", 1))
+    if stride < 1:
+        raise ValueError(f"Formal B1K requires streaming_anchor_stride >= 1; got {stride}")
+    if getattr(config, "epoch_anchor_offsets", None) is not None:
         raise ValueError(
-            "Formal B1K requires warmup=1000, peak_lr=1e-5, decay_steps=104912, decay_lr=0; "
-            f"got {schedule_values}"
+            "Formal B1K no longer uses per-epoch anchor offsets: the offset rotation was an "
+            "unnecessary decomposition of a single stride-N sweep and required mid-training "
+            "dataloader rebuilds. Set streaming_anchor_stride and leave offsets unset."
         )
 
-    os.environ.setdefault("FRAME_ANCHOR_STRIDE", "12")
-    os.environ.setdefault("FRAME_ANCHOR_OFFSETS", "0,4,8")
-    if os.environ["FRAME_ANCHOR_STRIDE"] != "12":
-        raise ValueError("Formal B1K requires FRAME_ANCHOR_STRIDE=12")
-    try:
-        frame_offsets = tuple(int(value) for value in os.environ["FRAME_ANCHOR_OFFSETS"].split(","))
-    except ValueError as exc:
-        raise ValueError("Formal B1K FRAME_ANCHOR_OFFSETS must be exactly 0,4,8") from exc
-    if frame_offsets != (0, 4, 8):
-        raise ValueError(
-            f"Formal B1K FRAME_ANCHOR_OFFSETS must be exactly (0, 4, 8); got {frame_offsets}"
-        )
-
+    # The dataset captures stride/offset from the environment at construction
+    # time, so the stride the trainer will actually use is derived from the
+    # config rather than pinned to a literal. Offset 0 with no rotation.
     formal_dataset_defaults = {
-        "OPENPI_B1K_ANCHOR_STRIDE": "12",
+        "OPENPI_B1K_ANCHOR_STRIDE": str(stride),
         "OPENPI_B1K_ANCHOR_OFFSET": "0",
         "OPENPI_B1K_DROP_INCOMPLETE_HORIZON": "1",
     }
@@ -643,29 +770,31 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
 
     os.environ.setdefault("OPENPI_PERSISTENT_WORKERS", "0")
     if os.environ["OPENPI_PERSISTENT_WORKERS"] != "0":
-        raise ValueError("Formal B1K requires OPENPI_PERSISTENT_WORKERS=0 so every pass rebuilds workers")
+        raise ValueError("Formal B1K requires OPENPI_PERSISTENT_WORKERS=0")
 
     if accelerator is not None:
         if int(accelerator.num_processes) != 32:
             raise ValueError(f"Formal B1K requires world size 32; got {accelerator.num_processes}")
-        expected_grad_accum = int(contract["gradient_accumulation_steps"])
+        expected_grad_accum = int(config.gradient_accumulation_steps)
         if int(accelerator.gradient_accumulation_steps) != expected_grad_accum:
             raise ValueError(
-                "Formal B1K requires Accelerator "
-                f"gradient_accumulation_steps={expected_grad_accum}; "
-                f"got {accelerator.gradient_accumulation_steps}"
+                "Formal B1K Accelerator/config mismatch: "
+                f"gradient_accumulation_steps={accelerator.gradient_accumulation_steps}, "
+                f"config={expected_grad_accum}"
             )
         effective_global_batch = (
             int(config.batch_size_per_gpu)
             * int(accelerator.num_processes)
             * int(accelerator.gradient_accumulation_steps)
         )
-        if effective_global_batch != 256:
+        expected_global_batch = getattr(config, "expected_global_batch", None)
+        if expected_global_batch is None or effective_global_batch != int(expected_global_batch):
             raise ValueError(
-                "Formal B1K requires effective global batch 256; "
-                f"got {effective_global_batch}"
+                f"Formal B1K profile requires global batch {expected_global_batch}; "
+                f"got {effective_global_batch} (B{config.batch_size_per_gpu} x "
+                f"W{accelerator.num_processes} x GA{accelerator.gradient_accumulation_steps})"
             )
-        if contract["pytorch_training_precision"] == "float32":
+        if config.pytorch_training_precision == "float32":
             if accelerator.distributed_type != DistributedType.DEEPSPEED:
                 raise ValueError("Formal V100 FP32 requires DeepSpeed")
             ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
@@ -1184,6 +1313,20 @@ def build_val_datasets(config: _config.TrainConfig):
                 drop_last=True,
                 pin_memory=torch.cuda.is_available(),
                 **({"prefetch_factor": 2} if int(config.num_workers) > 0 else {}),
+                # Keep the val workers alive across validations. This loader is
+                # built ONCE per run (build_val_datasets is called only at setup)
+                # but `_DeterministicValLoader.__iter__` re-enters it at every
+                # validation, so without this the workers are torn down and
+                # re-forked ~105 times x world_size x num_workers. This loader
+                # has no `multiprocessing_context`, so those are Linux fork()s,
+                # and each one is a chance to inherit a lock the parent happens
+                # to hold (a run died at step 5990 with a val worker blocked
+                # forever on wandb's SockClient._lock, taking all 32 ranks down
+                # via the NCCL watchdog). Persistent workers collapse that to a
+                # single fork per run. Safe here because the sampler is
+                # shuffle=False, so re-iteration replays the identical fixed
+                # order; PyTorch raises if this is set with num_workers=0.
+                **({"persistent_workers": True} if int(config.num_workers) > 0 else {}),
             )
             loader = _DeterministicValLoader(loader, val_dc, subset, coverage)
             return loader, val_dc
@@ -3357,13 +3500,159 @@ def _configure_gradient_checkpointing(model, *, enabled: bool) -> None:
         )
 
 
+# The kwargs the validation call site passes to compute_eval_metrics on BOTH KI
+# variants, classified by what a missing one actually costs. The two classes are
+# invoked through one shared `is_pi05_ki_joint` branch but are maintained
+# separately, so this surface is where they silently drift apart.
+#
+#   metric selectors  -- choose WHICH metrics are produced. A variant may
+#                        legitimately not emit one; consumers must then use
+#                        `in`/`.get()` rather than unconditional indexing.
+#   metric parameters -- only meaningful when their metric is enabled; they
+#                        travel with it.
+#   behaviour flags   -- change the STATISTICAL PROPERTIES of metrics that are
+#                        reported. These must be honoured or hard-fail. Silently
+#                        ignoring one is the worst case: with deterministic_flow
+#                        off, flow_loss / expert_loss / total_loss carry a random
+#                        component that does NOT shrink as the validation subset
+#                        grows, so an arm that ignores it has an irreducible noise
+#                        floor on exactly the metrics an A/B compares -- invisible,
+#                        and fatal to the conclusion rather than to the run.
+_KI_EVAL_METRIC_SELECTORS = ("compute_flow_l1",)
+_KI_EVAL_METRIC_PARAMETERS = ("num_denoise_steps", "flow_l1_seed")
+_KI_EVAL_BEHAVIOUR_FLAGS = ("deterministic_flow",)
+
+
+def _validate_ki_eval_capability(model, config, *, is_main: bool) -> None:
+    """Fail at step 0 if the model cannot honour the validation call the trainer makes.
+
+    Motivation (concrete): the trainer passes ``deterministic_flow`` to both KI
+    variants unconditionally, but Variant A's override of ``compute_eval_metrics``
+    did not accept it. The result was ``TypeError: compute_eval_metrics() got an
+    unexpected keyword argument 'deterministic_flow'`` raised at the FIRST
+    validation -- i.e. after ~2h40m of training on 32 GPUs, not at startup. A
+    bounded smoke shorter than one validation interval cannot catch it either.
+
+    This check resolves what will be requested against what the model actually
+    supports, before the training loop, so the same defect costs seconds.
+    """
+    import inspect
+
+    if config.pytorch_model_name not in ("pi05_ki_joint_query", "pi05_ki_joint_fast"):
+        return
+
+    fn = getattr(type(model), "compute_eval_metrics", None)
+    if fn is None:
+        raise RuntimeError(
+            f"model {type(model).__name__} is routed through the KI validation branch "
+            "but does not implement compute_eval_metrics"
+        )
+    params = inspect.signature(fn).parameters
+    accepts_var_kw = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+    requested = (
+        _KI_EVAL_METRIC_SELECTORS + _KI_EVAL_METRIC_PARAMETERS + _KI_EVAL_BEHAVIOUR_FLAGS
+    )
+    problems: list[str] = []
+
+    for name in requested:
+        if name in params:
+            continue
+        if accepts_var_kw:
+            # Absorbed by **kwargs: no TypeError, and therefore no signal at all.
+            problems.append(
+                f"{name!r} is not an explicit parameter and would be silently swallowed "
+                f"by **kwargs in {type(model).__name__}.compute_eval_metrics"
+            )
+        else:
+            problems.append(
+                f"{name!r} is not accepted by {type(model).__name__}.compute_eval_metrics "
+                "and would raise TypeError at the first validation"
+            )
+
+    # A behaviour flag that is requested ON must be genuinely implemented, not
+    # merely present in the signature. Signature parity with a no-op body is a
+    # silent failure, so require the flag to be referenced in the body as well as
+    # the signature (>= 2 occurrences: the parameter plus at least one use).
+    #
+    # This is a heuristic, deliberately a weak one: it catches a blatant no-op but
+    # a body that merely mentions the name in a comment would satisfy it. It is a
+    # backstop for the signature check, not a proof of correct semantics -- that is
+    # what tests/test_pi05_ki_h20_bf16_two_arm.py asserts, by requiring both
+    # variants to contain the actual mechanism (manual_seed, train_preprocess=False,
+    # set_rng_state_all).
+    source_available = True
+    try:
+        body = inspect.getsource(fn)
+    except (OSError, TypeError):
+        body = ""
+        source_available = False
+    for name in _KI_EVAL_BEHAVIOUR_FLAGS:
+        if not bool(getattr(config, f"val_{name}", False)):
+            continue
+        if not source_available:
+            # Do NOT skip silently: an unverifiable behaviour flag is a known gap,
+            # not a pass. Real model classes are file-backed so this should not
+            # occur in production.
+            if is_main:
+                logging.warning(
+                    "KI eval capability: could not read the source of %s.compute_eval_metrics, "
+                    "so whether behaviour flag %r is actually honoured is UNVERIFIED "
+                    "(signature accepts it)",
+                    type(model).__name__,
+                    name,
+                )
+            continue
+        if name in params and body.count(name) < 2:
+            problems.append(
+                f"behaviour flag {name!r} is accepted by {type(model).__name__}"
+                ".compute_eval_metrics but never referenced in its body, so it would be "
+                "accepted and ignored -- this changes the statistical properties of "
+                "reported metrics rather than which metrics appear"
+            )
+
+    if problems:
+        raise RuntimeError(
+            "KI validation capability check failed for "
+            f"{config.pytorch_model_name!r} ({type(model).__name__}):\n  - "
+            + "\n  - ".join(problems)
+        )
+
+    if is_main:
+        logging.info(
+            "KI eval capability OK model=%s selectors=%s parameters=%s "
+            "behaviour_flags=%s (val_deterministic_flow=%s)",
+            type(model).__name__,
+            list(_KI_EVAL_METRIC_SELECTORS),
+            list(_KI_EVAL_METRIC_PARAMETERS),
+            list(_KI_EVAL_BEHAVIOUR_FLAGS),
+            bool(getattr(config, "val_deterministic_flow", False)),
+        )
+        # Variant-specific metric keys, logged once so an absent column later is
+        # visible here rather than inferred from a gap in the metrics file.
+        if config.pytorch_model_name == "pi05_ki_joint_fast":
+            logging.info(
+                "KI eval metric surface: Variant A emits action_ce_loss / "
+                "action_token_accuracy and deliberately OMITS query_mse_loss / "
+                "query_l1 (no learned queries, no query head). Consumers must use "
+                "`in` or .get() for those keys; `query_l1=nan` in the [VAL] line is "
+                "expected for this variant, not a failure."
+            )
+
+
 def _validate_a100_optimizer_offload_policy(config_name: str, ds_config: dict) -> None:
-    if config_name not in _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS:
+    if config_name in _A100_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS:
+        family = "A100 formal"
+    elif config_name in _H20_BF16_NO_OPTIMIZER_OFFLOAD_CONFIGS:
+        family = "H20"
+    else:
         return
     zero_config = ds_config.get("zero_optimization", {})
     if "offload_optimizer" in zero_config:
         raise ValueError(
-            f"A100 formal config {config_name!r} requires optimizer offload disabled; "
+            f"{family} config {config_name!r} requires optimizer offload disabled; "
             f"got {zero_config.get('offload_optimizer')!r}"
         )
 
@@ -3385,6 +3674,15 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         gradient_accumulation_steps=int(getattr(config, "gradient_accumulation_steps", 1)),
         kwargs_handlers=kwargs_handlers,
     )
+    if _is_formal_b1k_mode(config):
+        from openpi.training.launcher_profile import materialize_effective_recipe
+
+        # CLI parsing produces raw registered authorities. Materialize the shared
+        # pure effective recipe exactly once after world size is known, then
+        # validate the same effective object that the launcher resolved.
+        config = materialize_effective_recipe(
+            config, world_size=int(accelerator.num_processes)
+        )
     _validate_formal_b1k_contract(config, accelerator=accelerator)
 
     is_main = accelerator.is_main_process
@@ -3527,10 +3825,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             )
 
     # Build the training loader under the config's streaming anchor stride.
-    # The formal B1K pass loop overrides this per-pass via
-    # _set_formal_b1k_pass_offset; for all other configs the stride comes from
-    # config.streaming_anchor_stride. Epoch-anchor-offset configs build the
-    # first epoch with offset[0] and rebuild at each epoch boundary.
+    # The stride always comes from config.streaming_anchor_stride. Epoch-anchor-
+    # offset configs build the first epoch with offset[0] and rebuild at each
+    # epoch boundary; the formal B1K path sets no offsets and so builds once.
     epoch_offsets = getattr(config, "epoch_anchor_offsets", None)
     initial_offset = int(epoch_offsets[0]) if epoch_offsets else 0
     with _train_b1k_anchor_env(
@@ -3580,9 +3877,23 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     # the nearest complete anchor (incomplete trailing horizons are dropped,
     # matching ``_streaming_drop_incomplete_horizon`` semantics). The grad-accum
     # division is applied AFTER the stride reduction, so the effective optimizer
-    # steps per epoch == (microbatches // stride) // grad_accum. The formal B1K
-    # control uses a fixed 104,912-step budget (epochs=None) and is left
-    # untouched; this adjustment only affects epoch-based runs.
+    # steps per epoch == (microbatches // stride) // grad_accum.
+    #
+    # KNOWN OVERSHOOT, quantified. ``len(dataset)`` is inherited from
+    # LeRobotDataset and is the RAW frame count: it is unaware of both the stride
+    # and of ``drop_incomplete_horizon``. Dividing by the stride recovers the
+    # stride reduction but NOT the horizon rejection, so this estimate exceeds
+    # the true count of horizon-eligible anchors. For the B1K train population
+    # (107,696,389 raw frames, action_horizon 32, first 180 sorted episodes of
+    # each of the 50 tasks) the exact eligible count at stride 4 is 26,857,712
+    # versus 26,924,097 for raw//4 -- an overshoot of 66,385 anchors, 0.247%.
+    # At global batch 1024 that is 26,293 estimated versus 26,228 exact, i.e.
+    # the last ~65 steps re-read the head of the sweep rather than extending it.
+    # This is a duplicate-exposure rounding effect, not a coverage loss, and it
+    # is bounded by one stride-pass worth of horizon tails. Deriving the exact
+    # value would require replicating the dataset's eligibility predicate here,
+    # which would drift from the dataset itself; the estimate is used instead and
+    # the discrepancy is logged so it can never be silent.
     streaming_stride = int(getattr(config, "streaming_anchor_stride", 1))
     if streaming_stride > 1 and config.num_train_epochs is not None:
         effective_micro = max(1, steps_per_epoch_micro // streaming_stride)
@@ -3593,7 +3904,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             logging.info(
                 "Streaming anchor stride=%s: steps_per_epoch reduced from %s to %s "
                 "(raw_micro=%s, effective_micro=%s//%s=%s, grad_accum=%s) "
-                "so one epoch == one pass over unique anchors",
+                "so one epoch == one pass over unique anchors; this is an UPPER BOUND "
+                "because len(dataset) is horizon-unaware (see comment above)",
                 streaming_stride,
                 steps_per_epoch,
                 effective_steps_per_epoch,
@@ -3605,13 +3917,32 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             )
         steps_per_epoch = effective_steps_per_epoch
 
-    if _is_formal_b1k_mode(config) and is_main:
-        logging.info(
-            "Formal B1K lean contract: offsets=(0,4,8), pass_steps=(34982,34971,34959), "
-            "boundaries=(34982,69953,104912), theoretical_eligible=26857712, consumed=26857472, "
-            "global_batch_drop=240, exposure=24.9383588896% of 107696389 anchors. "
-            "Coverage is approximate; checkpoints are weights/eval artifacts and resume is unsupported."
-        )
+    # ---- Batch-invariant cadences ----
+    # Formal profiles were materialized once from the shared pure resolver after
+    # world size became known. Non-formal configs retain their historical local
+    # conversion because they are not launcher-profile contracts.
+    global_batch = (
+        int(config.batch_size_per_gpu)
+        * int(accelerator.num_processes)
+        * int(accelerator.gradient_accumulation_steps)
+    )
+    if not _is_formal_b1k_mode(config):
+        for samples_field, steps_field in (
+            ("val_interval_samples", "val_log_interval"),
+            ("save_interval_samples", "save_interval"),
+        ):
+            samples = getattr(config, samples_field, None)
+            if samples is None:
+                continue
+            if int(samples) <= 0:
+                raise ValueError(f"{samples_field} must be positive when set; got {samples!r}")
+            object.__setattr__(
+                config, steps_field, max(1, int(samples) // global_batch)
+            )
+        if getattr(config, "save_interval_samples", None) is not None:
+            object.__setattr__(
+                config, "rolling_checkpoint_interval", int(config.save_interval)
+            )
 
     if config.num_train_epochs is not None:
         if config.num_train_epochs <= 0:
@@ -3641,6 +3972,72 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             object.__setattr__(config, "save_interval", target_steps)
             if is_main:
                 logging.info("save_at_epoch_end_only enabled: save_interval=%s", target_steps)
+
+    # ---- Resolved recipe: derivation consistency + one auditable log line ----
+    # These are consistency assertions, not remembered values. They are the
+    # replacement for the deleted literal gates (warmup/peak_lr/decay_steps/
+    # num_train_steps == fixed tuple), which had to be hand-edited on every
+    # batch or stride change and so froze a stale budget back in each time.
+    resolved_epochs = getattr(config, "num_train_epochs", None)
+    resolved_steps = int(config.num_train_steps)
+    resolved_decay = int(config.lr_schedule.decay_steps) or resolved_steps
+    resolved_warmup = int(config.lr_schedule.warmup_steps)
+    if steps_per_epoch <= 0:
+        raise RuntimeError(f"steps_per_epoch must be positive; got {steps_per_epoch}")
+    if resolved_steps <= 0:
+        raise RuntimeError(f"num_train_steps must be positive after derivation; got {resolved_steps}")
+    if resolved_epochs is not None and resolved_steps != int(resolved_epochs) * steps_per_epoch:
+        raise RuntimeError(
+            f"Budget inconsistency: num_train_steps={resolved_steps} != "
+            f"num_train_epochs={resolved_epochs} x steps_per_epoch={steps_per_epoch}"
+        )
+    # The strict schedule-span assertions are scoped to the formal B1K protocol.
+    # Elsewhere a decay_steps that differs from num_train_steps is a tolerated
+    # (warned + auto-corrected) condition further down, and several exploratory
+    # configs rely on that -- e.g. the long-baseline pair uses
+    # num_train_steps=200 with decay_steps=500. Promoting that to a hard failure
+    # here would break configs this refactor is not about.
+    if _is_formal_b1k_mode(config):
+        if resolved_decay != resolved_steps:
+            raise RuntimeError(
+                f"Formal B1K: decay_steps={resolved_decay} must equal "
+                f"num_train_steps={resolved_steps} so the cosine schedule spans exactly the budget"
+            )
+        if resolved_warmup >= resolved_steps:
+            raise RuntimeError(
+                f"Formal B1K: warmup_steps={resolved_warmup} must be < "
+                f"num_train_steps={resolved_steps}"
+            )
+    if is_main:
+        # Single line so the whole recipe can be audited from the log without
+        # reading the config. num_train_epochs and steps_per_epoch are both
+        # present on purpose: without epochs, the discriminating relation
+        # num_train_steps == epochs x steps_per_epoch cannot be evaluated, and a
+        # checker that silently skips it would certify a hardcoded budget as
+        # "derived". samples_per_step is included so throughput (samples/s) can
+        # be computed from any two log timestamps.
+        logging.info(
+            "RESOLVED_RECIPE config=%s stride=%s batch_size_per_gpu=%s world=%s grad_accum=%s "
+            "global_batch=%s samples_per_step=%s num_train_epochs=%s steps_per_epoch=%s "
+            "num_train_steps=%s decay_steps=%s warmup_steps=%s peak_lr=%.6g "
+            "val_log_interval=%s save_interval=%s total_samples=%s",
+            config.name,
+            streaming_stride,
+            int(config.batch_size_per_gpu),
+            int(accelerator.num_processes),
+            int(accelerator.gradient_accumulation_steps),
+            global_batch,
+            global_batch,
+            resolved_epochs,
+            steps_per_epoch,
+            resolved_steps,
+            resolved_decay,
+            resolved_warmup,
+            float(config.lr_schedule.peak_lr),
+            int(config.val_log_interval),
+            int(config.save_interval),
+            resolved_steps * global_batch,
+        )
 
     checkpoint_policy = getattr(config, "checkpoint_policy", _CHECKPOINT_POLICY_STEP)
     if checkpoint_policy == _CHECKPOINT_POLICY_EPOCH_WITH_ROLLING:
@@ -3845,6 +4242,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             gradient_checkpointing,
             _resolved_gradient_checkpointing_state(model),
         )
+
+    # Step-0 gate: prove the model can honour the validation call the trainer will
+    # make, before spending any training time. See _validate_ki_eval_capability.
+    _validate_ki_eval_capability(model, config, is_main=is_main)
 
     # Memory/perf knobs (keep same behavior as train_pytorch.py).
     if world_size >= 8:
@@ -4155,80 +4556,52 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     )
 
     last_epoch_logged = None
-    formal_b1k_mode = _is_formal_b1k_mode(config)
-    formal_pass_index = None
-    formal_pass_offset = None
-    formal_pass_start = 0
-    formal_pass_end = int(config.num_train_steps)
     train_iterator = None
-    epoch_anchor_index = 0 if (epoch_offsets is not None and not formal_b1k_mode) else None
+    epoch_anchor_index = 0 if epoch_offsets is not None else None
     while global_step < int(config.num_train_steps):
-        if formal_b1k_mode:
-            next_pass_index, next_offset, pass_steps, pass_start, pass_end = _formal_b1k_pass_for_step(global_step)
-            if formal_pass_index != next_pass_index:
+        # Epoch-anchor-offset mode: rebuild the loader when a new epoch starts
+        # so the dataset captures the next offset from the env. The streaming
+        # dataset reads OPENPI_B1K_ANCHOR_OFFSET at construction time; merely
+        # calling iter(loader) would replay the same offset for every epoch.
+        #
+        # The formal B1K path deliberately does NOT set epoch_anchor_offsets and
+        # therefore never rebuilds. Its three stride-12 offset passes were
+        # removed because they union to exactly one stride-4 sweep, and each
+        # boundary performed a full mid-training
+        # `del loader; build_datasets(); accelerator.prepare()` -- the same
+        # fork-while-holding-flock path that has deadlocked in practice. That
+        # rebuild's 3-retry protection lives in `except` clauses and a deadlock
+        # never raises, so the retry was structurally blind to the failure it
+        # appeared to cover. One sweep, no mid-run rebuilds.
+        if epoch_offsets is not None:
+            current_epoch = global_step // steps_per_epoch
+            if current_epoch != epoch_anchor_index:
+                if current_epoch >= len(epoch_offsets):
+                    break
                 accelerator.wait_for_everyone()
                 _close_training_iterator(train_iterator)
                 train_iterator = None
-                if next_pass_index > 0:
-                    del loader
-                    gc.collect()
-                    _set_formal_b1k_pass_offset(next_offset)
+                del loader
+                gc.collect()
+                next_offset = int(epoch_offsets[current_epoch])
+                with _train_b1k_anchor_env(
+                    int(getattr(config, "streaming_anchor_stride", 1)),
+                    next_offset,
+                ):
                     loader, _ = build_datasets(config)
-                    loader = accelerator.prepare(loader)
-                formal_pass_index = next_pass_index
-                formal_pass_offset = next_offset
-                formal_pass_start = pass_start
-                formal_pass_end = pass_end
-                train_iterator = iter(loader)
-                accelerator.wait_for_everyone()
+                loader = accelerator.prepare(loader)
+                epoch_anchor_index = current_epoch
                 if is_main:
                     logging.info(
-                        "Formal B1K pass=%s offset=%s steps=%s global_range=[%s,%s): "
-                        "streaming stride=12 with approximate quarter exposure; exact unique coverage is not claimed",
-                        formal_pass_index,
-                        formal_pass_offset,
-                        pass_steps,
-                        formal_pass_start,
-                        formal_pass_end,
-                    )
-        else:
-            # Epoch-anchor-offset mode: rebuild the loader when a new epoch
-            # starts so the dataset captures the next offset from the env.
-            # The streaming dataset reads OPENPI_B1K_ANCHOR_OFFSET at
-            # construction time; merely calling iter(loader) would replay the
-            # same offset for every epoch. Formal B1K mode uses its own
-            # explicit multi-pass rebuild above and never enters this branch.
-            if epoch_offsets is not None and not formal_b1k_mode:
-                current_epoch = global_step // steps_per_epoch
-                if current_epoch != epoch_anchor_index:
-                    if current_epoch >= len(epoch_offsets):
-                        break
-                    accelerator.wait_for_everyone()
-                    _close_training_iterator(train_iterator)
-                    train_iterator = None
-                    del loader
-                    gc.collect()
-                    next_offset = int(epoch_offsets[current_epoch])
-                    with _train_b1k_anchor_env(
-                        int(getattr(config, "streaming_anchor_stride", 1)),
+                        "Epoch anchor offset rotated: epoch=%s offset=%s stride=%s",
+                        current_epoch + 1,
                         next_offset,
-                    ):
-                        loader, _ = build_datasets(config)
-                    loader = accelerator.prepare(loader)
-                    epoch_anchor_index = current_epoch
-                    if is_main:
-                        logging.info(
-                            "Epoch anchor offset rotated: epoch=%s offset=%s stride=%s",
-                            current_epoch + 1,
-                            next_offset,
-                            getattr(config, "streaming_anchor_stride", 1),
-                        )
-            train_iterator = iter(loader)
+                        getattr(config, "streaming_anchor_stride", 1),
+                    )
+        train_iterator = iter(loader)
 
         for observation, actions in train_iterator:
             if global_step >= int(config.num_train_steps):
-                break
-            if formal_b1k_mode and global_step >= formal_pass_end:
                 break
             if epoch_anchor_index is not None and global_step >= (epoch_anchor_index + 1) * steps_per_epoch:
                 break
@@ -4377,9 +4750,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             )
                         continue
 
-                    # Backbone backward inherits the outer boundary so ZeRO-2
-                    # finalizes the backbone group, but no update happens yet.
-                    two_phase_update.backward(bb_loss)
+                    # The measured no-optimizer-offload policy requires the
+                    # first phase not to declare the outer update boundary.
+                    two_phase_update.backward_first_phase(bb_loss)
 
                     # Capture scalar metrics only on rank 0. The old code called
                     # .item() for every component on all 64 ranks even though only
@@ -4472,10 +4845,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         continue
 
                     # Expert backward accumulates expert gradients (and
-                    # flow→backbone gradients with KI=OFF). For DeepSpeed this
-                    # phase is marked with the actual outer accumulation
-                    # boundary, but the engine update is still deferred until
-                    # both graphs have been freed below.
+                    # flow→backbone gradients with KI=OFF). As the final phase,
+                    # it always inherits the actual outer accumulation boundary;
+                    # the engine update remains deferred until both graphs have
+                    # been freed below.
                     two_phase_update.backward(ex_loss)
 
                     # Capture scalar metrics only on rank 0; all other ranks keep
@@ -4937,14 +5310,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             "grad_norm_total": grad_norm_value,
                             **extra_metrics,
                         }
-                        if formal_b1k_mode:
-                            info_dict.update(
-                                {
-                                    "formal_pass_index": float(formal_pass_index),
-                                    "formal_pass_offset": float(formal_pass_offset),
-                                    "formal_pass_step": float(global_step - formal_pass_start),
-                                }
-                            )
                         # Per-param-group LRs for π0.5-KI joint query model.
                         if is_pi05_ki_joint:
                             for pg in optimizer.param_groups:
@@ -5061,14 +5426,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 }
                                 if avg_loss_scale is not None:
                                     log_payload["loss_scale"] = avg_loss_scale
-                                if formal_b1k_mode:
-                                    log_payload.update(
-                                        {
-                                            "formal/pass_index": float(formal_pass_index),
-                                            "formal/pass_offset": float(formal_pass_offset),
-                                            "formal/pass_step": float(global_step - formal_pass_start),
-                                        }
-                                    )
 
                                 # --- π0.5-KI structured metrics ---
                                 if is_pi05_ki_joint:
@@ -5180,12 +5537,26 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         )
 
                     # ---- Epoch-end validation with slow metrics (flow_l1) ----
+                    # Restricted to epoch-expressed budgets, and skipped on the
+                    # final step because the post-loop "final validation" below
+                    # already covers it with slow metrics.
+                    #
+                    # Both conditions preserve pre-refactor behaviour exactly.
+                    # The old guard was `not formal_b1k_mode`, which suppressed
+                    # this for ALL formal configs. The legacy fixed-budget formal
+                    # configs (on_bf16 / on_v100_fp32) have num_train_epochs=None
+                    # and so are still suppressed by the first condition; the
+                    # single-epoch H20 formal run's only boundary is its last
+                    # step and so is suppressed by the second. Multi-epoch
+                    # non-formal runs (e.g. a100, 4 epochs) keep firing at
+                    # epochs 1..n-1 as before.
                     if (
-                        not formal_b1k_mode
-                        and val_loader is not None
+                        val_loader is not None
+                        and config.num_train_epochs is not None
                         and steps_per_epoch > 0
                         and global_step % steps_per_epoch == 0
                         and global_step > 0
+                        and global_step < int(config.num_train_steps)
                     ):
                         # Flush training metrics before epoch-end validation writes.
                         _metrics_buffer_flush()
@@ -5204,14 +5575,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             slow_metrics=True,
                             val_label="val_epoch_end",
                         )
-
-                    if formal_b1k_mode:
-                        if global_step > formal_pass_end:
-                            raise RuntimeError(
-                                f"Formal B1K pass {formal_pass_index} overshot boundary {formal_pass_end}: {global_step}"
-                            )
-                        if global_step == formal_pass_end:
-                            break
 
     _close_training_iterator(train_iterator)
 

@@ -41,6 +41,133 @@ _B1K_OBJECT_MAPPING = str(
 )
 _PI05_BASE_CKPT = "checkpoints/pi05_base_pytorch"
 
+# --- H20 warm-start packages -------------------------------------------------
+# The 4x8 NVIDIA_H20 pool mounts behavior-data-hl / navigation-hl /
+# robot-mllm-data-hl and does **not** mount saiwenresearch, so _CANONICAL_BASE_CKPT
+# and _B1K_DATA_ROOT above are unreachable from H20. These are the H20-reachable
+# base packages and are the only ones the H20 entrypoints may use.
+#
+# Each arm deliberately pairs a weight set with the ``assets`` (hence the
+# ``norm_stats.json``) that ships alongside it, because that arm's flow expert and
+# action head were fit in that normalization space:
+#   Arm A "comet base" -- Team Comet's B1K fine-tune. norm_stats sha256
+#       d66ed168…, 6368 B. fp32 weights, model.safetensors 14,467,165,872 B.
+#   Arm B "pi05 base"  -- the pi05 pretrain. norm_stats sha256 4dde119e…,
+#       6361 B. bf16 weights, model.safetensors 7,233,650,408 B.
+# Both expose an identical 812-tensor / 3,616,757,520-parameter state dict and
+# both were measured to cover 100.0000% of the Variant A parameter set with
+# 0 missing / 0 unexpected / 0 shape-mismatched keys (the single absent
+# ``embed_tokens.weight`` is a documented tie to ``paligemma.lm_head.weight``
+# recorded in each file's safetensors ``__metadata__``); see
+# scripts/verify_warm_start_keymap.py --actually-load.
+#
+# NOTE for the A/B write-up: the two arms differ in TWO coupled variables --
+# base weights *and* action normalization -- plus a minor stored-dtype asymmetry
+# (fp32 vs bf16, both downcast to bf16 for training). A comparison between them
+# therefore ranks base *packages*; it does not isolate the weights with
+# normalization held fixed.
+_HL_COMET_B1K_FT_CKPT = (
+    "/mnt/bn/navigation-hl/mlx/users/chenjunting/repo/openpi-comet"
+    "/checkpoints/openpi_comet/pi05-b1kpt50-cs32"
+)
+_HL_PI05_BASE_CKPT = (
+    "/mnt/bn/behavior-data-hl/chenjunting/repo/openpi-comet/checkpoints/pi05_base_pytorch"
+)
+
+# --- Shared FAST action-token capacity for BOTH H20 arms ---------------------
+# EXHAUSTIVELY VERIFIED under Arm A's normalization (norm_stats.json sha256
+# d66ed16830a98f90dde8a315058b4a0df59f5e05734c1686d8b3f66787d0a929, 6368 B) --
+# a DIFFERENT normalization from the one the historical cap-208 bound was proven
+# on. The exhaustive provenance recorded on the V100/A100 FAST configs
+# (run_id=0bb9280746…, manifest=ef4cb52d…, aggregate=51250f15…) belongs to
+# norm_stats 4dde119e… and is deliberately NOT reused here.
+#
+# MEASURED, every window in both populations, no sampling:
+#   train  n=26,857,712 (100%): min 19, p50 37, p99 73, p99.9  98, max 200
+#   val    n=11,398,271 (100%): min 19, p50 38, p99 74, p99.9 102, max 189
+#   windows >208 = 0 and >256 = 0 in both splits.
+# Provenance record (per-split JSON with full histograms, anchor rule, digests):
+#   h20_fastce_scan/exhaustive_W_cap256_20260824_124043/
+# The record asserts SAMPLED_NOT_EXHAUSTIVE=false and windows_scanned ==
+# population_windows, and its anchor_rule (stride 12, offsets [0,4,8], drop) is
+# the formal training contract, so the scanned population IS the population the
+# run consumes. action_dim=23, so only q01/q99 dims 0..22 affect token length.
+#
+# WHY THE OLD BOUND COULD NOT BE REUSED -- now a measured fact, not an argument:
+# the train max under d66ed168 is **200**, which EXCEEDS the known exhaustive max
+# of 199 under 4dde119e, on exactly 1 window in 26,857,712 (3.7e-08). Copying the
+# cap-208 provenance across normalizations would therefore have asserted a max of
+# 199 for a population whose max is 200 -- literally false, not merely unproven.
+#
+# HONEST NOTE ON THE VALUE: 208 would in fact have sufficed (200 < 208, 8 tokens
+# spare). 256 was chosen before this scan existed, from a sampled bound, and is
+# more conservative than the exhaustive result requires -- 56 tokens (28%) of
+# headroom where 8 would have done, costing ~+3% sequence length. It is kept
+# because it is exhaustively proven safe and because changing it now would
+# invalidate this record for no benefit. It is NOT presented as vindicated.
+# For the reader deciding a future cap: the sampled maxima were train 166 / val
+# 178, i.e. they understated the exhaustive maxima by 34 and 11 tokens. A sampled
+# max cannot bound a fail-closed cap; tokenize_action_chunk RAISES rather than
+# truncating, so one over-cap window aborts the run.
+#
+# Raising the cap is metric-neutral, so BOTH arms share one value and the cap
+# never becomes a third confound: padded positions are emitted with mask=False,
+# ar_mask=0 and loss_mask=False, and the action objective divides by
+# shift_loss_mask.sum() -- i.e. CE and accuracy are normalized over valid tokens
+# only.
+#
+# Arm B's population under 4dde119e… is exactly what cap 208 was exhaustively
+# proven on, so 256 is strictly slack there; it is held identical to Arm A purely
+# to keep the A/B comparison clean.
+#
+# To re-audit a different cap or normalization:
+#   h20_fastce_scan/run_exhaustive_gate.sh <P|W|/abs/path/norm_stats.json> <cap> <workers>
+_H20_FAST_ACTION_TOKEN_MAX_LEN = 256
+
+# Shared schedule/data recipe for the two H20 formal arms. Held in one place so
+# the A/B comparison cannot drift on anything except the warm-start package.
+#
+# Nothing here is a step budget: ``num_train_steps=0`` and ``decay_steps=0`` are
+# sentinels meaning "derive at runtime". train_accelerate.py computes
+#   steps_per_epoch = eligible_anchors // global_batch
+#   num_train_steps = num_train_epochs * steps_per_epoch
+#   decay_steps     = num_train_steps            (auto-set when <= 0)
+# so changing the batch or the stride rescales the budget automatically instead
+# of silently changing how much data a fixed step count covers.
+#
+# num_train_epochs=1 is ONE full stride-4 sweep. The previous recipe's three
+# stride-12 passes (offsets 0/4/8) union to exactly this same anchor set, so
+# this preserves the historical sample budget of 26,857,472 exactly while
+# removing the decomposition and its two mid-run dataloader rebuilds.
+#
+# peak_lr 2e-5 is sqrt scaling of the 1e-5 used at global batch 256
+# (1e-5 * sqrt(1024/256) = 2e-5). Sqrt rather than linear because the optimizer
+# is AdamW, whose update is normalized by the gradient RMS and is therefore
+# largely invariant to gradient scale -- the linear rule's SGD derivation does
+# not transfer. The deciding factor is risk asymmetry: too low still trains and
+# still answers the backbone question, too high risks divergence and warm-start
+# damage across days of 32 H20.
+#
+# The two cadences are expressed in SAMPLES, not steps, because a step-valued
+# cadence silently changes meaning when the batch changes. Both reproduce the
+# historical cadence exactly at the new batch:
+#   val  256,000 samples // 1024 =  250 steps  (was 1,000 steps @ 256)
+#   save 2,560,000 samples // 1024 = 2,500 steps  (was 10,000 steps @ 256)
+_H20_FORMAL_RECIPE = {
+    "batch_size_per_gpu": 32,
+    "gradient_accumulation_steps": 1,
+    "expected_global_batch": 1024,
+    "num_train_epochs": 1,
+    "num_train_steps": 0,
+    "decay_steps": 0,
+    "warmup_steps": 250,
+    "peak_lr": 2e-5,
+    "decay_lr": 0.0,
+    "streaming_anchor_stride": 4,
+    "val_interval_samples": 1_000 * 256,
+    "save_interval_samples": 10_000 * 256,
+}
+
 
 def _make_b1k_subtask_data_config(episodes_index: list[int] | None = None) -> LeRobotB1KDataConfig:
     """Shared B1K data config with subtask annotations.
@@ -601,11 +728,17 @@ def _make_pi05_ki_joint_full_task_set_config(
     decay_lr: float = 0.0,
     batch_size_per_gpu: int = 8,
     gradient_accumulation_steps: int = 1,
+    expected_global_batch: int | None = None,
+    num_workers: int = 2,
     save_interval: int = 10_000,
+    checkpoint_policy: str = "step",
+    rolling_checkpoint_interval: int = 10_000,
     val_log_interval: int = 1_000,
     val_num_batches: int = 20,
+    val_interval_samples: int | None = None,
+    save_interval_samples: int | None = None,
     log_interval: int = 10,
-    streaming_anchor_stride: int = 12,
+    streaming_anchor_stride: int = 1,
     action_repr: str = "query_mse",
     action_token_max_len: int = 64,
     precision: str = "bfloat16",
@@ -638,8 +771,11 @@ def _make_pi05_ki_joint_full_task_set_config(
     the Skill-Bridge variant runs with the standard stride-1 data loader and
     the caller's ``num_train_epochs`` / ``num_train_steps`` budget.
 
-    ``streaming_anchor_stride`` (default 12, matching the formal control) pins
-    the B1K chunk-streaming anchor stride for the *training* loader. It is
+    ``streaming_anchor_stride`` (default 1 == every frame is an anchor) pins
+    the B1K chunk-streaming anchor stride for the *training* loader. The
+    default is deliberately the identity: a stride is a data-subsampling
+    policy, so any config that subsamples must say so at its own call site
+    rather than inheriting it invisibly from this signature. It is
     stored on ``TrainConfig``; the trainer applies it by setting
     ``OPENPI_B1K_ANCHOR_STRIDE`` scoped to the train-loader construction. The
     validation loader always runs with the baseline stride-1 / no-drop
@@ -705,17 +841,40 @@ def _make_pi05_ki_joint_full_task_set_config(
         assets_base_dir=f"{output_root}/assets",
         checkpoint_base_dir=f"{output_root}/checkpoints",
         log_base_dir=f"{output_root}/logs",
-        num_workers=2,
+        num_workers=num_workers,
         batch_size_per_gpu=batch_size_per_gpu,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        expected_global_batch=expected_global_batch,
         save_interval=save_interval,
-        checkpoint_policy="step",
-        rolling_checkpoint_interval=10_000,
+        checkpoint_policy=checkpoint_policy,
+        rolling_checkpoint_interval=rolling_checkpoint_interval,
         log_interval=log_interval,
         val_log_interval=val_log_interval,
         val_num_batches=val_num_batches,
+        val_interval_samples=val_interval_samples,
+        save_interval_samples=save_interval_samples,
         streaming_anchor_stride=streaming_anchor_stride,
         epoch_anchor_offsets=epoch_anchor_offsets,
+    )
+
+
+def _make_v100_fast_profile(*, name: str, val_log_interval: int = 1_000) -> TrainConfig:
+    """Build the V100 FAST recipe; validation profiles may change cadence only."""
+    return _make_pi05_ki_joint_full_task_set_config(
+        name=name,
+        behavior_dataset_root=_B1K_DATA_ROOT,
+        base_checkpoint_path=_CANONICAL_BASE_CKPT,
+        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
+        batch_size_per_gpu=1,
+        gradient_accumulation_steps=8,
+        expected_global_batch=256,
+        action_repr="fast_ce",
+        num_train_steps=104_912,
+        decay_steps=104_912,
+        streaming_anchor_stride=4,
+        val_log_interval=val_log_interval,
+        action_token_max_len=208,
+        precision="float32",
     )
 
 
@@ -841,6 +1000,22 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # This is the non-Skill-Bridge control (Tracking Run 2). Left untouched.
     _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_bf16",
+        expected_global_batch=256,
+        # stride/budget were previously inherited from the factory defaults.
+        # They are now explicit because the factory default became stride 1.
+        #
+        # stride is 4, NOT the historical 12. These configs used to rely on the
+        # trainer rotating three stride-12 offsets (0, 4, 8) at pass boundaries;
+        # that machinery is gone, and stride 12 with a single fixed offset would
+        # cover only 1/12 of frames and wrap ~3x over the same subset, silently
+        # cutting unique data to 33.3% with no visible effect on the loss curve.
+        # {0,4,8} mod 12 unions to exactly {0} mod 4, so stride 4 reproduces the
+        # old three-pass anchor set exactly, and one stride-4 sweep at global
+        # batch 256 is 26,857,712 // 256 = 104,912 steps -- identical to the
+        # budget below. Coverage and step count are both preserved exactly.
+        num_train_steps=104_912,
+        decay_steps=104_912,
+        streaming_anchor_stride=4,
     ),
     # Variant A of the same control: identical data, schedule, batch size, flow
     # expert and knowledge insulation, with the backbone action objective
@@ -850,31 +1025,24 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
     # which this repository has never actually run.
     _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_fast_b1k-full_task-ki_on_bf16",
+        expected_global_batch=256,
         action_repr="fast_ce",
+        # See sibling above: previously implicit factory defaults, now explicit,
+        # and stride 4 rather than 12 for the same union-identity reason.
+        num_train_steps=104_912,
+        decay_steps=104_912,
+        streaming_anchor_stride=4,
     ),
     # Formal 4x8 V100 FP32 pair. B1/GPU x world32 x GA8 preserves the formal
     # global batch 256, optimizer-step budget, pass boundaries and exposure.
     # LQ-compatible data/checkpoint inputs are explicit; launcher-level path
     # overrides must pass the same strict formal contract before training.
-    _make_pi05_ki_joint_full_task_set_config(
+    _make_v100_fast_profile(
         name="pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32",
-        behavior_dataset_root=_B1K_DATA_ROOT,
-        base_checkpoint_path=_CANONICAL_BASE_CKPT,
-        base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
-        batch_size_per_gpu=1,
-        gradient_accumulation_steps=8,
-        action_repr="fast_ce",
-        # Exhaustive formal train population: 26,857,712 chunks, max 199 tokens
-        # including BOS/EOS, p99.9=99, and 30,554 chunks >96. Cap 208 is the
-        # smallest 16-aligned value >=199 (+9 tokens, 4.52% headroom); any input
-        # identity change requires a rescan rather than relying on this margin.
-        # Tail attribution found ep12780's eight >=160-token windows are
-        # overlapping views of one local dynamics burst, not independent samples.
-        # Provenance: run_id=0bb9280746094702c226099205ba0c84b0d44aa4f976d2ad3f4a3f1400a6d760
-        # manifest=ef4cb52d59023664a3ddc2edfbb0dc2edeece7ee001d1bc3931e6661c6578f0e
-        # aggregate=51250f1571edc47bf8f0b6bbfffa1b718ab36cd616a94ff05f756bea23a2b25e
-        action_token_max_len=208,
-        precision="float32",
+    ),
+    _make_v100_fast_profile(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32_validation10",
+        val_log_interval=10,
     ),
     _make_pi05_ki_joint_full_task_set_config(
         name="pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32",
@@ -883,7 +1051,15 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         base_assets_dir=f"{_CANONICAL_BASE_CKPT}/assets",
         batch_size_per_gpu=1,
         gradient_accumulation_steps=8,
+        expected_global_batch=256,
         action_repr="query_mse",
+        # Previously implicit factory defaults, now explicit (factory default
+        # stride became 1), and stride 4 rather than 12: see the on_bf16 sibling
+        # above -- {0,4,8} mod 12 == {0} mod 4, so stride 4 reproduces the old
+        # three-pass coverage exactly and 104,912 steps is exactly one sweep.
+        num_train_steps=104_912,
+        decay_steps=104_912,
+        streaming_anchor_stride=4,
         precision="float32",
     ),
     # Matched 4x8 V100 FP32 debug pair. These deliberately use B1 and a five-
@@ -990,6 +1166,8 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         precision="bfloat16",
         streaming_anchor_stride=4,
         epoch_anchor_offsets=[0, 1, 2, 3],
+        checkpoint_policy="epoch_with_rolling",
+        rolling_checkpoint_interval=10_000,
         project_name="pi05_ki_a100",
     ),
     _make_pi05_ki_joint_full_task_set_config(
@@ -1009,6 +1187,149 @@ _PI05_KI_JOINT_QUERY_CONFIGS = [
         precision="bfloat16",
         streaming_anchor_stride=4,
         epoch_anchor_offsets=[0, 1, 2, 3],
+        checkpoint_policy="epoch_with_rolling",
+        rolling_checkpoint_interval=10_000,
         project_name="pi05_ki_a100",
+    ),
+    # ------------------------------------------------------------------
+    # Formal 4x8 NVIDIA_H20 BF16 Variant A pair: two warm-start packages.
+    #
+    # This is a controlled two-arm experiment. Everything is held identical --
+    # model, objective (fast_ce), FAST capacity, data root, schedule, B32/GA1
+    # global batch 1024, a single stride-4 sweep, and the epoch-derived
+    # optimizer-step budget -- EXCEPT the warm-start package.
+    #
+    # DATA POLICY (was: "stride-12 three-pass rotation with offsets (0,4,8)").
+    # Those three passes were an unnecessary decomposition of ONE stride-4
+    # epoch: the anchor sets {0,4,8} mod 12 union to exactly {0} mod 4, so the
+    # rotation re-derived a stride-4 sweep in three pieces and paid for it with
+    # two mid-training dataloader rebuilds. Verified against the episode
+    # metadata (meta/episodes.jsonl, action_horizon=32, first 180 sorted
+    # episodes of each of the 50 tasks):
+    #   raw train frames                       107,696,389
+    #   horizon-eligible anchors @ stride 4      26,857,712
+    #   @ stride 12 offsets 0/4/8   8,955,603 + 8,952,584 + 8,949,525
+    #                                         =  26,857,712   (union delta 0)
+    #   //256 -> 34,982 + 34,971 + 34,959      =     104,912 steps  (old budget)
+    #   //1024 (one sweep)                     =      26,228 steps  (new budget)
+    # Both consume 26,857,472 samples, so the sample budget is UNCHANGED; only
+    # the decomposition and the batch differ. Sample ORDER does change
+    # (interleaved stride-4 rather than three offset-blocked sweeps), so step
+    # metrics are not bit-comparable with runs before this commit.
+    # ------------------------------------------------------------------
+    #
+    #   h20_bf16          Arm A "comet base": pi05-b1kpt50-cs32 + its own assets
+    #                     (norm_stats d66ed168…). Team Comet's B1K fine-tune;
+    #                     this is the weight set our verified RGBWrapper easy-8
+    #                     baseline (mean q 0.347044) actually served.
+    #   h20_pi05base_bf16 Arm B "pi05 base": pi05_base_pytorch + its own assets
+    #                     (norm_stats 4dde119e…). The pretrain cont2 trained from.
+    #
+    # Each arm pairs weights with the normalization they were fit under, which is
+    # the intended design. It also means the arms differ in TWO coupled variables
+    # (weights AND action normalization), so the comparison ranks base *packages*
+    # rather than isolating the weights. Measured divergence between the two
+    # weight sets is substantial (~20.7% mean relative difference over probe
+    # tensors; action_out_proj 15.3%, gemma_expert.lm_head 141%), while the tied
+    # vocab embedding is nearly identical (0.0032%) -- so near-identical initial
+    # token-embedding statistics between arms are expected and are NOT evidence
+    # of a failed load.
+    #
+    # Both arms share _H20_FAST_ACTION_TOKEN_MAX_LEN so capacity cannot become a
+    # third confound; see that constant for the sampled-scan provenance and why
+    # it is 256 rather than 208.
+    #
+    # Neither arm may reference saiwenresearch: the H20 pool does not mount it.
+    # ------------------------------------------------------------------
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        base_checkpoint_path=_HL_COMET_B1K_FT_CKPT,
+        base_assets_dir=f"{_HL_COMET_B1K_FT_CKPT}/assets",
+        action_repr="fast_ce",
+        action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
+        precision="bfloat16",
+        checkpoint_policy="epoch_with_rolling",
+        # The materialized H20 save cadence is 2,500 optimizer steps.
+        rolling_checkpoint_interval=2_500,
+        **_H20_FORMAL_RECIPE,
+    ),
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        base_checkpoint_path=_HL_PI05_BASE_CKPT,
+        base_assets_dir=f"{_HL_PI05_BASE_CKPT}/assets",
+        action_repr="fast_ce",
+        action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
+        precision="bfloat16",
+        checkpoint_policy="epoch_with_rolling",
+        # The materialized H20 save cadence is 2,500 optimizer steps.
+        rolling_checkpoint_interval=2_500,
+        **_H20_FORMAL_RECIPE,
+    ),
+    # Bounded H20 smoke pair. These exist because the formal contract in
+    # train_accelerate.py hard-pins num_train_steps=104,912, so a short run
+    # cannot use the formal config names. They keep B8/GA1 -- the whole point is
+    # to measure the real after-backward memory peak and prove NCCL init, the
+    # warm start and finite loss/grad at the formal per-GPU batch -- but drop to
+    # stride 1 and a single-digit optimizer-step budget. FAST capacity is held at
+    # the formal value so the smoke exercises the same fail-closed data contract
+    # instead of masking a formal overflow.
+    #
+    # val_log_interval is 4, NOT the budget length. This is a hard requirement,
+    # not a tuning choice: validation fires on
+    # ``global_step % val_log_interval == 0 and global_step > 0``, so an interval
+    # equal to num_train_steps would put the only validation exactly on the
+    # termination boundary, and an interval above the budget would skip
+    # validation entirely. Either way the smoke would never call
+    # ``compute_eval_metrics`` -- which is precisely where Variant A's known
+    # historical failure lives (the trainer passes ``deterministic_flow`` to both
+    # KI variants unconditionally, and Variant A's override lacked it, killing an
+    # A100 FAST run at its first validation after ~2h40m of training). A smoke
+    # that cannot reach the code path with a known failure mode is not a gate.
+    # At 4, an 8-step run validates twice (steps 4 and 8).
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16_smoke",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        base_checkpoint_path=_HL_COMET_B1K_FT_CKPT,
+        base_assets_dir=f"{_HL_COMET_B1K_FT_CKPT}/assets",
+        num_train_steps=8,
+        num_train_epochs=None,
+        warmup_steps=1,
+        peak_lr=1e-5,
+        decay_steps=8,
+        decay_lr=0.0,
+        batch_size_per_gpu=8,
+        gradient_accumulation_steps=1,
+        save_interval=8,
+        val_log_interval=4,
+        val_num_batches=1,
+        log_interval=1,
+        streaming_anchor_stride=1,
+        action_repr="fast_ce",
+        action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
+        precision="bfloat16",
+    ),
+    _make_pi05_ki_joint_full_task_set_config(
+        name="pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16_smoke",
+        behavior_dataset_root=_HL_B1K_DATA_ROOT,
+        base_checkpoint_path=_HL_PI05_BASE_CKPT,
+        base_assets_dir=f"{_HL_PI05_BASE_CKPT}/assets",
+        num_train_steps=8,
+        num_train_epochs=None,
+        warmup_steps=1,
+        peak_lr=1e-5,
+        decay_steps=8,
+        decay_lr=0.0,
+        batch_size_per_gpu=8,
+        gradient_accumulation_steps=1,
+        save_interval=8,
+        val_log_interval=4,
+        val_num_batches=1,
+        log_interval=1,
+        streaming_anchor_stride=1,
+        action_repr="fast_ce",
+        action_token_max_len=_H20_FAST_ACTION_TOKEN_MAX_LEN,
+        precision="bfloat16",
     ),
 ]

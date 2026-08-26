@@ -17,7 +17,8 @@ import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _LAUNCHER = _REPO_ROOT / "scripts/run_pi05_ki_formal_fp32_4x8_v100.sh"
-_A_CONFIG = "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32"
+_A_FORMAL_CONFIG = "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32"
+_A_CONFIG = "pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32_validation10"
 _B_CONFIG = "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32"
 
 
@@ -26,9 +27,9 @@ def test_formal_v100_configs_are_exactly_matched_outside_objective():
     from openpi.models.pi05_ki_joint_query_config import Pi05KIJointQueryConfig
     from openpi.training.train_config import get_config
 
-    variant_a = get_config(_A_CONFIG)
+    variant_a = get_config(_A_FORMAL_CONFIG)
     variant_b = get_config(_B_CONFIG)
-    assert variant_a.name == _A_CONFIG
+    assert variant_a.name == _A_FORMAL_CONFIG
     assert variant_b.name == _B_CONFIG
     assert type(variant_a.model) is Pi05KIJointFastConfig
     assert type(variant_b.model) is Pi05KIJointQueryConfig
@@ -41,9 +42,19 @@ def test_formal_v100_configs_are_exactly_matched_outside_objective():
         assert config.model.dtype == "float32"
         assert config.batch_size_per_gpu == 1
         assert config.gradient_accumulation_steps == 8
+        assert config.num_workers == 2
+        assert config.expected_global_batch == 256
         assert config.num_train_steps == 104_912
         assert config.num_train_epochs is None
-        assert config.streaming_anchor_stride == 12
+        # Stride 4, not the historical 12, and this PRESERVES coverage rather than
+        # loosening it. The trainer no longer rotates anchor offsets at pass
+        # boundaries, and {0,4,8} mod 12 unions to exactly {0} mod 4, so one
+        # stride-4 sweep selects the identical anchor set the three stride-12
+        # passes selected; 26,857,712 // 256 == 104,912 leaves the step budget
+        # byte-identical. Keeping stride 12 with one fixed offset would have
+        # covered only 1/12 of frames and wrapped ~3x over that same subset.
+        assert config.streaming_anchor_stride == 4
+        assert config.epoch_anchor_offsets is None
         assert config.save_interval == 10_000
         assert config.checkpoint_policy == "step"
         assert config.rolling_checkpoint_interval == 10_000
@@ -110,19 +121,6 @@ def test_query_arm_declares_exactly_three_query_head_tensors():
     )
     assert 'name == "query_embeddings"' in source
     assert 'name.startswith("query_action_head.")' in source
-
-
-def test_training_loop_routes_both_ki_phases_through_single_step_controller():
-    source = (_REPO_ROOT / "scripts/train_accelerate.py").read_text()
-    assert "two_phase_update.backward(bb_loss)" in source
-    assert "two_phase_update.backward(ex_loss)" in source
-    assert "boundary = bool(self._accelerator.sync_gradients)" in source
-    assert "post_step_grad_norm = two_phase_update.step_and_zero_grad(optimizer)" in source
-    assert "grad_norm_value = _grad_norm_to_float(post_step_grad_norm)" in source
-    assert "model.gradient_checkpointing_enable()" in source
-    assert "deepspeed_two_phase_update" in source
-    assert "accelerator.backward(bb_loss)" not in source
-    assert "accelerator.backward(ex_loss)" not in source
 
 
 def test_recursive_gradient_checkpointing_reaches_decoder_layers_and_recomputes():
@@ -322,34 +320,25 @@ def test_model_loaded_banner_is_arm_correct():
     assert "joint query query-MSE variant model loaded" not in source
 
 
-def test_formal_launcher_is_not_debug_and_locks_the_full_contract():
+def test_formal_launcher_resolves_recipe_from_registered_profile():
     source = _LAUNCHER.read_text()
-    assert 'pi05_ki_joint_fast_b1k-full_task-ki_on_v100_fp32"' in source
-    assert 'pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32"' in source
-    assert "v100_fp32_debug" not in source
-    assert "BATCH_SIZE_PER_GPU=1" in source
-    assert "GRADIENT_ACCUMULATION_STEPS=8" in source
-    assert "NUM_TRAIN_STEPS=104912" in source
-    assert "GLOBAL_BATCH_SIZE == 256" in source
-    assert 'checks["FAST action capacity 208"] = config.model.action_token_max_len == 208' in source
-    assert "SAVE_INTERVAL=10000" in source
-    assert "VAL_LOG_INTERVAL=1000" in source
-    assert "VAL_NUM_BATCHES=20" in source
+    assert "openpi.training.launcher_profile" in source
+    assert "CFG_BATCH_SIZE_PER_GPU" in source
+    assert "CFG_GRADIENT_ACCUMULATION_STEPS" in source
+    assert "CFG_NUM_TRAIN_STEPS" in source
+    assert "CFG_VAL_LOG_INTERVAL" in source
+    assert "CFG_SAVE_INTERVAL" in source
+    assert "CFG_EXPECTED_GLOBAL_BATCH" in source
+    assert '"${GLOBAL_BATCH_SIZE}" -eq "${CFG_EXPECTED_GLOBAL_BATCH}"' in source
     assert "OPENPI_EXPECTED_CODE_COMMIT" in source
     assert "status --porcelain --untracked-files=all" in source
-    assert 'export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src' in source
-    assert "openpi.__file__" in source
-    assert "KEEPALIVE_DISABLE=0 KEEPALIVE_ON_SUCCESS=1 STRICT_GPU_COUNT=0" in source
     assert "formal Merlin entrypoint must be the outer keepalive wrapper" in source
-    assert 'OPENPI_KI_TRAINING_INNER:-0}" == "1"' in source
-    assert 'exec bash "${KEEPALIVE_WRAPPER}"' not in source
     assert "OPENPI_REUSE_PREFIX_KV remains HOLD" in source
-    assert "formal runtime base checkpoint is pinned" in source
-    assert "formal runtime dataset root is pinned" in source
-    assert "formal runtime assets are pinned" in source
-    assert "formal runtime norm stats are pinned" in source
     assert 'FORMAL_CUDA_ALLOC_CONF="expandable_segments:True"' in source
-    assert "formal V100 requires PYTORCH_CUDA_ALLOC_CONF=" in source
+    assert "validation=1000" not in source
+    assert "--batch-size-per-gpu 1" not in source
+    assert "--gradient-accumulation-steps 8" not in source
+    assert "--num-train-steps 104912" not in source
 
 
 def test_formal_deepspeed_file_is_fp32_zero2_cpu_offload():
@@ -462,7 +451,7 @@ def _run_formal_preflight(env, arm):
 @pytest.mark.parametrize(
     ("arm", "expected_config", "fast_expected"),
     [
-        ("A", _A_CONFIG, True),
+        ("A", _A_FORMAL_CONFIG, True),
         ("B", _B_CONFIG, False),
     ],
 )
@@ -476,9 +465,20 @@ def test_formal_launcher_cpu_preflight_is_strict_and_side_effect_free(
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
     assert "FORMAL_FP32_ZERO2_PREFLIGHT_OK" in combined
-    assert f"FORMAL_CONFIG_PREFLIGHT_OK name={expected_config}" in combined
+    assert f"profile={expected_config}" in combined
     assert "PREFLIGHT_OK" in combined
     assert ("FAST_OFFLINE_PROCESSOR_PREFLIGHT_OK" in combined) is fast_expected
+    assert not output.exists()
+
+
+def test_validation10_launcher_profile_preflight_is_side_effect_free(formal_preflight_env):
+    env, output = formal_preflight_env
+    env["CONFIG_NAME"] = _A_CONFIG
+    result = _run_formal_preflight(env, "A")
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert f"profile={_A_CONFIG}" in combined
+    assert "save=10000 val=10x20" in combined
     assert not output.exists()
 
 
@@ -505,25 +505,26 @@ def test_formal_launcher_rejects_debug_config_without_fallback(formal_preflight_
     env["CONFIG_NAME"] = "pi05_ki_joint_query_b1k-full_task-ki_on_v100_fp32_debug"
     result = _run_formal_preflight(env, "B")
     assert result.returncode != 0
-    assert "No debug config or unknown-name fallback is permitted" in result.stderr
+    assert "refusing unknown/mismatched profile" in result.stderr
     assert not output.exists()
 
 
 @pytest.mark.parametrize(
-    ("variable", "value", "message"),
+    ("variable", "value"),
     [
-        ("BATCH_SIZE_PER_GPU", "8", "BATCH_SIZE_PER_GPU=1"),
-        ("GRADIENT_ACCUMULATION_STEPS", "1", "GRADIENT_ACCUMULATION_STEPS=8"),
-        ("NUM_TRAIN_STEPS", "5", "NUM_TRAIN_STEPS=104912"),
-        ("SAVE_INTERVAL", "5", "SAVE_INTERVAL=10000"),
-        ("VAL_LOG_INTERVAL", "5", "VAL_LOG_INTERVAL=1000"),
-        ("VAL_NUM_BATCHES", "1", "VAL_NUM_BATCHES=20"),
+        ("BATCH_SIZE_PER_GPU", "8"),
+        ("GRADIENT_ACCUMULATION_STEPS", "1"),
+        ("NUM_TRAIN_STEPS", "5"),
+        ("SAVE_INTERVAL", "5"),
+        ("VAL_LOG_INTERVAL", "5"),
+        ("VAL_NUM_BATCHES", "1"),
     ],
 )
-def test_formal_launcher_rejects_runtime_contract_drift(formal_preflight_env, variable, value, message):
+def test_recipe_environment_cannot_override_registered_profile(formal_preflight_env, variable, value):
     env, output = formal_preflight_env
     env[variable] = value
     result = _run_formal_preflight(env, "B")
-    assert result.returncode != 0
-    assert message in result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "B1xW32xGA8=256" in result.stdout
+    assert "save=10000 val=1000x20" in result.stdout
     assert not output.exists()

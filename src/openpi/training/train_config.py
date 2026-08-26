@@ -92,6 +92,10 @@ class TrainConfig:
     seed: int = 42
     batch_size: int = 32
     batch_size_per_gpu: int | None = None
+    # Optional protocol lock used by formal launchers/trainers after resolving
+    # the actual world size. This remains profile metadata rather than a shell or
+    # trainer literal, so batch-shape changes have one authoritative edit site.
+    expected_global_batch: int | None = None
     num_workers: int = 2
     num_train_steps: int = 30_000
     num_train_epochs: int | None = None
@@ -141,6 +145,18 @@ class TrainConfig:
     # materializes this as ``OPENPI_B1K_ANCHOR_STRIDE`` scoped to train-dataset
     # construction. Default 1 preserves pre-existing behavior.
     streaming_anchor_stride: int = 1
+
+    # ---- Batch-invariant cadences (opt-in) ----
+    # ``save_interval`` and ``val_log_interval`` are expressed in OPTIMIZER
+    # STEPS, so their meaning silently changes whenever the global batch
+    # changes: "every 1000 steps" becomes 4x rarer in sample terms when the
+    # batch is raised 4x. When these ``*_samples`` fields are set the trainer
+    # derives the step interval at runtime as
+    # ``max(1, samples // global_batch)``, holding the cadence fixed in samples
+    # across any batch or world-size change. Default None leaves the
+    # step-valued fields authoritative, so existing configs are unchanged.
+    val_interval_samples: int | None = None
+    save_interval_samples: int | None = None
 
     # Per-epoch anchor offsets for streaming-anchor training. When set, the
     # trainer rebuilds the training dataloader at each epoch boundary with
@@ -247,6 +263,8 @@ class TrainConfig:
 
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("--gradient_accumulation_steps must be a positive integer.")
+        if self.expected_global_batch is not None and self.expected_global_batch <= 0:
+            raise ValueError("--expected_global_batch must be positive when set.")
 
         if not isinstance(self.gradient_checkpointing, bool):
             raise ValueError("--gradient_checkpointing must be a boolean flag.")
