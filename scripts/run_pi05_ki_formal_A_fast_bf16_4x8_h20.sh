@@ -31,7 +31,7 @@
 #   * action_token_max_len=256 — shared by both arms so capacity can never be a
 #     third confound. SAMPLED (not exhaustive) bound under d66ed168; see the
 #     _H20_FAST_ACTION_TOKEN_MAX_LEN comment in pi05_ki_joint_query_config.py.
-#   * W&B project pi05_ki, fresh run, NO resume
+#   * W&B project pi05_ki; fresh by default, engineering resume when OPENPI_RESUME=1
 #
 # H20 mounts behavior-data-hl / navigation-hl / robot-mllm-data-hl and does NOT
 # mount saiwenresearch, so every pinned path here is HL-side.
@@ -180,7 +180,7 @@ GLOBAL_BATCH_SIZE=$(( CFG_BATCH_SIZE_PER_GPU * TOTAL_GPUS * CFG_GRADIENT_ACCUMUL
 [[ -n "${CFG_EXPECTED_GLOBAL_BATCH}" && "${GLOBAL_BATCH_SIZE}" -eq "${CFG_EXPECTED_GLOBAL_BATCH}" ]] \
   || die "profile ${CFG_NAME} requires global batch ${CFG_EXPECTED_GLOBAL_BATCH}, got ${GLOBAL_BATCH_SIZE}"
 
-# ---- W&B (fresh, no resume) ------------------------------------------------
+# ---- W&B (trainer owns fresh/resume identity) ------------------------------
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_DISABLED="${WANDB_DISABLED:-0}"
 [[ "${WANDB_MODE}" == "online" ]] || die "formal runs require WANDB_MODE=online"
@@ -300,7 +300,10 @@ if mode == "formal":
         "save cadence expressed in samples": cfg.save_interval_samples is not None,
         "val cadence divides into >=1 step": cfg.val_interval_samples // global_batch >= 1,
         "save cadence divides into >=1 step": cfg.save_interval_samples // global_batch >= 1,
-        "val20": cfg.val_num_batches == 20,
+        "formal val batch size 8": cfg.val_batch_size == 8,
+        "formal val 16 batches/rank": cfg.val_num_batches == 16,
+        "formal val 20 episodes/task": cfg.val_episodes_per_task == 20,
+        "formal val 4 anchors/episode": cfg.val_anchors_per_episode == 4,
     })
 else:
     checks.update({
@@ -478,6 +481,10 @@ TRAIN_ARGS=(
 )
 if [[ "${CFG_GRADIENT_CHECKPOINTING}" == 1 ]]; then TRAIN_ARGS+=(--gradient-checkpointing); fi
 if [[ -n "${CFG_NUM_TRAIN_EPOCHS}" ]]; then TRAIN_ARGS+=(--num-train-epochs "${CFG_NUM_TRAIN_EPOCHS}"); fi
+if [[ "${OPENPI_RESUME:-0}" == "1" ]]; then
+  TRAIN_ARGS+=(--resume)
+  info "engineering resume enabled: optimizer resume; data order restart"
+fi
 
 python -m accelerate.commands.launch \
   --config_file "${ACCEL_CONFIG}" \

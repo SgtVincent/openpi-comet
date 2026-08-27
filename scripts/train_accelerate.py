@@ -474,6 +474,10 @@ _FORMAL_B1K_CHECKPOINT_POLICIES = {
     "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16": "epoch_with_rolling",
 }
 _FORMAL_B1K_CONFIGS = set(_FORMAL_B1K_CHECKPOINT_POLICIES)
+_H20_FORMAL_B1K_CONFIGS = {
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16",
+    "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_pi05base_bf16",
+}
 # H20 shares the A100 memory policy: ZeRO-2 with the optimizer resident on GPU.
 # H20 carries ~96 GB HBM3 versus A100-40GB, so if no-offload is safe on A100 it
 # is safe here; the bounded smoke still has to produce the real measured peak.
@@ -527,7 +531,13 @@ def _validate_profile_recipe_unchanged(config, *, world_size: int | None = None)
         "num_workers",
         "save_interval",
         "val_log_interval",
+        "val_batch_size",
         "val_num_batches",
+        "val_episodes_per_task",
+        "val_anchors_per_episode",
+        "val_deterministic_subset",
+        "val_deterministic_flow",
+        "val_log_per_task",
         "val_interval_samples",
         "save_interval_samples",
         "streaming_anchor_stride",
@@ -667,10 +677,25 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
                 f"Formal B1K requires {field}={expected!r}; got {actual!r}. "
                 "Runtime overrides are not supported."
             )
-    if bool(getattr(config, "resume", False)):
+    if getattr(config, "name", None) in _H20_FORMAL_B1K_CONFIGS:
+        h20_validation_fields = {
+            "val_batch_size": 8,
+            "val_num_batches": 16,
+            "val_episodes_per_task": 20,
+            "val_anchors_per_episode": 4,
+            "val_deterministic_subset": True,
+            "val_deterministic_flow": True,
+            "val_log_per_task": True,
+        }
+        for field, expected in h20_validation_fields.items():
+            actual = getattr(config, field, None)
+            if actual != expected:
+                raise ValueError(
+                    f"Formal H20 validation requires {field}={expected}; got {actual!r}"
+                )
+    elif bool(getattr(config, "resume", False)):
         raise ValueError(
-            "Formal B1K resume is unsupported: checkpoints are weights/evaluation artifacts, "
-            "not exact data-order resume points"
+            "Formal B1K resume is supported only for the two H20 formal profiles"
         )
     if len(config.data) != 1 or len(config.val_data) != 1:
         raise ValueError("Formal B1K requires exactly one train and one validation data config")
@@ -806,7 +831,7 @@ def _validate_formal_b1k_contract(config, *, accelerator=None) -> None:
                 raise ValueError("Formal V100 FP32 requires DeepSpeed CPU optimizer offload")
 
 
-def _init_formal_b1k_wandb(config, *, accelerator) -> None:
+def _init_formal_b1k_wandb(config, *, accelerator, resuming: bool = False) -> None:
     """Require rank-0 Byted-W&B init and broadcast one matched result."""
 
     if not _is_formal_b1k_mode(config) or config.prepare_hf_cache_only:
@@ -815,7 +840,7 @@ def _init_formal_b1k_wandb(config, *, accelerator) -> None:
     error = None
     if accelerator.is_main_process:
         try:
-            _init_wandb_run(config, resuming=False)
+            _init_wandb_run(config, resuming=resuming)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
 
@@ -977,27 +1002,333 @@ def _checkpoint_step_from_dir(checkpoint_dir: Path) -> int | None:
         return None
 
 
-def _latest_step_dir(checkpoint_dir: Path) -> tuple[int, Path] | None:
-    """Discover the newest durable or atomically published rolling checkpoint."""
+def _basic_checkpoint_step(checkpoint_dir: Path) -> int | None:
+    """Return a step only when metadata, manifest, and resume state agree."""
+    step = _checkpoint_step_from_dir(checkpoint_dir)
+    if step is None:
+        return None
+    try:
+        metadata = torch.load(
+            checkpoint_dir / "metadata.pt", map_location="cpu", weights_only=False
+        )
+        manifest = json.loads((checkpoint_dir / "manifest.json").read_text())
+        metadata_step = int(metadata["global_step"])
+        manifest_step = int(manifest["run_metadata"]["global_step"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if step != metadata_step or step != manifest_step:
+        return None
+    if not (checkpoint_dir / "accelerate_state").is_dir():
+        return None
+    return step
+
+
+def _latest_step_dir(
+    checkpoint_dir: Path,
+    *,
+    checkpoint_policy: str | None = None,
+) -> tuple[int, Path] | None:
+    """Discover a durable or atomically published rolling checkpoint.
+
+    ``epoch_with_rolling`` treats ``rolling_latest`` as the current run's
+    publication pointer and therefore prefers it over numeric directories that
+    may belong to an older run. If no pointer exists, numeric discovery remains
+    the compatibility fallback. An existing but invalid pointer fails closed.
+    """
     if not checkpoint_dir.exists():
         return None
 
-    durable_steps = [
-        int(d.name)
+    prefer_rolling = checkpoint_policy == _CHECKPOINT_POLICY_EPOCH_WITH_ROLLING
+    durable_candidates = [
+        d
         for d in checkpoint_dir.iterdir()
         if d.is_dir() and not d.is_symlink() and d.name.isdigit()
     ]
     latest = None
-    if durable_steps:
-        step = max(durable_steps)
-        latest = (step, checkpoint_dir / f"{step}")
+    for candidate in durable_candidates:
+        step = (
+            _basic_checkpoint_step(candidate)
+            if prefer_rolling
+            else _checkpoint_step_from_dir(candidate)
+        )
+        if step is not None and (latest is None or step > latest[0]):
+            latest = (step, candidate)
 
     rolling_link = checkpoint_dir / _ROLLING_CHECKPOINT_LINK_NAME
     rolling_target = _rolling_checkpoint_target(checkpoint_dir)
-    rolling_step = _checkpoint_step_from_dir(rolling_target) if rolling_target is not None else None
-    if rolling_step is not None and (latest is None or rolling_step > latest[0]):
+    rolling_step = (
+        _basic_checkpoint_step(rolling_target)
+        if prefer_rolling and rolling_target is not None
+        else _checkpoint_step_from_dir(rolling_target) if rolling_target is not None else None
+    )
+    if prefer_rolling and os.path.lexists(rolling_link) and rolling_step is None:
+        raise ValueError(f"invalid rolling_latest checkpoint pointer: {rolling_link}")
+    if rolling_step is not None and (prefer_rolling or latest is None or rolling_step > latest[0]):
         latest = (rolling_step, rolling_link)
     return latest
+
+
+def _validate_accelerate_state_artifacts(
+    state_dir: Path,
+    *,
+    world_size: int,
+    require_h20_deepspeed: bool,
+) -> None:
+    """Fail closed when a published formal state is missing rank artifacts."""
+    if not state_dir.is_dir():
+        raise FileNotFoundError(f"checkpoint is missing accelerate_state: {state_dir}")
+    if not require_h20_deepspeed:
+        return
+    # Accelerate + DeepSpeed ZeRO-2 writes one replicated model-state file,
+    # one optimizer shard per rank, and one RNG file per rank.
+    model_states = list(state_dir.glob("**/*model_states.pt"))
+    optimizer_states = list(state_dir.glob("**/*optim_states.pt"))
+    rng_states = list(state_dir.glob("random_states_*.pkl"))
+    expected = {
+        "model state files": (len(model_states), 1),
+        "optimizer state shards": (len(optimizer_states), int(world_size)),
+        "RNG states": (len(rng_states), int(world_size)),
+    }
+    for label, (actual_count, expected_count) in expected.items():
+        if actual_count != expected_count:
+            raise ValueError(
+                f"Formal H20 checkpoint requires {expected_count} {label}; "
+                f"found {actual_count} in {state_dir}"
+            )
+
+
+def _validate_h20_resume_compatibility(
+    *,
+    manifest: dict,
+    config,
+    data_config,
+    accelerator,
+) -> None:
+    """Check only identity-bearing H20 fields; logger/validation changes are allowed."""
+    saved_config = manifest.get("config") or {}
+    saved_hardware = manifest.get("hardware") or {}
+    current_fingerprint = _build_data_fingerprint(config, data_config)
+    saved_fingerprint = manifest.get("data_fingerprint") or {}
+    checks = {
+        "config name/arm": (saved_config.get("name"), config.name),
+        "batch_size_per_gpu": (
+            saved_config.get("batch_size_per_gpu"),
+            int(config.batch_size_per_gpu),
+        ),
+        "gradient_accumulation_steps": (
+            saved_config.get("gradient_accumulation_steps"),
+            int(config.gradient_accumulation_steps),
+        ),
+        "world_size": (saved_hardware.get("num_gpus"), int(accelerator.num_processes)),
+        "precision": (
+            saved_hardware.get("precision"),
+            str(config.pytorch_training_precision),
+        ),
+        "strategy": (
+            saved_hardware.get("strategy"),
+            str(accelerator.distributed_type),
+        ),
+        "data fingerprint": (
+            saved_fingerprint.get("sha256"),
+            current_fingerprint.get("sha256"),
+        ),
+    }
+    mismatches = {
+        label: {"saved": saved, "current": current}
+        for label, (saved, current) in checks.items()
+        if saved is None or saved != current
+    }
+    saved_commit = (manifest.get("git") or {}).get("commit")
+    current_commit = _get_git_info().get("commit")
+    allowed_commits = {
+        "f89a7ce1e7f0148a6ef1113b5861d09c70d0c2b6",
+        current_commit,
+    }
+    if saved_commit not in allowed_commits:
+        mismatches["source commit"] = {
+            "saved": saved_commit,
+            "allowed": sorted(str(value) for value in allowed_commits),
+        }
+    if mismatches:
+        raise ValueError(f"Formal H20 resume compatibility mismatch: {mismatches}")
+
+
+def _inspect_resume_checkpoint(
+    selected_step: int,
+    selected_dir: Path,
+    *,
+    formal: bool,
+    config=None,
+    data_config=None,
+    accelerator=None,
+) -> dict:
+    """Validate basic checkpoint completeness and return saved metadata."""
+    resolved = selected_dir.resolve(strict=True)
+    name_step = _checkpoint_step_from_name(resolved.name)
+    if name_step is None:
+        raise ValueError(f"resume checkpoint has an invalid step-bearing name: {resolved.name}")
+
+    metadata_path = resolved / "metadata.pt"
+    manifest_path = resolved / "manifest.json"
+    if formal and not metadata_path.is_file():
+        raise FileNotFoundError(f"Formal resume checkpoint is missing metadata.pt: {resolved}")
+    if formal and not manifest_path.is_file():
+        raise FileNotFoundError(f"Formal resume checkpoint is missing manifest.json: {resolved}")
+
+    metadata = (
+        torch.load(metadata_path, map_location="cpu", weights_only=False)
+        if metadata_path.is_file()
+        else {}
+    )
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+    metadata_step = int(metadata.get("global_step", selected_step))
+    manifest_step = int((manifest.get("run_metadata") or {}).get("global_step", selected_step))
+    recorded_steps = {
+        "selected": int(selected_step),
+        "name": int(name_step),
+        "metadata": metadata_step,
+        "manifest": manifest_step,
+    }
+    if len(set(recorded_steps.values())) != 1:
+        raise ValueError(f"checkpoint step mismatch: {recorded_steps}")
+    if formal and config is not None:
+        if data_config is None or accelerator is None:
+            raise ValueError("Formal H20 resume compatibility requires runtime data and accelerator")
+        _validate_h20_resume_compatibility(
+            manifest=manifest,
+            config=config,
+            data_config=data_config,
+            accelerator=accelerator,
+        )
+    logging.info(
+        "Resume checkpoint selected name=%s manifest_step=%s metadata_step=%s",
+        resolved.name,
+        manifest_step,
+        metadata_step,
+    )
+    return metadata
+
+
+def _load_resume_state(
+    accelerator,
+    *,
+    checkpoint_dir: Path,
+    checkpoint_policy: str,
+    formal: bool,
+    selected: tuple[int, Path] | None = None,
+    config=None,
+    data_config=None,
+) -> tuple[int, dict, Path]:
+    """Load the generic Accelerate/DeepSpeed state from one validated checkpoint."""
+    selection = selected or _latest_step_dir(
+        checkpoint_dir, checkpoint_policy=checkpoint_policy
+    )
+    if selection is None:
+        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+    selected_step, selected_dir = selection
+    metadata = _inspect_resume_checkpoint(
+        selected_step,
+        selected_dir,
+        formal=formal,
+        config=config,
+        data_config=data_config,
+        accelerator=accelerator,
+    )
+    acc_state_dir = selected_dir / "accelerate_state"
+    _validate_accelerate_state_artifacts(
+        acc_state_dir,
+        world_size=int(getattr(accelerator, "num_processes", 1)),
+        require_h20_deepspeed=formal and config is not None,
+    )
+    accelerator.load_state(str(acc_state_dir))
+    logging.info(
+        "Resumed optimizer/model/RNG state at step %s; optimizer resume; data order restart",
+        selected_step,
+    )
+    return selected_step, metadata, selected_dir
+
+
+class _SampleProgress:
+    def __init__(self, accum_num_samples: int, samples_per_update: int, epoch_num_samples: int):
+        self.accum_num_samples = int(accum_num_samples)
+        self.samples_per_update = int(samples_per_update)
+        self.epoch_num_samples = int(epoch_num_samples)
+
+    @classmethod
+    def fresh(cls, *, samples_per_update: int, epoch_num_samples: int) -> "_SampleProgress":
+        if samples_per_update <= 0 or epoch_num_samples <= 0:
+            raise ValueError("sample progress requires positive update and epoch sample counts")
+        return cls(0, int(samples_per_update), int(epoch_num_samples))
+
+    def record_update(self, *, committed: bool) -> None:
+        if committed:
+            self.accum_num_samples += self.samples_per_update
+
+    def metrics(self) -> dict[str, float | int]:
+        return {
+            "dataset/accum_num_samples": int(self.accum_num_samples),
+            "dataset/epoch_fraction": float(self.accum_num_samples / self.epoch_num_samples),
+            "dataset/samples_per_update": int(self.samples_per_update),
+            "dataset/epoch_num_samples": int(self.epoch_num_samples),
+        }
+
+    def checkpoint_payload(self) -> dict[str, int]:
+        return {
+            "accum_num_samples": int(self.accum_num_samples),
+            "samples_per_update": int(self.samples_per_update),
+            "epoch_num_samples": int(self.epoch_num_samples),
+        }
+
+
+def _saved_samples_per_update(metadata: dict) -> int | None:
+    saved_config = metadata.get("config") or {}
+    saved_runtime = metadata.get("accelerate") or {}
+    per_gpu = saved_config.get("batch_size_per_gpu")
+    world_size = saved_runtime.get("num_processes")
+    grad_accum = saved_config.get("gradient_accumulation_steps", 1)
+    if per_gpu is not None and world_size is not None:
+        value = int(per_gpu) * int(world_size) * int(grad_accum)
+        return value if value > 0 else None
+    saved_global_batch = saved_config.get("expected_global_batch") or saved_config.get("batch_size")
+    if saved_global_batch is not None:
+        # expected_global_batch/batch_size already describe the committed
+        # optimizer-update batch, including gradient accumulation.
+        value = int(saved_global_batch)
+        return value if value > 0 else None
+    return None
+
+
+def _restore_sample_progress(
+    metadata: dict,
+    *,
+    current_samples_per_update: int,
+    default_epoch_num_samples: int,
+) -> _SampleProgress:
+    """Restore cumulative samples, using saved recipe values for legacy checkpoints."""
+    payload = metadata.get("sample_progress") or {}
+    if payload:
+        accum_num_samples = int(payload["accum_num_samples"])
+        epoch_num_samples = int(payload["epoch_num_samples"])
+    else:
+        saved_samples_per_update = _saved_samples_per_update(metadata)
+        if saved_samples_per_update is None:
+            raise ValueError("Legacy checkpoint cannot derive its saved global batch")
+        accum_num_samples = int(metadata.get("global_step", 0)) * saved_samples_per_update
+        saved_config = metadata.get("config") or {}
+        saved_steps = int(saved_config.get("num_train_steps") or 0)
+        saved_epochs = int(saved_config.get("num_train_epochs") or 0)
+        epoch_num_samples = (
+            (saved_steps // saved_epochs) * saved_samples_per_update
+            if saved_steps > 0 and saved_epochs > 0
+            else int(default_epoch_num_samples)
+        )
+    if accum_num_samples < 0 or epoch_num_samples <= 0 or current_samples_per_update <= 0:
+        raise ValueError("Invalid sample progress in checkpoint metadata")
+    return _SampleProgress(
+        accum_num_samples=accum_num_samples,
+        samples_per_update=int(current_samples_per_update),
+        epoch_num_samples=epoch_num_samples,
+    )
 
 
 def build_datasets(config: _config.TrainConfig):
@@ -1109,6 +1440,17 @@ def _build_stratified_val_indices(raw_dataset, config, *, logger_=None):
     rng = random.Random(int(getattr(config, "val_subset_seed", 12345)))
     n_eps = int(getattr(config, "val_episodes_per_task", 10))
     n_anch = max(1, int(getattr(config, "val_anchors_per_episode", 1)))
+    formal_h20 = getattr(config, "name", None) in _H20_FORMAL_B1K_CONFIGS
+    if formal_h20:
+        if len(by_task) != 50:
+            raise ValueError(
+                f"Formal H20 validation requires 50 tasks; found {len(by_task)}"
+            )
+        short = {task: len(candidates) for task, candidates in by_task.items() if len(candidates) != n_eps}
+        if short:
+            raise ValueError(
+                f"Formal H20 validation requires exactly {n_eps} episodes per task; found {short}"
+            )
 
     indices: list[int] = []
     task_ids: list[int] = []
@@ -1118,29 +1460,64 @@ def _build_stratified_val_indices(raw_dataset, config, *, logger_=None):
         if len(cand) > n_eps:
             cand = sorted(rng.sample(cand, n_eps), key=lambda x: x[0])
         for ep, a, b in cand:
-            if b <= a:
+            episode_length = b - a
+            if episode_length <= 0:
+                if formal_h20:
+                    raise ValueError(f"Formal H20 validation episode {ep} is empty")
                 continue
+            if formal_h20 and episode_length < n_anch + 2:
+                raise ValueError(
+                    f"Formal H20 validation episode {ep} is too short for {n_anch} distinct interior anchors"
+                )
             used_eps += 1
-            for j in range(n_anch):
-                frac = (j + 0.5) / n_anch
-                indices.append(min(b - 1, a + int((b - a) * frac)))
-                task_ids.append(int(task))
+            episode_anchors = [
+                a + ((j + 1) * (episode_length - 1)) // (n_anch + 1)
+                for j in range(n_anch)
+            ]
+            if formal_h20 and (
+                len(set(episode_anchors)) != n_anch
+                or min(episode_anchors) <= a
+                or max(episode_anchors) >= b - 1
+            ):
+                raise ValueError(
+                    f"Formal H20 validation episode {ep} did not produce distinct interior anchors: "
+                    f"{episode_anchors}"
+                )
+            indices.extend(episode_anchors)
+            task_ids.extend([int(task)] * len(episode_anchors))
 
-    # Deterministic interleave so every batch mixes tasks (stratified batches
-    # are much lower-variance than task-homogeneous ones).
-    order = list(range(len(indices)))
-    random.Random(int(getattr(config, "val_subset_seed", 12345)) + 1).shuffle(order)
-    indices = [indices[i] for i in order]
-    task_ids = [task_ids[i] for i in order]
+    # Non-formal validation retains the historical deterministic interleave.
+    # Formal H20 keeps task order so a task-homogeneous batch plan can turn
+    # scalar batch metrics into correct task means without changing model APIs.
+    if not formal_h20:
+        order = list(range(len(indices)))
+        random.Random(int(getattr(config, "val_subset_seed", 12345)) + 1).shuffle(order)
+        indices = [indices[i] for i in order]
+        task_ids = [task_ids[i] for i in order]
 
     coverage = {
         "n_samples": len(indices),
+        "n_unique_anchors": len(set(indices)),
         "n_tasks": len(set(task_ids)),
+        "n_raw_episodes": len(bounds),
         "n_episodes": used_eps,
         "episodes_per_task": n_eps,
         "anchors_per_episode": n_anch,
         "seed": int(getattr(config, "val_subset_seed", 12345)),
     }
+    if formal_h20:
+        expected = {
+            "n_samples": 4_000,
+            "n_unique_anchors": 4_000,
+            "n_tasks": 50,
+            "n_raw_episodes": 1_000,
+            "n_episodes": 1_000,
+        }
+        actual = {key: coverage[key] for key in expected}
+        if actual != expected:
+            raise ValueError(
+                f"Formal H20 validation population invariant failed: expected={expected} actual={actual}"
+            )
     if logger_ is not None:
         logger_.info(
             "Deterministic val subset: %d samples | %d tasks | %d episodes "
@@ -1149,6 +1526,98 @@ def _build_stratified_val_indices(raw_dataset, config, *, logger_=None):
             n_eps, n_anch, coverage["seed"],
         )
     return indices, task_ids, coverage
+
+
+def _cyclic_pad_to_length(values: list, target_length: int) -> list:
+    """Return ``values`` repeated cyclically to exactly ``target_length``."""
+    if target_length < len(values):
+        raise ValueError(f"target_length={target_length} is shorter than source={len(values)}")
+    if target_length == len(values):
+        return list(values)
+    if not values:
+        raise ValueError("cannot pad an empty sequence")
+    needed = target_length - len(values)
+    repeats, remainder = divmod(needed, len(values))
+    return list(values) + list(values) * repeats + list(values[:remainder])
+
+
+class _TaskHomogeneousBatchPlan:
+    def __init__(
+        self,
+        *,
+        batches: list[list[int]],
+        task_ids: list[int],
+        unique_counts: list[int],
+        batches_per_rank: int,
+    ):
+        self.batches = batches
+        self.task_ids = task_ids
+        self.unique_counts = unique_counts
+        self.batches_per_rank = int(batches_per_rank)
+
+
+def _build_task_homogeneous_batch_plan(
+    indices: list[int],
+    task_ids: list[int],
+    *,
+    batch_size: int,
+    world_size: int,
+) -> _TaskHomogeneousBatchPlan:
+    """Build task-pure batches and append full padding batches for DDP symmetry."""
+    if len(indices) != len(task_ids) or not indices:
+        raise ValueError("task-homogeneous validation requires aligned non-empty indices")
+    if batch_size <= 0 or world_size <= 0:
+        raise ValueError("batch_size and world_size must be positive")
+
+    by_task: dict[int, list[int]] = {}
+    for position, task_id in enumerate(task_ids):
+        by_task.setdefault(int(task_id), []).append(position)
+
+    batches: list[list[int]] = []
+    batch_tasks: list[int] = []
+    unique_counts: list[int] = []
+    for task_id in sorted(by_task):
+        task_indices = by_task[task_id]
+        if len(task_indices) % batch_size != 0:
+            raise ValueError(
+                f"task {task_id} has {len(task_indices)} anchors, not divisible by batch_size={batch_size}"
+            )
+        for offset in range(0, len(task_indices), batch_size):
+            batches.append(task_indices[offset : offset + batch_size])
+            batch_tasks.append(task_id)
+            unique_counts.append(batch_size)
+
+    target_batches = ((len(batches) + world_size - 1) // world_size) * world_size
+    original_batches = list(batches)
+    original_tasks = list(batch_tasks)
+    for offset in range(target_batches - len(batches)):
+        source = offset % len(original_batches)
+        batches.append(list(original_batches[source]))
+        batch_tasks.append(original_tasks[source])
+        unique_counts.append(0)
+    return _TaskHomogeneousBatchPlan(
+        batches=batches,
+        task_ids=batch_tasks,
+        unique_counts=unique_counts,
+        batches_per_rank=target_batches // world_size,
+    )
+
+
+class _DistributedBatchPlanSampler(torch.utils.data.Sampler[list[int]]):
+    """Select every rank's deterministic slice of a global batch plan."""
+
+    def __init__(self, plan: _TaskHomogeneousBatchPlan, *, rank: int, world_size: int):
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"rank={rank} is outside world_size={world_size}")
+        self._batches = plan.batches[rank::world_size]
+        self.batch_task_ids = plan.task_ids[rank::world_size]
+        self.batch_unique_counts = plan.unique_counts[rank::world_size]
+
+    def __iter__(self):
+        return iter(self._batches)
+
+    def __len__(self):
+        return len(self._batches)
 
 
 class _DeterministicValLoader:
@@ -1166,6 +1635,7 @@ class _DeterministicValLoader:
         self._subset = subset
         self.coverage = coverage
         self.batch_task_ids: list[list[int]] = []
+        self.batch_unique_counts: list[int] = []
 
     def data_config(self):
         return self._data_config
@@ -1189,14 +1659,27 @@ class _DeterministicValLoader:
         import openpi.models.model as _model_mod
 
         # Rank-local slice of the fixed index list, in loader order, so batch i
-        # can be mapped back to the tasks it contains.
-        sampler = getattr(self._loader, "sampler", None)
-        local = list(sampler) if sampler is not None else list(range(len(self._subset)))
-        bs = self._loader.batch_size
-        self.batch_task_ids = [
-            [self._subset.task_ids[j] for j in local[b * bs : (b + 1) * bs]]
-            for b in range(len(local) // bs)
-        ]
+        # can be mapped back to the tasks and unique-anchor counts it contains.
+        batch_sampler = getattr(self._loader, "batch_sampler", None)
+        if isinstance(batch_sampler, _DistributedBatchPlanSampler):
+            self.batch_task_ids = [
+                [task] * len(batch)
+                for task, batch in zip(
+                    batch_sampler.batch_task_ids,
+                    batch_sampler._batches,
+                    strict=True,
+                )
+            ]
+            self.batch_unique_counts = list(batch_sampler.batch_unique_counts)
+        else:
+            sampler = getattr(self._loader, "sampler", None)
+            local = list(sampler) if sampler is not None else list(range(len(self._subset)))
+            bs = self._loader.batch_size
+            self.batch_task_ids = [
+                [self._subset.task_ids[j] for j in local[b * bs : (b + 1) * bs]]
+                for b in range(len(local) // bs)
+            ]
+            self.batch_unique_counts = [len(tasks) for tasks in self.batch_task_ids]
         for batch in self._loader:
             batch = self._to_tensors(batch)
             yield _model_mod.Observation.from_dict(batch), batch["actions"]
@@ -1252,82 +1735,94 @@ def build_val_datasets(config: _config.TrainConfig):
                 else max(1, int(config.batch_size) // max(1, world_size))
             )
 
-            # Pad the index list to a whole number of global batches.
-            #
-            # Both DistributedSampler and the DataLoader below use
-            # drop_last=True (needed so every rank runs the same number of
-            # iterations), which means WITHOUT padding the number of scored
-            # anchors silently depends on world_size:
-            #   500 anchors,  8 ranks, bs 8 -> 62/rank -> 7 batches -> 448 (90%)
-            #   500 anchors, 32 ranks, bs 8 -> 15/rank -> 1 batch   -> 256 (51%)
-            #   100 anchors, 32 ranks, bs 8 ->  3/rank -> 0 batches ->   0 (!)
-            # That would defeat the whole point of a fixed subset (the scored
-            # set must not change with the cluster shape) and in the last case
-            # validation would silently score nothing.
-            # Padding by repeating the head of the list is deterministic, keeps
-            # every rank's iteration count equal, and guarantees every anchor is
-            # scored; the few duplicated anchors are counted twice, which is
-            # recorded in `coverage` so it is visible in metrics.jsonl.
-            stride = max(1, per_gpu * max(1, world_size))
-            remainder = len(indices) % stride
-            if remainder:
-                pad = stride - remainder
-                indices = indices + indices[:pad]
-                task_ids = task_ids + task_ids[:pad]
+            formal_h20 = getattr(config, "name", None) in _H20_FORMAL_B1K_CONFIGS
+            batch_sampler = None
+            sampler = None
+            if formal_h20:
+                plan = _build_task_homogeneous_batch_plan(
+                    indices,
+                    task_ids,
+                    batch_size=per_gpu,
+                    world_size=world_size,
+                )
+                batch_sampler = _DistributedBatchPlanSampler(
+                    plan,
+                    rank=int(os.environ.get("RANK", "0")),
+                    world_size=world_size,
+                )
+                coverage.update(
+                    {
+                        "n_padded": len(plan.batches) * per_gpu,
+                        "n_duplicated": len(plan.batches) * per_gpu - len(indices),
+                        "n_batches_per_rank": plan.batches_per_rank,
+                        "val_global_batch": per_gpu * world_size,
+                    }
+                )
+                expected = {
+                    "n_samples": 4_000,
+                    "n_unique_anchors": 4_000,
+                    "n_padded": 4_096,
+                    "n_duplicated": 96,
+                    "n_batches_per_rank": 16,
+                    "val_global_batch": 256,
+                }
+                actual = {key: coverage.get(key) for key in expected}
+                if actual != expected:
+                    raise ValueError(
+                        f"Formal H20 validation execution invariant failed: expected={expected} actual={actual}"
+                    )
+                logging.info(
+                    "Formal H20 val: raw_episodes=1000 unique=4000 executed=4096 "
+                    "duplicates=96 batches_per_rank=16 global_batch=256"
+                )
+            else:
+                # General deterministic validation pads cyclically to a whole
+                # global batch, including when the required pad exceeds the
+                # source length. Formal H20 uses the task-pure plan above.
+                stride = max(1, per_gpu * max(1, world_size))
+                remainder = len(indices) % stride
+                if remainder:
+                    pad = stride - remainder
+                    target = len(indices) + pad
+                    indices = _cyclic_pad_to_length(indices, target)
+                    task_ids = _cyclic_pad_to_length(task_ids, target)
+                else:
+                    pad = 0
                 coverage["n_padded"] = len(indices)
                 coverage["n_duplicated"] = pad
-                logging.info(
-                    "Val subset padded %d -> %d anchors (%d duplicated) so that "
-                    "world_size=%d x batch=%d divides it evenly and no anchor is dropped.",
-                    coverage["n_samples"], len(indices), pad, world_size, per_gpu,
-                )
-                if pad > 0.25 * coverage["n_samples"]:
-                    logging.warning(
-                        "Val subset padding duplicates %d of %d anchors (%.0f%%): the "
-                        "subset is small relative to world_size x batch (%d). Raise "
-                        "val_episodes_per_task (or lower val_batch_size) so the subset "
-                        "is a near-multiple of %d, otherwise a few anchors dominate the "
-                        "reported metrics.",
-                        pad, coverage["n_samples"],
-                        100.0 * pad / coverage["n_samples"], stride, stride,
+                if torch.distributed.is_initialized() and world_size > 1:
+                    sampler = torch.utils.data.distributed.DistributedSampler(
+                        _FixedIndexSubset(ds, indices, task_ids),
+                        num_replicas=world_size,
+                        rank=int(os.environ.get("RANK", "0")),
+                        shuffle=False,
+                        drop_last=True,
                     )
 
             subset = _FixedIndexSubset(ds, indices, task_ids)
-
-            sampler = None
-            if torch.distributed.is_initialized() and world_size > 1:
-                sampler = torch.utils.data.distributed.DistributedSampler(
-                    subset,
-                    num_replicas=world_size,
-                    rank=int(os.environ.get("RANK", "0")),
-                    shuffle=False,   # the list is already fixed + pre-interleaved
-                    drop_last=True,
-                )
-            loader = torch.utils.data.DataLoader(
-                subset,
-                batch_size=per_gpu,
-                shuffle=False,
-                sampler=sampler,
-                num_workers=int(config.num_workers),
-                collate_fn=_data_loader._collate_fn,
-                drop_last=True,
-                pin_memory=torch.cuda.is_available(),
+            loader_kwargs = {
+                "dataset": subset,
+                "num_workers": int(config.num_workers),
+                "collate_fn": _data_loader._collate_fn,
+                "pin_memory": torch.cuda.is_available(),
                 **({"prefetch_factor": 2} if int(config.num_workers) > 0 else {}),
-                # Keep the val workers alive across validations. This loader is
-                # built ONCE per run (build_val_datasets is called only at setup)
-                # but `_DeterministicValLoader.__iter__` re-enters it at every
-                # validation, so without this the workers are torn down and
-                # re-forked ~105 times x world_size x num_workers. This loader
-                # has no `multiprocessing_context`, so those are Linux fork()s,
-                # and each one is a chance to inherit a lock the parent happens
-                # to hold (a run died at step 5990 with a val worker blocked
-                # forever on wandb's SockClient._lock, taking all 32 ranks down
-                # via the NCCL watchdog). Persistent workers collapse that to a
-                # single fork per run. Safe here because the sampler is
-                # shuffle=False, so re-iteration replays the identical fixed
-                # order; PyTorch raises if this is set with num_workers=0.
                 **({"persistent_workers": True} if int(config.num_workers) > 0 else {}),
-            )
+            }
+            if batch_sampler is not None:
+                loader_kwargs["batch_sampler"] = batch_sampler
+            else:
+                loader_kwargs.update(
+                    {
+                        "batch_size": per_gpu,
+                        "shuffle": False,
+                        "sampler": sampler,
+                        "drop_last": True,
+                    }
+                )
+            # Persistent workers keep the deterministic validation worker pool
+            # alive across repeated passes; loader_kwargs applies this only when
+            # num_workers > 0, as required by PyTorch.
+            loader = torch.utils.data.DataLoader(**loader_kwargs)
             loader = _DeterministicValLoader(loader, val_dc, subset, coverage)
             return loader, val_dc
         except _StratifiedValUnavailable:
@@ -2640,6 +3135,10 @@ def _compute_data_manifest(
         manifest["n_val_frames_total_estimate"] = None
         manifest["n_val_microbatches_total_estimate"] = None
 
+    validation_fields = _validation_manifest_fields(val_loader, world_size=world_size)
+    if validation_fields is not None:
+        manifest["validation_protocol"] = validation_fields
+
     # -- FPS --
     manifest["fps"] = 30  # B1K datasets use 30 FPS; lerobot meta has fps too
     # Try to get fps from data_config or dataset metadata
@@ -2961,6 +3460,7 @@ def _build_checkpoint_manifest(
     data_manifest: dict | None = None,
     checkpoint_kind: str | None = None,
     checkpoint_epoch: int | None = None,
+    sample_progress: _SampleProgress | None = None,
 ) -> dict:
     """Build the checkpoint manifest.json dict with metadata."""
     git_info = _get_git_info()
@@ -2992,6 +3492,8 @@ def _build_checkpoint_manifest(
             "strategy": str(accelerator.distributed_type),
         },
     }
+    if sample_progress is not None:
+        manifest["run_metadata"]["sample_progress"] = sample_progress.checkpoint_payload()
     if checkpoint_kind is not None:
         manifest["run_metadata"]["checkpoint_kind"] = checkpoint_kind
     if checkpoint_epoch is not None:
@@ -3038,6 +3540,65 @@ def _move_observation_to_device(observation, device: torch.device):
     )
 
 
+def _validation_metric_totals(
+    batch_metrics: list[dict[str, float]],
+    *,
+    batch_task_ids: list[list[int]],
+    batch_unique_counts: list[int],
+    per_task_metric: str,
+) -> tuple[dict[str, list[float | int]], dict[int, list[float | int]]]:
+    """Convert scalar batch means into sample-weighted unique-anchor totals."""
+    if not (
+        len(batch_metrics) == len(batch_task_ids) == len(batch_unique_counts)
+    ):
+        raise ValueError("validation batch metric metadata lengths disagree")
+    metric_totals: dict[str, list[float | int]] = {}
+    task_totals: dict[int, list[float | int]] = {}
+    for metrics, task_ids, unique_count in zip(
+        batch_metrics, batch_task_ids, batch_unique_counts, strict=True
+    ):
+        unique_count = int(unique_count)
+        if unique_count <= 0:
+            continue
+        for key, value in metrics.items():
+            if not np.isfinite(value):
+                continue
+            total = metric_totals.setdefault(key, [0.0, 0])
+            total[0] = float(total[0]) + float(value) * unique_count
+            total[1] = int(total[1]) + unique_count
+        unique_tasks = set(int(task_id) for task_id in task_ids[:unique_count])
+        if (
+            len(unique_tasks) == 1
+            and per_task_metric in metrics
+            and np.isfinite(metrics[per_task_metric])
+        ):
+            task_id = unique_tasks.pop()
+            task_total = task_totals.setdefault(task_id, [0.0, 0])
+            task_total[0] = float(task_total[0]) + float(metrics[per_task_metric]) * unique_count
+            task_total[1] = int(task_total[1]) + unique_count
+    return metric_totals, task_totals
+
+
+def _validation_manifest_fields(val_loader, *, world_size: int) -> dict | None:
+    coverage = getattr(val_loader, "coverage", None)
+    if not coverage:
+        return None
+    required = {
+        "raw_episodes": "n_raw_episodes",
+        "unique_anchors": "n_unique_anchors",
+        "duplicate_anchors": "n_duplicated",
+        "executed_anchors": "n_padded",
+        "batches_per_rank": "n_batches_per_rank",
+        "global_batch": "val_global_batch",
+    }
+    if not all(source in coverage for source in required.values()):
+        return None
+    fields = {target: int(coverage[source]) for target, source in required.items()}
+    if fields["global_batch"] % int(world_size) != 0:
+        raise ValueError(f"validation global batch is not divisible by world size: {fields}")
+    return fields
+
+
 def run_validation(
     *,
     accelerator: Accelerator,
@@ -3051,6 +3612,7 @@ def run_validation(
     use_autocast: bool,
     autocast_dtype: torch.dtype,
     metrics_file,
+    sample_progress: _SampleProgress | None = None,
     slow_metrics: bool = False,
     val_label: str = "val",
 ) -> dict[str, float]:
@@ -3081,11 +3643,37 @@ def run_validation(
     Returns:
         dict of aggregated validation metrics (scalar floats, rank 0 values)
     """
+    formal_h20 = getattr(config, "name", None) in _H20_FORMAL_B1K_CONFIGS
     if val_loader is None:
+        if formal_h20:
+            raise ValueError("Formal H20 validation requires a non-empty validation loader")
         return {}
 
     is_main = accelerator.is_main_process
-    val_num_batches = getattr(config, "val_num_batches", 10)
+    configured_val_batches = int(getattr(config, "val_num_batches", 10))
+    actual_val_batches = len(val_loader)
+    val_num_batches = min(configured_val_batches, actual_val_batches)
+    if formal_h20:
+        protocol = _validation_manifest_fields(
+            val_loader, world_size=int(accelerator.num_processes)
+        )
+        expected_protocol = {
+            "raw_episodes": 1_000,
+            "unique_anchors": 4_000,
+            "duplicate_anchors": 96,
+            "executed_anchors": 4_096,
+            "batches_per_rank": 16,
+            "global_batch": 256,
+        }
+        if protocol != expected_protocol:
+            raise ValueError(
+                f"Formal H20 validation protocol mismatch: expected={expected_protocol} actual={protocol}"
+            )
+        if actual_val_batches != 16 or configured_val_batches < actual_val_batches:
+            raise ValueError(
+                "Formal H20 validation requires exactly 16 loader batches/rank and "
+                f"val_num_batches>=16; got loader={actual_val_batches} configured={configured_val_batches}"
+            )
 
     if is_main:
         logging.info("Running validation at step %s (%s batches)...", global_step, val_num_batches)
@@ -3100,7 +3688,6 @@ def run_validation(
     per_task_enabled = bool(getattr(config, "val_log_per_task", False)) and hasattr(
         val_loader, "batch_task_ids"
     )
-    per_task_sums: dict[int, list] = {}
 
     try:
         with torch.no_grad():
@@ -3159,18 +3746,6 @@ def run_validation(
                     if isinstance(v, torch.Tensor) and v.numel() == 1
                 }
                 batch_metrics_list.append(batch_metrics)
-                # Per-task accumulation (only when the fixed stratified subset is
-                # in use, since only then do we know each batch's task ids).
-                if per_task_enabled:
-                    try:
-                        for tk in set(val_loader.batch_task_ids[batch_idx]):
-                            per_task_sums.setdefault(int(tk), [0.0, 0])
-                            per_task_sums[int(tk)][0] += batch_metrics.get(
-                                per_task_metric, float("nan")
-                            )
-                            per_task_sums[int(tk)][1] += 1
-                    except Exception:  # noqa: BLE001
-                        pass
 
     finally:
         # Restore training mode
@@ -3178,65 +3753,105 @@ def run_validation(
             unwrapped.train()
 
     if not batch_metrics_list:
+        if formal_h20:
+            raise ValueError("Formal H20 validation produced zero metric batches")
         if is_main:
             logging.warning("Validation produced no batches; skipping val logging.")
         return {}
+    if formal_h20 and len(batch_metrics_list) != 16:
+        raise ValueError(
+            f"Formal H20 validation processed {len(batch_metrics_list)} batches; expected 16"
+        )
 
-    # Average across batches (per-rank)
-    all_keys = set()
-    for m in batch_metrics_list:
-        all_keys.update(m.keys())
+    all_keys = sorted({key for metrics in batch_metrics_list for key in metrics})
+    has_unique_metadata = hasattr(val_loader, "batch_unique_counts")
+    task_metadata = list(getattr(val_loader, "batch_task_ids", []))
+    unique_counts = list(getattr(val_loader, "batch_unique_counts", []))
+    if len(task_metadata) < len(batch_metrics_list):
+        task_metadata.extend([[]] * (len(batch_metrics_list) - len(task_metadata)))
+    if len(unique_counts) < len(batch_metrics_list):
+        if has_unique_metadata:
+            raise ValueError("validation unique-count metadata is shorter than processed batches")
+        # Legacy/non-formal loaders have no attribution metadata. Preserve their
+        # historical equal-batch aggregation by weighting each batch once.
+        unique_counts.extend([1] * (len(batch_metrics_list) - len(unique_counts)))
+    local_metric_totals, local_task_totals = _validation_metric_totals(
+        batch_metrics_list,
+        batch_task_ids=task_metadata[: len(batch_metrics_list)],
+        batch_unique_counts=unique_counts[: len(batch_metrics_list)],
+        per_task_metric=per_task_metric,
+    )
 
-    # NOTE: sorted keys are critical for correctness — we call
-    # torch.distributed.all_reduce inside _gather_scalar_stats, and all ranks
-    # must issue collectives in the same order.  A set has non-deterministic
-    # iteration order across ranks (hash randomization), which would cause
-    # different metrics to be reduced together, producing garbage.
-    sorted_keys = sorted(all_keys)
-
-    per_rank_means: dict[str, float] = {}
-    for key in sorted_keys:
-        vals = [m[key] for m in batch_metrics_list if key in m]
-        if vals:
-            per_rank_means[key] = sum(vals) / len(vals)
-
-    # DDP gather: average across ranks
+    # Reduce sums and counts, rather than averaging rank means. This excludes
+    # formal padding batches (unique_count=0) and remains exact if rank counts
+    # differ in a future protocol.
     global_means: dict[str, float] = {}
-    for key in sorted_keys:
-        val_tensor = torch.tensor(per_rank_means.get(key, 0.0), device=accelerator.device)
-        stats = _gather_scalar_stats(accelerator, val_tensor)
-        global_means[key] = float(stats["mean"])
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    global_metric_counts: dict[str, int] = {}
+    for key in all_keys:
+        local_sum, local_count = local_metric_totals.get(key, [0.0, 0])
+        pair = torch.tensor([float(local_sum), float(local_count)], device=accelerator.device)
+        if distributed:
+            torch.distributed.all_reduce(pair, op=torch.distributed.ReduceOp.SUM)
+        count = float(pair[1].item())
+        if count > 0:
+            global_means[key] = float(pair[0].item()) / count
+            global_metric_counts[key] = int(count)
 
-    # ---- Per-task reduction (fixed stratified subset only) ----
+    if formal_h20:
+        required_metrics = {"total_loss", "flow_mse"}
+        invalid_metrics = {
+            key: {
+                "count": global_metric_counts.get(key, 0),
+                "value": global_means.get(key),
+            }
+            for key in required_metrics
+            if global_metric_counts.get(key) != 4_000
+            or not np.isfinite(global_means.get(key, float("nan")))
+        }
+        if invalid_metrics:
+            raise ValueError(
+                f"Formal H20 validation core metrics are incomplete/non-finite: {invalid_metrics}"
+            )
+        local_unique_count = sum(int(value) for value in unique_counts[: len(batch_metrics_list)])
+        unique_tensor = torch.tensor(float(local_unique_count), device=accelerator.device)
+        if distributed:
+            torch.distributed.all_reduce(unique_tensor, op=torch.distributed.ReduceOp.SUM)
+        if int(unique_tensor.item()) != 4_000:
+            raise ValueError(
+                f"Formal H20 validation reduced {int(unique_tensor.item())} unique anchors; expected 4000"
+            )
+
     per_task_global: dict[int, float] = {}
     if per_task_enabled:
-        try:
-            import torch.distributed as _dist
-
-            task_keys = sorted(per_task_sums.keys())
-            if _dist.is_available() and _dist.is_initialized():
-                # Union the task id space across ranks so every rank reduces the
-                # same fixed-size tensors in the same order.
-                n_tasks_max = 1024
-                sums = torch.zeros(n_tasks_max, device=accelerator.device)
-                cnts = torch.zeros(n_tasks_max, device=accelerator.device)
-                for tk in task_keys:
-                    if 0 <= tk < n_tasks_max:
-                        sums[tk] = per_task_sums[tk][0]
-                        cnts[tk] = per_task_sums[tk][1]
-                _dist.all_reduce(sums, op=_dist.ReduceOp.SUM)
-                _dist.all_reduce(cnts, op=_dist.ReduceOp.SUM)
-                for tk in range(n_tasks_max):
-                    c = float(cnts[tk].item())
-                    if c > 0:
-                        per_task_global[tk] = float(sums[tk].item()) / c
-            else:
-                for tk in task_keys:
-                    s, c = per_task_sums[tk]
-                    if c > 0:
-                        per_task_global[tk] = s / c
-        except Exception:  # noqa: BLE001
-            logging.warning("per-task val reduction failed; skipping", exc_info=True)
+        n_tasks_max = 1024
+        sums = torch.zeros(n_tasks_max, device=accelerator.device)
+        cnts = torch.zeros(n_tasks_max, device=accelerator.device)
+        for task_id, (task_sum, task_count) in local_task_totals.items():
+            if 0 <= task_id < n_tasks_max:
+                sums[task_id] = float(task_sum)
+                cnts[task_id] = int(task_count)
+        if distributed:
+            torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(cnts, op=torch.distributed.ReduceOp.SUM)
+        for task_id in range(n_tasks_max):
+            count = float(cnts[task_id].item())
+            if count > 0:
+                per_task_global[task_id] = float(sums[task_id].item()) / count
+    if formal_h20:
+        invalid_tasks = {
+            task_id: {
+                "count": int(cnts[task_id].item()),
+                "value": per_task_global.get(task_id),
+            }
+            for task_id in range(50)
+            if int(cnts[task_id].item()) != 80
+            or not np.isfinite(per_task_global.get(task_id, float("nan")))
+        }
+        if invalid_tasks:
+            raise ValueError(
+                f"Formal H20 validation per-task metrics are incomplete/non-finite: {invalid_tasks}"
+            )
 
     if is_main:
         epoch = (global_step // steps_per_epoch) + 1 if steps_per_epoch > 0 else 1
@@ -3262,6 +3877,8 @@ def run_validation(
                 val_record["val_per_task_n"] = len(vals)
             if getattr(val_loader, "coverage", None):
                 val_record["val_subset"] = val_loader.coverage
+            if sample_progress is not None:
+                val_record.update(sample_progress.metrics())
             _metrics_buffer_write_boundary(val_record)
 
         # Log to W&B
@@ -3276,6 +3893,8 @@ def run_validation(
                 }
                 for key, val in global_means.items():
                     log_payload[f"val/{key}"] = val
+                if sample_progress is not None:
+                    log_payload.update(sample_progress.metrics())
                 wandb.log(log_payload, step=global_step)
             except Exception:
                 logging.warning("wandb val log failed; continuing without wandb", exc_info=True)
@@ -3303,6 +3922,7 @@ def save_checkpoint(
     data_config: _config.DataConfig,
     data_manifest: dict | None = None,
     steps_per_epoch: int | None = None,
+    sample_progress: _SampleProgress | None = None,
 ) -> None:
     if os.environ.get("OPENPI_DISABLE_CHECKPOINT", "0") in {"1", "true", "TRUE", "True"}:
         return
@@ -3354,23 +3974,30 @@ def save_checkpoint(
 
     # Save accelerate/deepspeed state for resume.
     # IMPORTANT: This must run on *all* ranks (DeepSpeed save is collective). Running it on rank0 only can hang.
+    h20_formal_checkpoint = getattr(config, "name", None) in _H20_FORMAL_B1K_CONFIGS
     save_acc_state = os.environ.get("OPENPI_SAVE_ACCELERATE_STATE", "1") != "0"
+    if h20_formal_checkpoint and not save_acc_state:
+        raise ValueError("Formal H20 checkpoints require OPENPI_SAVE_ACCELERATE_STATE=1")
     if save_acc_state:
         acc_state_dir = tmp_ckpt_dir / "accelerate_state"
         t0 = time.time()
         if accelerator.is_main_process and _should_profile_memory_step(global_step):
             _reset_peak_memory_stats(accelerator)
-        try:
+        if h20_formal_checkpoint:
+            # A failed collective state save must abort before the old published
+            # rolling checkpoint is replaced.
             accelerator.save_state(str(acc_state_dir))
-        except Exception as exc:
-            logging.warning(
-                "accelerator.save_state failed (resume may not work for sharded optimizers): %s", exc
-            )
         else:
-            if accelerator.is_main_process:
-                logging.info("accelerator.save_state finished in %.1fs", time.time() - t0)
-                if _should_profile_memory_step(global_step):
-                    log_memory_usage(accelerator, global_step, "after_save_state")
+            try:
+                accelerator.save_state(str(acc_state_dir))
+            except Exception as exc:
+                logging.warning(
+                    "accelerator.save_state failed (resume may not work for sharded optimizers): %s", exc
+                )
+        if accelerator.is_main_process and acc_state_dir.exists():
+            logging.info("accelerator.save_state finished in %.1fs", time.time() - t0)
+            if _should_profile_memory_step(global_step):
+                log_memory_usage(accelerator, global_step, "after_save_state")
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
@@ -3401,13 +4028,15 @@ def save_checkpoint(
                 "num_processes": accelerator.num_processes,
             },
         }
+        if sample_progress is not None:
+            metadata["sample_progress"] = sample_progress.checkpoint_payload()
         if epoch_checkpointing:
             metadata["checkpoint_kind"] = checkpoint_kind
             metadata["epoch"] = checkpoint_epoch
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
         # Save manifest.json (human-readable checkpoint metadata fingerprint).
-        try:
+        def _write_manifest() -> None:
             manifest = _build_checkpoint_manifest(
                 config=config,
                 data_config=data_config,
@@ -3417,12 +4046,36 @@ def save_checkpoint(
                 data_manifest=data_manifest,
                 checkpoint_kind=checkpoint_kind if epoch_checkpointing else None,
                 checkpoint_epoch=checkpoint_epoch,
+                sample_progress=sample_progress,
             )
             manifest_path = tmp_ckpt_dir / "manifest.json"
             with open(manifest_path, "w") as f:
                 json.dump(manifest, f, indent=2, default=str)
-        except Exception:
-            logging.warning("Failed to write manifest.json", exc_info=True)
+
+        if h20_formal_checkpoint:
+            _write_manifest()
+        else:
+            try:
+                _write_manifest()
+            except Exception:
+                logging.warning("Failed to write manifest.json", exc_info=True)
+
+        if h20_formal_checkpoint:
+            _validate_accelerate_state_artifacts(
+                tmp_ckpt_dir / "accelerate_state",
+                world_size=int(accelerator.num_processes),
+                require_h20_deepspeed=True,
+            )
+            metadata_check = torch.load(
+                tmp_ckpt_dir / "metadata.pt", map_location="cpu", weights_only=False
+            )
+            manifest_check = json.loads((tmp_ckpt_dir / "manifest.json").read_text())
+            metadata_progress = metadata_check.get("sample_progress")
+            manifest_progress = (manifest_check.get("run_metadata") or {}).get("sample_progress")
+            if metadata_progress != manifest_progress:
+                raise ValueError(
+                    "Formal H20 checkpoint metadata/manifest sample progress mismatch"
+                )
 
         # Save norm stats.
         norm_stats = data_config.norm_stats
@@ -3699,7 +4352,10 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
     resuming = False
     if config.resume:
         if config.checkpoint_dir.exists():
-            latest = _latest_step_dir(config.checkpoint_dir)
+            latest = _latest_step_dir(
+                config.checkpoint_dir,
+                checkpoint_policy=getattr(config, "checkpoint_policy", _CHECKPOINT_POLICY_STEP),
+            )
             if latest is None:
                 raise FileNotFoundError(f"No valid checkpoints found in {config.checkpoint_dir} for resume")
             resuming = True
@@ -3749,7 +4405,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     if not config.prepare_hf_cache_only:
         if _is_formal_b1k_mode(config):
-            _init_formal_b1k_wandb(config, accelerator=accelerator)
+            _init_formal_b1k_wandb(config, accelerator=accelerator, resuming=resuming)
         elif is_main:
             init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
@@ -4117,6 +4773,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 val_probe.get("num_batches_sampled", 0),
             )
     except Exception:
+        if getattr(config, "name", None) in _H20_FORMAL_B1K_CONFIGS:
+            raise RuntimeError("Formal H20 data manifest validation failed")
         logging.warning("Failed to compute data manifest; continuing without it", exc_info=True)
         _data_manifest = None
 
@@ -4457,26 +5115,33 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     # Resume (after prepare so that accelerator can restore distributed states).
     global_step = 0
+    resume_metadata: dict = {}
     if resuming:
-        latest = _latest_step_dir(config.checkpoint_dir)
-        if latest is None:
-            raise FileNotFoundError(f"No checkpoints found in {config.checkpoint_dir}")
-        latest_step, latest_dir = latest
-        acc_state_dir = latest_dir / "accelerate_state"
-        if not acc_state_dir.exists():
-            raise FileNotFoundError(
-                f"Resume checkpoint is missing accelerate_state: {acc_state_dir}. "
-                "Refusing to continue with fresh model/optimizer state."
-            )
-        accelerator.load_state(str(acc_state_dir))
-        metadata_path = latest_dir / "metadata.pt"
-        if metadata_path.exists():
-            metadata = torch.load(metadata_path, map_location="cpu", weights_only=False)
-            global_step = int(metadata.get("global_step", latest_step))
-        else:
-            global_step = latest_step
+        global_step, resume_metadata, _ = _load_resume_state(
+            accelerator,
+            checkpoint_dir=config.checkpoint_dir,
+            checkpoint_policy=getattr(config, "checkpoint_policy", _CHECKPOINT_POLICY_STEP),
+            formal=getattr(config, "name", None) in _H20_FORMAL_B1K_CONFIGS,
+            selected=latest,
+            config=config,
+            data_config=data_config,
+        )
         if is_main:
             logging.info("Resumed training from step %s", global_step)
+
+    epoch_num_samples = int(steps_per_epoch) * int(global_batch)
+    sample_progress = (
+        _restore_sample_progress(
+            resume_metadata,
+            current_samples_per_update=global_batch,
+            default_epoch_num_samples=epoch_num_samples,
+        )
+        if resuming
+        else _SampleProgress.fresh(
+            samples_per_update=global_batch,
+            epoch_num_samples=epoch_num_samples,
+        )
+    )
 
     # Pre-training barrier to avoid watchdog timeouts on large init skew.
     if is_main:
@@ -5300,6 +5965,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         continue
 
                     consecutive_skipped_updates = 0
+                    sample_progress.record_update(committed=True)
 
                     # stats/logging use optimizer-step granularity
                     if is_main:
@@ -5308,6 +5974,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             "learning_rate": float(optimizer.param_groups[0]["lr"]),
                             "grad_norm": grad_norm_value,
                             "grad_norm_total": grad_norm_value,
+                            **sample_progress.metrics(),
                             **extra_metrics,
                         }
                         # Per-param-group LRs for π0.5-KI joint query model.
@@ -5423,6 +6090,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                     "epoch_step": float(epoch_step),
                                     "steps_per_epoch": float(steps_per_epoch),
                                     "time_per_step": elapsed / max(1, int(config.log_interval)),
+                                    **sample_progress.metrics(),
                                 }
                                 if avg_loss_scale is not None:
                                     log_payload["loss_scale"] = avg_loss_scale
@@ -5497,6 +6165,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         data_config=data_config,
                         data_manifest=_data_manifest,
                         steps_per_epoch=steps_per_epoch,
+                        sample_progress=sample_progress,
                     )
 
                     if pbar is not None:
@@ -5533,6 +6202,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             use_autocast=use_autocast,
                             autocast_dtype=autocast_dtype,
                             metrics_file=_metrics_file,
+                            sample_progress=sample_progress,
                             slow_metrics=_slow_now,
                         )
 
@@ -5572,6 +6242,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             use_autocast=use_autocast,
                             autocast_dtype=autocast_dtype,
                             metrics_file=_metrics_file,
+                            sample_progress=sample_progress,
                             slow_metrics=True,
                             val_label="val_epoch_end",
                         )
@@ -5595,6 +6266,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
             use_autocast=use_autocast,
             autocast_dtype=autocast_dtype,
             metrics_file=_metrics_file,
+            sample_progress=sample_progress,
             slow_metrics=True,
             val_label="val_final",
         )

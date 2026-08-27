@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -193,6 +194,53 @@ def test_resume_discovery_prefers_newer_rolling_then_newer_durable(trainer, tmp_
     assert trainer._latest_step_dir(tmp_path) == (200, tmp_path / "200")
 
 
+def _write_basic_valid_checkpoint(path, step):
+    path.mkdir()
+    (path / "accelerate_state").mkdir()
+    trainer_metadata = {"global_step": step}
+    import torch
+    torch.save(trainer_metadata, path / "metadata.pt")
+    (path / "manifest.json").write_text(json.dumps({"run_metadata": {"global_step": step}}))
+
+
+def test_epoch_resume_prefers_published_rolling_over_stale_higher_numeric(trainer, tmp_path):
+    _write_basic_valid_checkpoint(tmp_path / "10000", 10000)
+    rolling = tmp_path / ".rolling_step_000000005000"
+    _write_basic_valid_checkpoint(rolling, 5000)
+    trainer._publish_rolling_checkpoint(tmp_path, rolling)
+
+    assert trainer._latest_step_dir(
+        tmp_path, checkpoint_policy="epoch_with_rolling"
+    ) == (5000, tmp_path / "rolling_latest")
+
+
+def test_epoch_resume_uses_numeric_fallback_when_no_rolling_link(trainer, tmp_path):
+    durable = tmp_path / "10000"
+    _write_basic_valid_checkpoint(durable, 10000)
+
+    assert trainer._latest_step_dir(
+        tmp_path, checkpoint_policy="epoch_with_rolling"
+    ) == (10000, durable)
+
+
+def test_epoch_resume_fails_closed_on_malformed_or_outside_rolling_link(trainer, tmp_path):
+    checkpoint_root, _ = _checkpoint_root_with_durable(tmp_path)
+    malformed = checkpoint_root / "not-a-checkpoint"
+    malformed.mkdir()
+    link = checkpoint_root / "rolling_latest"
+    link.symlink_to(malformed.name, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="invalid rolling_latest"):
+        trainer._latest_step_dir(checkpoint_root, checkpoint_policy="epoch_with_rolling")
+
+    link.unlink()
+    outside = tmp_path / ".rolling_step_000000000999"
+    outside.mkdir()
+    link.symlink_to(outside.resolve(), target_is_directory=True)
+    with pytest.raises(ValueError, match="invalid rolling_latest"):
+        trainer._latest_step_dir(checkpoint_root, checkpoint_policy="epoch_with_rolling")
+
+
 def _checkpoint_root_with_durable(tmp_path):
     checkpoint_root = tmp_path / "checkpoints"
     checkpoint_root.mkdir()
@@ -292,6 +340,118 @@ def test_non_main_rank_participates_in_collective_state_save(trainer, tmp_path, 
     assert accelerator.wait_calls == 3
     assert not (tmp_path / ".rolling_step_000000000040").exists()
     assert not (tmp_path / "rolling_latest").exists()
+
+
+def test_formal_state_save_failure_preserves_published_checkpoint(trainer, tmp_path, monkeypatch):
+    from dataclasses import dataclass
+
+    old = tmp_path / ".rolling_step_000000000020"
+    old.mkdir()
+    trainer._publish_rolling_checkpoint(tmp_path, old)
+
+    @dataclass
+    class Config:
+        checkpoint_dir: Path
+        name: str = "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16"
+        checkpoint_policy: str = "epoch_with_rolling"
+        rolling_checkpoint_interval: int = 40
+        num_train_steps: int = 100
+        save_interval: int = 0
+        pytorch_training_precision: str = "bfloat16"
+        wandb_enabled: bool = False
+
+    class Accelerator:
+        is_main_process = True
+        distributed_type = "DEEPSPEED"
+        num_processes = 32
+
+        def wait_for_everyone(self):
+            return None
+
+        def save_state(self, _path):
+            raise RuntimeError("state save failed")
+
+    monkeypatch.setenv("OPENPI_SAVE_ACCELERATE_STATE", "1")
+    with pytest.raises(RuntimeError, match="state save failed"):
+        trainer.save_checkpoint(
+            accelerator=Accelerator(),
+            model=object(),
+            optimizer=None,
+            global_step=40,
+            config=Config(checkpoint_dir=tmp_path),
+            data_config=SimpleNamespace(norm_stats=None, asset_id=None),
+            steps_per_epoch=100,
+        )
+
+    assert trainer._rolling_checkpoint_target(tmp_path) == old.resolve()
+    assert not (tmp_path / ".rolling_step_000000000040").exists()
+
+
+def test_formal_manifest_failure_preserves_published_checkpoint(trainer, tmp_path, monkeypatch):
+    from dataclasses import dataclass
+
+    old = tmp_path / ".rolling_step_000000000020"
+    old.mkdir()
+    trainer._publish_rolling_checkpoint(tmp_path, old)
+
+    @dataclass
+    class Config:
+        checkpoint_dir: Path
+        name: str = "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16"
+        checkpoint_policy: str = "epoch_with_rolling"
+        rolling_checkpoint_interval: int = 40
+        num_train_steps: int = 100
+        save_interval: int = 0
+        pytorch_training_precision: str = "bfloat16"
+        wandb_enabled: bool = False
+
+    class Accelerator:
+        is_main_process = True
+        distributed_type = "DEEPSPEED"
+        num_processes = 32
+
+        def wait_for_everyone(self):
+            return None
+
+        def save_state(self, path):
+            state = Path(path)
+            state.mkdir(parents=True)
+            (state / "pytorch_model").mkdir()
+            (state / "pytorch_model/mp_rank_00_model_states.pt").touch()
+            for rank in range(self.num_processes):
+                (state / f"rank{rank:02d}_optim_states.pt").touch()
+                (state / f"random_states_{rank}.pkl").touch()
+
+        def unwrap_model(self, model):
+            return model
+
+        def get_state_dict(self, _model):
+            return {}
+
+    monkeypatch.setattr(
+        trainer.safetensors.torch,
+        "save_file",
+        lambda _state, path: Path(path).write_bytes(b"model"),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_build_checkpoint_manifest",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("manifest failed")),
+    )
+    monkeypatch.setenv("OPENPI_SAVE_ACCELERATE_STATE", "1")
+    with pytest.raises(RuntimeError, match="manifest failed"):
+        trainer.save_checkpoint(
+            accelerator=Accelerator(),
+            model=object(),
+            optimizer=None,
+            global_step=40,
+            config=Config(checkpoint_dir=tmp_path),
+            data_config=SimpleNamespace(norm_stats=None, asset_id=None),
+            steps_per_epoch=100,
+        )
+
+    assert trainer._rolling_checkpoint_target(tmp_path) == old.resolve()
+    assert not (tmp_path / ".rolling_step_000000000040").exists()
 
 
 def test_main_rank_writes_rolling_then_durable_epoch_metadata(trainer, tmp_path, monkeypatch):

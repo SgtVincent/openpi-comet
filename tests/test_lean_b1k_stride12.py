@@ -372,7 +372,10 @@ def _formal_config_stub(
         checkpoint_policy=("epoch_with_rolling" if is_h20 else "step"),
         rolling_checkpoint_interval=10_000,
         val_log_interval=1_000,
-        val_num_batches=20,
+        val_batch_size=8 if is_h20 else None,
+        val_num_batches=16 if is_h20 else 20,
+        val_episodes_per_task=20 if is_h20 else 10,
+        val_anchors_per_episode=4 if is_h20 else 1,
         streaming_anchor_stride=schedule["streaming_anchor_stride"],
         epoch_anchor_offsets=None,
         overwrite=False,
@@ -783,8 +786,7 @@ def test_all_formal_ab_names_share_pass_wandb_and_resume_guards(trainer, monkeyp
         assert trainer._is_formal_b1k_mode(config)
 
         config.resume = True
-        with pytest.raises(ValueError, match="resume is unsupported"):
-            trainer._validate_formal_b1k_contract(config)
+        trainer._validate_formal_b1k_contract(config)
 
 
 @pytest.mark.parametrize(
@@ -880,7 +882,6 @@ _DERIVED_FORMAL_NAME = "pi05_ki_joint_fast_b1k-full_task-ki_on_h20_bf16"
 @pytest.mark.parametrize(
     ("name", "field", "value", "message"),
     [
-        (_LEGACY_FORMAL_NAME, "resume", True, "resume is unsupported"),
         (_LEGACY_FORMAL_NAME, "wandb_enabled", False, "wandb_enabled=True"),
         # The literal "num_train_steps == 104912" gate is gone. Drift is now
         # caught as an INCONSISTENCY: moving the budget without moving the cosine

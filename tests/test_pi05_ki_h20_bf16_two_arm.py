@@ -52,7 +52,7 @@ _WORLD = 32
 _FORMAL_STRIDE = 4
 _FORMAL_BATCH_PER_GPU = 32
 _FORMAL_GLOBAL_BATCH = 1024
-_FORMAL_VAL_SAMPLES = 256_000
+_FORMAL_VAL_SAMPLES = 1_024_000
 _FORMAL_SAVE_SAMPLES = 2_560_000
 _FORMAL_WARMUP = 250
 _FORMAL_PEAK_LR = 2e-5
@@ -199,9 +199,12 @@ def test_formal_arms_carry_the_derived_single_sweep_recipe() -> None:
         assert cfg.rolling_checkpoint_interval == 2_500
         global_batch = cfg.batch_size_per_gpu * _WORLD * cfg.gradient_accumulation_steps
         assert global_batch == _FORMAL_GLOBAL_BATCH
-        assert cfg.val_interval_samples // global_batch == 250
+        assert cfg.val_interval_samples // global_batch == 1_000
         assert cfg.save_interval_samples // global_batch == 2_500
-        assert cfg.val_num_batches == 20
+        assert cfg.val_batch_size == 8
+        assert cfg.val_num_batches == 16
+        assert cfg.val_episodes_per_task == 20
+        assert cfg.val_anchors_per_episode == 4
         assert cfg.project_name == "pi05_ki"
         sched = cfg.lr_schedule
         assert (

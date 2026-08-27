@@ -140,7 +140,7 @@ def test_h20_profiles_preserve_intended_epoch_recipe_batch_and_effective_cadence
         assert profile.batch_size_per_gpu == 32
         assert profile.gradient_accumulation_steps == 1
         assert profile.expected_global_batch == 1024
-        assert profile.effective_val_log_interval == 250
+        assert profile.effective_val_log_interval == 1_000
         assert profile.effective_save_interval == 2_500
         assert profile.num_train_epochs == 1
         assert profile.num_train_steps == 0
@@ -208,7 +208,7 @@ def test_h20_exact_tyro_argv_parses_raw_then_validates_shared_effective_recipe(
 
     effective = materialize_effective_recipe(parsed, world_size=32)
     assert effective.save_interval == 2_500
-    assert effective.val_log_interval == 250
+    assert effective.val_log_interval == 1_000
     trainer._validate_formal_b1k_contract(
         effective, accelerator=_accelerator_for(effective)
     )
@@ -218,8 +218,8 @@ def test_h20_exact_tyro_argv_parses_raw_then_validates_shared_effective_recipe(
 def test_h20_effective_recipe_mutation_is_rejected(name):
     trainer = _load_trainer()
     effective = materialize_effective_recipe(get_config(name), world_size=32)
-    mutated = dataclasses.replace(effective, val_log_interval=251)
-    with pytest.raises(ValueError, match="effective val_log_interval=250"):
+    mutated = dataclasses.replace(effective, val_log_interval=1_001)
+    with pytest.raises(ValueError, match="effective val_log_interval=1000"):
         trainer._validate_formal_b1k_contract(
             mutated, accelerator=_accelerator_for(mutated)
         )
