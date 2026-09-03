@@ -14,6 +14,7 @@ import torch
 from typing_extensions import override
 
 from openpi import transforms as _transforms
+from openpi.models import hierarchy_cache as _hierarchy_cache
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
@@ -54,9 +55,16 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        # Hierarchical-MoMA-VLA held state (design section 2.2 / 4.4).
+        #
+        # These three names previously existed in this constructor and were never
+        # read or written anywhere in the tree.  They are now backed by a real
+        # cache with explicit invalidate semantics.  The cache holds hierarchy
+        # token IDs only -- HierarchyTokenCache refuses a past_key_values payload,
+        # because caching the prefix KV would carry a stale image and (for pi05) a
+        # stale discretised state into later action chunks (design section 4.5).
+        self._hierarchy_cache = _hierarchy_cache.HierarchyTokenCache()
         self._cached_subtask_prompt: str | None = None
-        self._cached_subtask_tokens = None
-        self._cached_subtask_text: str | None = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -66,6 +74,33 @@ class Policy(BasePolicy):
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
+
+    @property
+    def hierarchy_cache(self) -> "_hierarchy_cache.HierarchyTokenCache":
+        """The held hierarchy for this policy instance."""
+        return self._hierarchy_cache
+
+    @property
+    def _cached_subtask_tokens(self):
+        """Back-compat alias for the held hierarchy token ids (None when cold)."""
+        return self._hierarchy_cache.tokens
+
+    @property
+    def _cached_subtask_text(self) -> str | None:
+        """Back-compat alias for the held hierarchy text (None when cold)."""
+        return self._hierarchy_cache.text
+
+    def reset(self, reason: str = "episode boundary") -> None:
+        """Drop held hierarchy state.
+
+        Call this between episodes.  A held hierarchy that survives an episode
+        boundary is stale by construction, and nothing else in the stack will
+        notice: it is the caller's responsibility, so it is made explicit here
+        rather than inferred.
+        """
+        self._hierarchy_cache.invalidate(reason)
+        self._cached_subtask_prompt = None
+
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]

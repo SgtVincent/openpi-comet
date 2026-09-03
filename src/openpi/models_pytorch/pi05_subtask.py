@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 import openpi.shared.download as download
+from openpi.models.hierarchy_cache import observation_fingerprint
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 
 import sentencepiece
@@ -247,6 +248,12 @@ class PI05SubtaskPytorch(PI0Pytorch):
             subtask_tokens=getattr(observation, "subtask_tokens", None),
             subtask_mask=getattr(observation, "subtask_mask", None),
         )
+        # Fingerprint of the observation we are acting on *now*.  Passing it into
+        # every velocity step wires up the design section 4.5 guard: if a caller
+        # ever hands in a prefix_ctx encoded from an earlier action chunk, this
+        # raises StalePrefixKVError instead of silently acting on a stale image
+        # and (for pi05) a stale discretised state.
+        current_obs_fingerprint = observation_fingerprint(images, lang_tokens)
 
         dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
         x_t = noise
@@ -259,6 +266,7 @@ class PI05SubtaskPytorch(PI0Pytorch):
                 state=state,
                 x_t=x_t,
                 time=expanded_time,
+                expected_obs_fingerprint=current_obs_fingerprint,
             )
             x_t = x_t + dt * v_t
             time += dt

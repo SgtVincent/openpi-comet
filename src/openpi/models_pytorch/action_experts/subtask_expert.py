@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from openpi.models.hierarchy_cache import assert_prefix_fresh, observation_fingerprint
 from openpi.models_pytorch.action_experts.base import ActionExpert
 from openpi.models_pytorch.dtype_utils import align_tensors_to_reference_dtype
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
@@ -102,6 +103,12 @@ class SubtaskActionExpert(ActionExpert):
         return {
             "prefix_pad_masks": prefix_pad_masks,
             "past_key_values": past_key_values,
+            # Stamp of the observation this KV was built from.  Consumed by
+            # compute_velocity_infer via assert_prefix_fresh: reusing this ctx on
+            # a later action chunk raises instead of silently acting on a stale
+            # image/state (design section 4.5).  Covers lang_tokens too because
+            # for pi05 the state is discretised text inside them.
+            "obs_fingerprint": observation_fingerprint(images, lang_tokens),
         }
 
     def compute_velocity_train(
@@ -276,8 +283,17 @@ class SubtaskActionExpert(ActionExpert):
         state: torch.Tensor,
         x_t: torch.Tensor,
         time: torch.Tensor,
+        expected_obs_fingerprint: tuple | None = None,
     ) -> torch.Tensor:
-        """Standard inference velocity computation."""
+        """Standard inference velocity computation.
+
+        ``expected_obs_fingerprint`` is the fingerprint of the observation being
+        acted on *now*.  When supplied it is checked against the one stamped into
+        ``prefix_ctx`` by ``encode_prefix``; a mismatch means the caller reused a
+        prefix KV across action chunks and raises ``StalePrefixKVError``.
+        Defaults to ``None`` so existing callers keep working unchanged.
+        """
+        assert_prefix_fresh(prefix_ctx, expected_obs_fingerprint, where="compute_velocity_infer")
         prefix_pad_masks = prefix_ctx["prefix_pad_masks"]
         past_key_values = prefix_ctx["past_key_values"]
         return model.denoise_step(state, prefix_pad_masks, past_key_values, x_t, time)
