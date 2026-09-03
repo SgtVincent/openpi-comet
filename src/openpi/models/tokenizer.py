@@ -562,3 +562,91 @@ class SubtaskTokenizer:
             np.asarray(ar_mask, dtype=np.int32),
             np.asarray(loss_mask, dtype=np.bool_),
         )
+
+    # ------------------------------------------------------------------
+    # Hierarchical-MoMA-VLA (design P1)
+    # ------------------------------------------------------------------
+    # The hierarchy SUBSUMES the subtask segment rather than forming a third
+    # parallel conditioning channel.  This codebase already has two mutually
+    # disconnected GT-plan channels (`subtask_tokens` and the prompt text), and a
+    # previous investigation found the golden-rule path touched `subtask_tokens`
+    # zero times while it was believed to be conditioning the model.  Adding a
+    # third channel would compound exactly that defect, so hierarchy text is
+    # emitted into the existing `subtask_*` slots: one channel, one owner.
+    #
+    # Compatibility: a plain subtask string still tokenises exactly as before via
+    # `tokenize_subtask`.  Hierarchy text is distinguishable at the token level
+    # because it opens with the reserved `<MEM>` slot id, so a checkpoint trained
+    # on bare subtask text is not silently reinterpreted.
+
+    @property
+    def hierarchy_codec(self):
+        """Lazily-built codec for the hierarchy tag <-> reserved-slot mapping."""
+        codec = getattr(self, "_hierarchy_codec", None)
+        if codec is None:
+            from openpi.models import hierarchy_tokens as _hier
+
+            codec = _hier.HierarchyTagCodec(tokenizer=self._tokenizer)
+            self._hierarchy_codec = codec
+        return codec
+
+    def tokenize_hierarchy(
+        self, hierarchy_text: str, *, validate: bool = True
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Tokenize canonical hierarchy text into the subtask token slots.
+
+        Mirrors `tokenize_subtask` (BOS, causal ar_mask, loss on everything after
+        BOS, pad/truncate to `subtask_max_len`) so that the downstream prefix
+        assembly and CE loss are unchanged.  The only difference is that the tags
+        are rewritten to reserved single-token slots before encoding.
+
+        Returns (tokens, mask, ar_mask, loss_mask).
+        """
+        if hierarchy_text is None:
+            raise ValueError("tokenize_hierarchy() requires text; pass the canonical hierarchy string")
+        codec = self.hierarchy_codec
+        # Deliberately no `.replace("\n", " ")` here: build_hierarchy_text uses
+        # newlines as the only field separator and already collapsed whitespace
+        # inside each field, so stripping them would erase the field boundaries.
+        body_ids = codec.encode(hierarchy_text.strip(), validate=validate)
+        hierarchy_tokens = [self._tokenizer.bos_id(), *body_ids, self._tokenizer.eos_id()]
+        hierarchy_len = len(hierarchy_tokens)
+
+        tokens = hierarchy_tokens
+        mask = [True] * hierarchy_len
+        ar_mask = [1] * hierarchy_len
+        loss_mask = [False] + [True] * (hierarchy_len - 1)
+
+        if hierarchy_len < self._subtask_max_len:
+            padding_len = self._subtask_max_len - hierarchy_len
+            tokens = tokens + [0] * padding_len
+            mask = mask + [False] * padding_len
+            ar_mask = ar_mask + [0] * padding_len
+            loss_mask = loss_mask + [False] * padding_len
+        else:
+            if hierarchy_len > self._subtask_max_len:
+                # Loud, not silent: truncating hierarchy text drops trailing tags
+                # (typically </NEXT>), which corrupts the supervision target.
+                logging.warning(
+                    f"Hierarchy token length ({hierarchy_len}) exceeds max ({self._subtask_max_len}), "
+                    "truncating. This drops trailing hierarchy tags and corrupts the CE target; "
+                    "raise subtask_max_len or shorten the memory field."
+                )
+            tokens = tokens[: self._subtask_max_len]
+            mask = mask[: self._subtask_max_len]
+            ar_mask = ar_mask[: self._subtask_max_len]
+            loss_mask = loss_mask[: self._subtask_max_len]
+
+        return (
+            np.asarray(tokens, dtype=np.int32),
+            np.asarray(mask, dtype=np.bool_),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask, dtype=np.bool_),
+        )
+
+    def decode_hierarchy(self, tokens) -> str:
+        """Decode hierarchy token ids back to *readable* tag form (for logging/eval)."""
+        ids = [int(t) for t in np.asarray(tokens).reshape(-1).tolist()]
+        specials = {self._tokenizer.bos_id(), self._tokenizer.eos_id(), self._tokenizer.pad_id()}
+        ids = [i for i in ids if i not in specials and i >= 0]
+        return self.hierarchy_codec.decode(ids)
