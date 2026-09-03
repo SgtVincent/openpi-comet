@@ -188,6 +188,19 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step = 0
 
     @override
+    def reset(self) -> None:
+        """Forward the reset to the wrapped policy.
+
+        Without this, wrapping a Policy in a PolicyRecorder silently disarms
+        hierarchy invalidation: PolicyRecorder would inherit BasePolicy's no-op
+        reset, the inner Policy would never be told the episode ended, and the
+        held hierarchy would leak into the next episode with nothing reporting
+        it. A guard has to be reachable from every consumer, not just the
+        unwrapped one.
+        """
+        self._policy.reset()
+
+    @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         results = self._policy.infer(obs)
 

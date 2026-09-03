@@ -320,8 +320,19 @@ def test_policy_reset_clears_held_hierarchy():
 
     A hierarchy carried into a new episode is stale by construction and nothing
     downstream would notice.
+
+    Note this override lands on an existing hook: BasePolicy.reset() is declared
+    as a no-op (base_policy.py:10-12) and ActionChunkBroker already calls
+    self._policy.reset() with no arguments (action_chunk_broker.py:48). So the
+    invalidation is reached by the existing runtime rather than needing a new
+    call site -- which is why `reason` must keep a default. This test calls it
+    the same zero-argument way the broker does.
     """
+    from openpi_client import base_policy as _base_policy
+
     from openpi.policies.policy import Policy
+
+    assert issubclass(Policy, _base_policy.BasePolicy), "Policy must still implement the BasePolicy hook"
 
     policy = Policy.__new__(Policy)  # bypass model construction; only cache wiring is under test
     policy._hierarchy_cache = HierarchyTokenCache()
@@ -329,8 +340,28 @@ def test_policy_reset_clears_held_hierarchy():
     policy._hierarchy_cache.store([1, 2, 3], text="<MEM>m</MEM>")
     assert policy._cached_subtask_tokens is not None
 
-    policy.reset()
+    policy.reset()  # exactly how ActionChunkBroker calls it
     assert policy._cached_subtask_tokens is None
     assert policy._cached_subtask_text is None
     assert policy._cached_subtask_prompt is None
     assert policy._hierarchy_cache.invalidated_reason == "episode boundary"
+
+
+def test_policy_recorder_forwards_reset_to_the_wrapped_policy(tmp_path):
+    """FAILS IF: PolicyRecorder stops forwarding reset().
+
+    PolicyRecorder wraps a policy but inherits BasePolicy's no-op reset. If it
+    does not forward, wrapping silently disarms hierarchy invalidation and the
+    held hierarchy leaks into the next episode -- the guard would exist but be
+    unreachable from this consumer.
+    """
+    from openpi.policies.policy import Policy, PolicyRecorder
+
+    inner = Policy.__new__(Policy)
+    inner._hierarchy_cache = HierarchyTokenCache()
+    inner._cached_subtask_prompt = None
+    inner._hierarchy_cache.store([1, 2, 3])
+
+    recorder = PolicyRecorder(inner, str(tmp_path / "rec"))
+    recorder.reset()
+    assert not inner._hierarchy_cache.is_populated, "reset did not reach the wrapped policy"

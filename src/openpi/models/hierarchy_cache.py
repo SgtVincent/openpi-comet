@@ -166,14 +166,14 @@ class HierarchyTokenCache:
             )
         if hasattr(tokens, "dtype"):
             dtype = tokens.dtype
-            is_int = getattr(dtype, "is_floating_point", None) is False or np.issubdtype(
-                getattr(dtype, "type", np.int64) if isinstance(dtype, np.dtype) else np.int64, np.integer
-            )
-            # torch tensors expose dtype.is_floating_point; numpy goes via np.issubdtype.
             if isinstance(tokens, np.ndarray):
-                is_int = np.issubdtype(tokens.dtype, np.integer)
-            elif hasattr(dtype, "is_floating_point"):
-                is_int = not bool(dtype.is_floating_point)
+                is_int = bool(np.issubdtype(dtype, np.integer))
+            elif hasattr(dtype, "is_floating_point"):  # torch
+                is_int = not bool(dtype.is_floating_point) and not bool(getattr(dtype, "is_complex", False))
+            else:
+                # Unknown array library: refuse rather than guess. Being wrong in
+                # the permissive direction here is what lets a KV through.
+                is_int = False
             if not is_int:
                 raise HierarchyCacheError(
                     f"refusing to cache a non-integer tensor of dtype {dtype}: the hierarchy cache "

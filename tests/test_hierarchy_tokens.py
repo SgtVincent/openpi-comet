@@ -179,7 +179,7 @@ def test_raw_text_tags_would_drift_and_cost_more(sp_tokenizer):
     raw_cost = sum(len(sp_tokenizer.encode(tag)) for tag in HIERARCHY_TAG_TO_SLOT)
     assert raw_cost > 8, "raw-text tags are not more expensive; option C's cost argument is void"
     # Drift: leading whitespace changes the first id of the raw-text tag.
-    assert sp_tokenizer.encode("<MEM>")[0] != sp_tokenizer.encode(" <MEM>")[1 - 1], (
+    assert sp_tokenizer.encode("<MEM>")[0] != sp_tokenizer.encode(" <MEM>")[0], (
         "raw-text tag did not drift with context; option C's drift argument is void"
     )
 
