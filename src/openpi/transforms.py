@@ -391,17 +391,17 @@ class PromptFromLeRobotItem(DataTransformFn):
     drops ``subtask_text``.  Downstream, ``TokenizeSubtaskInputs`` then fabricates
     an all-zero / mask-False subtask, and ``SubtaskActionExpert.encode_prefix``
     short-circuits on ``not torch.any(subtask_mask)`` -- so the whole conditioning
-    segment disappears from the prefix with no error anywhere.  Hierarchy text
+    segment disappears from the prefix with no error anywhere.  Memory text
     travels the same path, which is why it gets an explicit ``require_*`` switch
     rather than inheriting that silence.
     """
 
     include_subtask_text: bool = False
-    include_hierarchy_text: bool = False
-    #: When True, hierarchy text must survive this transform.  A missing field or
-    #: a contradictory ``include_hierarchy_text=False`` raises instead of silently
+    include_memory_text: bool = False
+    #: When True, memory text must survive this transform.  A missing field or
+    #: a contradictory ``include_memory_text=False`` raises instead of silently
     #: degrading to an unconditioned model.
-    require_hierarchy_text: bool = False
+    require_memory_text: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         result = {**data}
@@ -409,20 +409,20 @@ class PromptFromLeRobotItem(DataTransformFn):
         if not self.include_subtask_text:
             result.pop("subtask_text", None)
 
-        if self.require_hierarchy_text and not self.include_hierarchy_text:
+        if self.require_memory_text and not self.include_memory_text:
             raise ValueError(
-                "PromptFromLeRobotItem is configured with require_hierarchy_text=True but "
-                "include_hierarchy_text=False, which would drop the field it is required to keep. "
-                "Set include_hierarchy_text=True."
+                "PromptFromLeRobotItem is configured with require_memory_text=True but "
+                "include_memory_text=False, which would drop the field it is required to keep. "
+                "Set include_memory_text=True."
             )
-        if not self.include_hierarchy_text:
-            result.pop("hierarchy_text", None)
-        elif result.get("hierarchy_text") is None and self.require_hierarchy_text:
+        if not self.include_memory_text:
+            result.pop("memory_text", None)
+        elif result.get("memory_text") is None and self.require_memory_text:
             raise ValueError(
-                "hierarchy_text is required but missing from this dataset item. "
-                "Without it the hierarchy segment silently vanishes from the prefix "
-                "(see this class's docstring). Regenerate the dataset with hierarchy "
-                "annotations, or set require_hierarchy_text=False to accept an "
+                "memory_text is required but missing from this dataset item. "
+                "Without it the memory segment silently vanishes from the prefix "
+                "(see this class's docstring). Regenerate the dataset with memory "
+                "annotations, or set require_memory_text=False to accept an "
                 "unconditioned run."
             )
         return result
@@ -437,8 +437,8 @@ class TokenizeSubtaskInputs(DataTransformFn):
     - subtask_tokens + subtask_mask + subtask_ar_mask + subtask_loss_mask: subtask CE targets
     - actions: continuous actions preserved for flow matching loss
 
-    Hierarchical-MoMA-VLA: when ``hierarchy_text`` is present it is tokenized
-    into the same ``subtask_*`` slots.  The hierarchy subsumes the subtask
+    MoMA-VLA: when ``memory_text`` is present it is tokenized
+    into the same ``subtask_*`` slots.  Memory subsumes the subtask
     segment rather than adding a third conditioning channel alongside
     ``subtask_tokens`` and the prompt text.
     """
@@ -446,10 +446,10 @@ class TokenizeSubtaskInputs(DataTransformFn):
     tokenizer: _tokenizer.SubtaskTokenizer
     #: Fail-closed switch.  With the default False, an absent conditioning field
     #: still degrades to the historical all-zero / mask-False subtask.  Set True
-    #: for hierarchy runs so that a missing field raises here instead of
+    #: for memory runs so that a missing field raises here instead of
     #: vanishing inside ``encode_prefix``'s ``not torch.any(subtask_mask)``
     #: short-circuit.
-    require_hierarchy: bool = False
+    require_memory: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -464,25 +464,25 @@ class TokenizeSubtaskInputs(DataTransformFn):
         # Tokenize the task prompt + state for the prefix
         prompt_tokens, prompt_mask = self.tokenizer.tokenize_prompt(prompt, state)
 
-        hierarchy_text = data.pop("hierarchy_text", None)
+        memory_text = data.pop("memory_text", None)
         subtask_text = data.pop("subtask_text", None)
 
-        if hierarchy_text is not None:
-            if not isinstance(hierarchy_text, str):
-                hierarchy_text = hierarchy_text.item()
-            st_tokens, st_mask, st_ar_mask, st_loss_mask = self.tokenizer.tokenize_hierarchy(hierarchy_text)
-        elif self.require_hierarchy:
+        if memory_text is not None:
+            if not isinstance(memory_text, str):
+                memory_text = memory_text.item()
+            st_tokens, st_mask, st_ar_mask, st_loss_mask = self.tokenizer.tokenize_memory(memory_text)
+        elif self.require_memory:
             # Do NOT fall through to the zero fabrication below.  That path
             # produces mask=False everywhere, encode_prefix then drops the whole
             # segment, and the run silently becomes unconditioned while still
             # reporting a loss.  Same philosophy as the strict-load verification:
             # a missing required input is an error, not a default.
             raise ValueError(
-                "require_hierarchy=True but this item carries no 'hierarchy_text'. "
+                "require_memory=True but this item carries no 'memory_text'. "
                 "Continuing would fabricate an all-zero, mask-False segment which "
                 "encode_prefix drops entirely, silently training/serving an "
                 "unconditioned model. Fix the dataset or the upstream "
-                "PromptFromLeRobotItem(include_hierarchy_text=...) wiring."
+                "PromptFromLeRobotItem(include_memory_text=...) wiring."
             )
         elif subtask_text is not None:
             if not isinstance(subtask_text, str):

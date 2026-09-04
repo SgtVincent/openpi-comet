@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from openpi.models.hierarchy_cache import assert_prefix_fresh, observation_fingerprint
+from openpi.models.memory_cache import assert_prefix_fresh, observation_fingerprint
 from openpi.models_pytorch.action_experts.base import ActionExpert
 from openpi.models_pytorch.dtype_utils import align_tensors_to_reference_dtype
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks

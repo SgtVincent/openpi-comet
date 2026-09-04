@@ -1,5 +1,5 @@
-"""Tests for the fail-closed hierarchy path through the data transforms
-(Hierarchical-MoMA-VLA P1, item 2).
+"""Tests for the fail-closed memory path through the data transforms
+(MoMA-VLA P1, item 2).
 
 The defect these guard against is a three-stage silent drop that exists today:
 
@@ -12,7 +12,7 @@ The defect these guard against is a three-stage silent drop that exists today:
      entirely.
 
 Nothing raises, nothing warns, and the run silently becomes unconditioned while
-still reporting a loss. Hierarchy tokens travel the same path.
+still reporting a loss. Memory tokens travel the same path.
 
 Each test states what would make it fail.
 """
@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from openpi import transforms as _transforms
-from openpi.models import hierarchy_tokens as hier
+from openpi.models import memory_text as mem
 
 
 @pytest.fixture(scope="module")
@@ -37,11 +37,12 @@ def subtask_tokenizer():
         pytest.skip(f"SubtaskTokenizer unavailable: {exc}")
 
 
-HIER_TEXT = hier.build_hierarchy_text(
-    memory="finished: pick up the radio, 1st occurrence; active: press the radio, 1st occurrence",
-    primitive="press the radio",
+MEM_TEXT = mem.build_memory_text(
+    memory="Completed: pick up the radio from the coffee table (1). Active: press the radio (1).",
+    primitive="press the radio (1)",
     skill="press the radio",
-    next_skill="place the radio on the coffee table",
+    next_skill="END_OF_PRIMITIVE",
+    next_primitive="place the radio on the coffee table (1)",
 )
 
 
@@ -54,39 +55,39 @@ def test_include_subtask_text_false_still_drops_subtask_text():
     """Characterisation of existing behaviour, kept deliberately.
 
     FAILS IF: the legacy default changes. We are adding a fail-closed path for
-    hierarchy, not silently altering what existing subtask configs do.
+    memory, not silently altering what existing subtask configs do.
     """
     tf = _transforms.PromptFromLeRobotItem()
     out = tf({"task": "t", "subtask_text": "press the radio"})
     assert "subtask_text" not in out
 
 
-def test_hierarchy_text_is_dropped_by_default_but_kept_when_included():
-    """FAILS IF: hierarchy_text leaks through by default (surprising existing
+def test_memory_text_is_dropped_by_default_but_kept_when_included():
+    """FAILS IF: memory_text leaks through by default (surprising existing
     configs), or cannot be kept when explicitly requested."""
-    dropped = _transforms.PromptFromLeRobotItem()({"task": "t", "hierarchy_text": HIER_TEXT})
-    assert "hierarchy_text" not in dropped
+    dropped = _transforms.PromptFromLeRobotItem()({"task": "t", "memory_text": MEM_TEXT})
+    assert "memory_text" not in dropped
 
-    kept = _transforms.PromptFromLeRobotItem(include_hierarchy_text=True)(
-        {"task": "t", "hierarchy_text": HIER_TEXT}
+    kept = _transforms.PromptFromLeRobotItem(include_memory_text=True)(
+        {"task": "t", "memory_text": MEM_TEXT}
     )
-    assert kept["hierarchy_text"] == HIER_TEXT
+    assert kept["memory_text"] == MEM_TEXT
 
 
-def test_require_hierarchy_text_rejects_the_contradictory_config():
-    """REQUIRED TEST (part 1). FAILS IF: a config that requires hierarchy while
+def test_require_memory_text_rejects_the_contradictory_config():
+    """REQUIRED TEST (part 1). FAILS IF: a config that requires memory while
     also dropping it is accepted -- i.e. the exact silent-drop shape survives
     behind a flag that claims to prevent it."""
-    tf = _transforms.PromptFromLeRobotItem(require_hierarchy_text=True, include_hierarchy_text=False)
+    tf = _transforms.PromptFromLeRobotItem(require_memory_text=True, include_memory_text=False)
     with pytest.raises(ValueError, match="would drop the field it is required to keep"):
-        tf({"task": "t", "hierarchy_text": HIER_TEXT})
+        tf({"task": "t", "memory_text": MEM_TEXT})
 
 
-def test_require_hierarchy_text_raises_when_the_field_is_absent():
-    """REQUIRED TEST (part 2). FAILS IF: a missing hierarchy_text passes through
+def test_require_memory_text_raises_when_the_field_is_absent():
+    """REQUIRED TEST (part 2). FAILS IF: a missing memory_text passes through
     quietly, which downstream becomes an unconditioned model with no error."""
-    tf = _transforms.PromptFromLeRobotItem(require_hierarchy_text=True, include_hierarchy_text=True)
-    with pytest.raises(ValueError, match="hierarchy_text is required but missing"):
+    tf = _transforms.PromptFromLeRobotItem(require_memory_text=True, include_memory_text=True)
+    with pytest.raises(ValueError, match="memory_text is required but missing"):
         tf({"task": "t"})
 
 
@@ -95,26 +96,26 @@ def test_require_hierarchy_text_raises_when_the_field_is_absent():
 # ---------------------------------------------------------------------------
 
 
-def test_tokenize_uses_hierarchy_text_when_present(subtask_tokenizer):
-    """FAILS IF: hierarchy_text is ignored, or routed anywhere other than the
+def test_tokenize_uses_memory_text_when_present(subtask_tokenizer):
+    """FAILS IF: memory_text is ignored, or routed anywhere other than the
     subtask_* slots (which would make it a third conditioning channel)."""
     tf = _transforms.TokenizeSubtaskInputs(tokenizer=subtask_tokenizer)
-    out = tf({"prompt": "turn on the radio", "state": np.zeros(8), "hierarchy_text": HIER_TEXT})
-    assert out["subtask_mask"].any(), "hierarchy produced an empty (dropped) segment"
-    mem_id = subtask_tokenizer.hierarchy_codec.slot_ids["<MEM>"]
-    assert mem_id in out["subtask_tokens"].tolist(), "hierarchy tags absent from the token stream"
+    out = tf({"prompt": "turn on the radio", "state": np.zeros(8), "memory_text": MEM_TEXT})
+    assert out["subtask_mask"].any(), "memory produced an empty (dropped) segment"
+    mem_id = subtask_tokenizer.memory_codec().label_token_ids["memory"][0]
+    assert mem_id in out["subtask_tokens"].tolist(), "memory labels absent from the token stream"
 
 
-def test_require_hierarchy_raises_instead_of_fabricating_zeros(subtask_tokenizer):
+def test_require_memory_raises_instead_of_fabricating_zeros(subtask_tokenizer):
     """REQUIRED TEST (part 3). FAILS IF: the all-zero / mask-False fabrication
-    happens when hierarchy is required.
+    happens when memory is required.
 
     Asserting the raise rather than asserting a zero tensor is the point: a zero
     tensor is precisely the silent failure, so a test that accepted it would
     lock in the bug.
     """
-    tf = _transforms.TokenizeSubtaskInputs(tokenizer=subtask_tokenizer, require_hierarchy=True)
-    with pytest.raises(ValueError, match="no 'hierarchy_text'"):
+    tf = _transforms.TokenizeSubtaskInputs(tokenizer=subtask_tokenizer, require_memory=True)
+    with pytest.raises(ValueError, match="no 'memory_text'"):
         tf({"prompt": "turn on the radio", "state": np.zeros(8)})
 
 
@@ -128,7 +129,7 @@ def test_legacy_zero_fabrication_still_happens_when_not_required(subtask_tokeniz
 
 
 def test_subtask_text_still_works_unchanged(subtask_tokenizer):
-    """FAILS IF: adding the hierarchy branch changed how plain subtask text is
+    """FAILS IF: adding the memory branch changed how plain subtask text is
     tokenized (which would invalidate every existing subtask checkpoint)."""
     tf = _transforms.TokenizeSubtaskInputs(tokenizer=subtask_tokenizer)
     out = tf({"prompt": "turn on the radio", "state": np.zeros(8), "subtask_text": "press the radio"})
@@ -156,8 +157,8 @@ def test_encode_prefix_really_does_drop_an_all_false_mask(subtask_tokenizer):
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-    from test_hierarchy_cache import _obs
-    from test_hierarchy_cache import _StubModel
+    from test_memory_cache import _obs
+    from test_memory_cache import _StubModel
 
     from openpi.models_pytorch.action_experts.subtask_expert import SubtaskActionExpert
 
@@ -196,30 +197,32 @@ def test_encode_prefix_really_does_drop_an_all_false_mask(subtask_tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# Tokenizer-level hierarchy encoding
+# Tokenizer-level memory encoding
 # ---------------------------------------------------------------------------
 
 
-def test_tokenize_hierarchy_round_trips_through_decode(subtask_tokenizer):
-    """FAILS IF: padding/BOS/EOS handling corrupts the hierarchy text on the way
+def test_tokenize_memory_round_trips_through_decode(subtask_tokenizer):
+    """FAILS IF: padding/BOS/EOS handling corrupts the memory text on the way
     back out, which would silently break rollout logging and eval."""
-    tokens, mask, ar_mask, loss_mask = subtask_tokenizer.tokenize_hierarchy(HIER_TEXT)
-    assert subtask_tokenizer.decode_hierarchy(tokens) == HIER_TEXT
-    assert ar_mask[: int(mask.sum())].all(), "hierarchy segment must be causal"
+    tokens, mask, ar_mask, loss_mask = subtask_tokenizer.tokenize_memory(MEM_TEXT)
+    assert subtask_tokenizer.decode_memory(tokens) == MEM_TEXT
+    assert ar_mask[: int(mask.sum())].all(), "memory segment must be causal"
     assert not loss_mask[0], "BOS must not be a CE target"
     assert loss_mask[1 : int(mask.sum())].all()
 
 
-def test_tokenize_hierarchy_rejects_malformed_text(subtask_tokenizer):
-    """FAILS IF: malformed hierarchy text is tokenized anyway, producing a target
+def test_tokenize_memory_rejects_malformed_text(subtask_tokenizer):
+    """FAILS IF: malformed memory text is tokenized anyway, producing a target
     the model is then trained to imitate."""
-    with pytest.raises(hier.HierarchyTagError):
-        subtask_tokenizer.tokenize_hierarchy("<MEM>only memory</MEM>")
+    with pytest.raises(mem.MemoryTextError):
+        subtask_tokenizer.tokenize_memory("Memory: only memory")
 
 
-def test_hierarchy_is_cheaper_than_raw_text_tags(subtask_tokenizer):
-    """FAILS IF: the reserved-slot encoding stops saving tokens, i.e. the
-    'compress the canonical text' half of item 1 regressed."""
-    special_len = int(subtask_tokenizer.tokenize_hierarchy(HIER_TEXT)[1].sum())
-    raw_len = len(subtask_tokenizer._tokenizer.encode(HIER_TEXT)) + 2  # +BOS/EOS
-    assert special_len < raw_len, f"special={special_len} not cheaper than raw={raw_len}"
+def test_reserved_slots_are_cheaper_than_plain_text(subtask_tokenizer):
+    """FAILS IF: the reserved-slot scheme stops saving tokens, i.e. the measured
+    trade-off behind the still-open label decision no longer holds."""
+    from openpi.models.memory_text import LabelScheme
+
+    plain = subtask_tokenizer.memory_token_length(MEM_TEXT, scheme=LabelScheme.PLAIN_TEXT)
+    slots = subtask_tokenizer.memory_token_length(MEM_TEXT, scheme=LabelScheme.RESERVED_SLOT)
+    assert slots < plain, f"reserved={slots} not cheaper than plain={plain}"

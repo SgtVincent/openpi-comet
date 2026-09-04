@@ -563,74 +563,82 @@ class SubtaskTokenizer:
             np.asarray(loss_mask, dtype=np.bool_),
         )
 
+
     # ------------------------------------------------------------------
-    # Hierarchical-MoMA-VLA (design P1)
+    # MoMA-VLA memory conditioning (design P1)
     # ------------------------------------------------------------------
-    # The hierarchy SUBSUMES the subtask segment rather than forming a third
-    # parallel conditioning channel.  This codebase already has two mutually
-    # disconnected GT-plan channels (`subtask_tokens` and the prompt text), and a
-    # previous investigation found the golden-rule path touched `subtask_tokens`
-    # zero times while it was believed to be conditioning the model.  Adding a
-    # third channel would compound exactly that defect, so hierarchy text is
-    # emitted into the existing `subtask_*` slots: one channel, one owner.
+    # Memory SUBSUMES the subtask segment rather than forming a third parallel
+    # conditioning channel.  This codebase already has two mutually disconnected
+    # GT-plan channels (`subtask_tokens` and the prompt text), and a previous
+    # investigation found the golden-rule path touched `subtask_tokens` zero times
+    # while it was believed to be conditioning the model.  A third channel would
+    # compound exactly that defect, so memory text is emitted into the existing
+    # `subtask_*` slots: one channel, one owner.
     #
     # Compatibility: a plain subtask string still tokenises exactly as before via
-    # `tokenize_subtask`.  Hierarchy text is distinguishable at the token level
-    # because it opens with the reserved `<MEM>` slot id, so a checkpoint trained
-    # on bare subtask text is not silently reinterpreted.
+    # `tokenize_subtask`.  The label scheme is owned entirely by MemoryTextCodec,
+    # because the choice between plain-text and reserved-slot labels is still open.
 
-    @property
-    def hierarchy_codec(self):
-        """Lazily-built codec for the hierarchy tag <-> reserved-slot mapping."""
-        codec = getattr(self, "_hierarchy_codec", None)
-        if codec is None:
-            from openpi.models import hierarchy_tokens as _hier
+    def memory_codec(self, scheme=None):
+        """Codec for the memory label representation.
 
-            codec = _hier.HierarchyTagCodec(tokenizer=self._tokenizer)
-            self._hierarchy_codec = codec
-        return codec
+        `scheme` defaults to `memory_text.DEFAULT_LABEL_SCHEME`, which is the
+        plain-text labels the design specifies.  Cached per scheme so that
+        switching schemes in a test does not silently reuse the wrong codec.
+        """
+        from openpi.models import memory_text as _mem
 
-    def tokenize_hierarchy(
-        self, hierarchy_text: str, *, validate: bool = True
+        scheme = scheme or _mem.DEFAULT_LABEL_SCHEME
+        cache = getattr(self, "_memory_codecs", None)
+        if cache is None:
+            cache = {}
+            self._memory_codecs = cache
+        if scheme not in cache:
+            cache[scheme] = _mem.MemoryTextCodec(tokenizer=self._tokenizer, scheme=scheme)
+        return cache[scheme]
+
+    def tokenize_memory(
+        self, memory_text: str, *, validate: bool = True, scheme=None
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Tokenize canonical hierarchy text into the subtask token slots.
+        """Tokenize canonical memory text into the subtask token slots.
 
         Mirrors `tokenize_subtask` (BOS, causal ar_mask, loss on everything after
-        BOS, pad/truncate to `subtask_max_len`) so that the downstream prefix
-        assembly and CE loss are unchanged.  The only difference is that the tags
-        are rewritten to reserved single-token slots before encoding.
+        BOS, pad/truncate to `subtask_max_len`) so the downstream prefix assembly
+        and CE loss are unchanged.
 
         Returns (tokens, mask, ar_mask, loss_mask).
         """
-        if hierarchy_text is None:
-            raise ValueError("tokenize_hierarchy() requires text; pass the canonical hierarchy string")
-        codec = self.hierarchy_codec
-        # Deliberately no `.replace("\n", " ")` here: build_hierarchy_text uses
+        if memory_text is None:
+            raise ValueError("tokenize_memory() requires text; pass the canonical memory string")
+        codec = self.memory_codec(scheme)
+        # Deliberately no `.replace("\n", " ")` here: build_memory_text uses
         # newlines as the only field separator and already collapsed whitespace
         # inside each field, so stripping them would erase the field boundaries.
-        body_ids = codec.encode(hierarchy_text.strip(), validate=validate)
-        hierarchy_tokens = [self._tokenizer.bos_id(), *body_ids, self._tokenizer.eos_id()]
-        hierarchy_len = len(hierarchy_tokens)
+        body_ids = codec.encode(memory_text.strip(), validate=validate)
+        memory_tokens = [self._tokenizer.bos_id(), *body_ids, self._tokenizer.eos_id()]
+        memory_len = len(memory_tokens)
 
-        tokens = hierarchy_tokens
-        mask = [True] * hierarchy_len
-        ar_mask = [1] * hierarchy_len
-        loss_mask = [False] + [True] * (hierarchy_len - 1)
+        tokens = memory_tokens
+        mask = [True] * memory_len
+        ar_mask = [1] * memory_len
+        loss_mask = [False] + [True] * (memory_len - 1)
 
-        if hierarchy_len < self._subtask_max_len:
-            padding_len = self._subtask_max_len - hierarchy_len
+        if memory_len < self._subtask_max_len:
+            padding_len = self._subtask_max_len - memory_len
             tokens = tokens + [0] * padding_len
             mask = mask + [False] * padding_len
             ar_mask = ar_mask + [0] * padding_len
             loss_mask = loss_mask + [False] * padding_len
         else:
-            if hierarchy_len > self._subtask_max_len:
-                # Loud, not silent: truncating hierarchy text drops trailing tags
-                # (typically </NEXT>), which corrupts the supervision target.
+            if memory_len > self._subtask_max_len:
+                # Loud, not silent: truncation drops the LAST fields, i.e.
+                # `Next skill` / `Next primitive`.  That looks like "the model is
+                # bad at predicting next-skill" rather than like a truncation bug,
+                # so it has to be reported at the point it happens.
                 logging.warning(
-                    f"Hierarchy token length ({hierarchy_len}) exceeds max ({self._subtask_max_len}), "
-                    "truncating. This drops trailing hierarchy tags and corrupts the CE target; "
-                    "raise subtask_max_len or shorten the memory field."
+                    f"Memory token length ({memory_len}) exceeds subtask_max_len ({self._subtask_max_len}), "
+                    "truncating. This drops the trailing memory fields (Next skill / Next primitive) and "
+                    "corrupts the CE target; raise subtask_max_len or shorten the Memory field."
                 )
             tokens = tokens[: self._subtask_max_len]
             mask = mask[: self._subtask_max_len]
@@ -644,9 +652,19 @@ class SubtaskTokenizer:
             np.asarray(loss_mask, dtype=np.bool_),
         )
 
-    def decode_hierarchy(self, tokens) -> str:
-        """Decode hierarchy token ids back to *readable* tag form (for logging/eval)."""
+    def memory_token_length(self, memory_text: str, *, validate: bool = True, scheme=None) -> int:
+        """Token length of `memory_text` including BOS/EOS, WITHOUT padding or truncation.
+
+        Exists so the P50/P90/P99 budget statistics the design asks for measure the
+        true length rather than the padded/clipped one -- `tokenize_memory` would
+        report `subtask_max_len` for everything that overflows, hiding the overflow.
+        """
+        codec = self.memory_codec(scheme)
+        return len(codec.encode(memory_text.strip(), validate=validate)) + 2
+
+    def decode_memory(self, tokens, *, scheme=None) -> str:
+        """Decode memory token ids back to readable label text (for logging/eval)."""
         ids = [int(t) for t in np.asarray(tokens).reshape(-1).tolist()]
         specials = {self._tokenizer.bos_id(), self._tokenizer.eos_id(), self._tokenizer.pad_id()}
         ids = [i for i in ids if i not in specials and i >= 0]
-        return self.hierarchy_codec.decode(ids)
+        return self.memory_codec(scheme).decode(ids)

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 import openpi.shared.download as download
-from openpi.models.hierarchy_cache import observation_fingerprint
+from openpi.models.memory_cache import observation_fingerprint
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 
 import sentencepiece

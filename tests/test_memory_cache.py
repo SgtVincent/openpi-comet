@@ -1,5 +1,5 @@
-"""Tests for the hierarchy token cache and the prefix-KV staleness guard
-(Hierarchical-MoMA-VLA P1, item 2).
+"""Tests for the memory token cache and the prefix-KV staleness guard
+(MoMA-VLA P1, item 2).
 
 Each test states what would make it fail.
 
@@ -8,7 +8,7 @@ The headline test here is
 warns that reusing a full prefix KV makes the Action Expert act on an old image
 (and, for pi05, an old discretised state, because the state is text inside the
 prefix). That risk is currently absent only because ``encode_prefix`` hardcodes
-``past_key_values=None``; introducing a hierarchy cache is what brings it back.
+``past_key_values=None``; introducing a memory cache is what brings it back.
 These tests make CI catch it rather than leaving it as a paragraph in a doc.
 """
 
@@ -20,11 +20,11 @@ import numpy as np
 import pytest
 import torch
 
-from openpi.models.hierarchy_cache import HierarchyCacheError
-from openpi.models.hierarchy_cache import HierarchyTokenCache
-from openpi.models.hierarchy_cache import StalePrefixKVError
-from openpi.models.hierarchy_cache import assert_prefix_fresh
-from openpi.models.hierarchy_cache import observation_fingerprint
+from openpi.models.memory_cache import MemoryCacheError
+from openpi.models.memory_cache import MemoryTokenCache
+from openpi.models.memory_cache import StalePrefixKVError
+from openpi.models.memory_cache import assert_prefix_fresh
+from openpi.models.memory_cache import observation_fingerprint
 from openpi.models_pytorch.action_experts.subtask_expert import SubtaskActionExpert
 
 # ---------------------------------------------------------------------------
@@ -223,12 +223,12 @@ def test_assert_prefix_fresh_message_names_the_remedy():
     A guard that fires without naming the fix gets worked around rather than
     obeyed.
     """
-    with pytest.raises(StalePrefixKVError, match="Cache the hierarchy token ids instead"):
+    with pytest.raises(StalePrefixKVError, match="Cache the memory token ids instead"):
         assert_prefix_fresh({"obs_fingerprint": ("a",)}, ("b",))
 
 
 # ---------------------------------------------------------------------------
-# HierarchyTokenCache -- what it accepts, and its invalidate semantics
+# MemoryTokenCache -- what it accepts, and its invalidate semantics
 # ---------------------------------------------------------------------------
 
 
@@ -242,23 +242,23 @@ def test_cache_refuses_a_kv_payload():
     class DynamicCache:  # name deliberately matches the HF class
         pass
 
-    cache = HierarchyTokenCache()
-    with pytest.raises(HierarchyCacheError, match="token ids only"):
+    cache = MemoryTokenCache()
+    with pytest.raises(MemoryCacheError, match="token ids only"):
         cache.store(DynamicCache())
 
 
 def test_cache_refuses_float_tensors():
     """FAILS IF: embeddings or KV tensors can be stored as if they were tokens."""
-    cache = HierarchyTokenCache()
-    with pytest.raises(HierarchyCacheError, match="non-integer"):
+    cache = MemoryTokenCache()
+    with pytest.raises(MemoryCacheError, match="non-integer"):
         cache.store(torch.zeros(4, 8, dtype=torch.float32))
-    with pytest.raises(HierarchyCacheError, match="non-integer"):
+    with pytest.raises(MemoryCacheError, match="non-integer"):
         cache.store(np.zeros(4, dtype=np.float32))
 
 
 def test_cache_accepts_integer_tokens_from_torch_and_numpy():
     """FAILS IF: the type guard is so strict it rejects legitimate token arrays."""
-    cache = HierarchyTokenCache()
+    cache = MemoryTokenCache()
     cache.store(torch.tensor([1, 2, 3]))
     assert cache.is_populated
     cache.store(np.asarray([1, 2, 3], dtype=np.int32))
@@ -267,24 +267,24 @@ def test_cache_accepts_integer_tokens_from_torch_and_numpy():
 
 
 def test_cache_refuses_none_and_empty():
-    """FAILS IF: an empty Planner generation silently wipes the held hierarchy.
+    """FAILS IF: an empty Planner generation silently wipes the held memory.
 
     The design's degradation rule is 'keep the previous tokens when generation
     is empty'. That must be the caller's explicit choice, not something the
     cache does silently in either direction.
     """
-    cache = HierarchyTokenCache()
-    with pytest.raises(HierarchyCacheError, match="refusing to store None"):
+    cache = MemoryTokenCache()
+    with pytest.raises(MemoryCacheError, match="refusing to store None"):
         cache.store(None)
-    with pytest.raises(HierarchyCacheError, match="empty token array"):
+    with pytest.raises(MemoryCacheError, match="empty token array"):
         cache.store([])
 
 
 def test_cold_cache_read_raises_and_names_the_reason():
     """FAILS IF: reading an unpopulated cache returns None and lets a caller act
-    on 'no hierarchy' without noticing."""
-    cache = HierarchyTokenCache()
-    with pytest.raises(HierarchyCacheError, match="never populated"):
+    on 'no memory' without noticing."""
+    cache = MemoryTokenCache()
+    with pytest.raises(MemoryCacheError, match="never populated"):
         cache.get()
     assert cache.get_or_none() is None  # opt-in non-raising read still available
 
@@ -292,21 +292,21 @@ def test_cold_cache_read_raises_and_names_the_reason():
 def test_invalidate_requires_a_reason_and_is_observable():
     """FAILS IF: invalidation becomes silent. An unexplained invalidation in a
     rollout log cannot be told apart from a bug."""
-    cache = HierarchyTokenCache()
-    cache.store([1, 2, 3], text="<MEM>m</MEM>")
-    with pytest.raises(HierarchyCacheError, match="non-empty reason"):
+    cache = MemoryTokenCache()
+    cache.store([1, 2, 3], text="Memory: m")
+    with pytest.raises(MemoryCacheError, match="non-empty reason"):
         cache.invalidate("")
     cache.invalidate("planner timeout")
     assert not cache.is_populated
     assert cache.invalidated_reason == "planner timeout"
-    with pytest.raises(HierarchyCacheError, match="planner timeout"):
+    with pytest.raises(MemoryCacheError, match="planner timeout"):
         cache.get()
 
 
 def test_store_overwrites_and_bumps_generation():
     """FAILS IF: the 'commit is an overwrite' semantics of design section 2.3
     changes, or generation stops tracking Planner ticks."""
-    cache = HierarchyTokenCache()
+    cache = MemoryTokenCache()
     cache.store([1, 2], text="first")
     cache.store([3, 4, 5], text="second")
     tokens, _ = cache.get()
@@ -315,10 +315,10 @@ def test_store_overwrites_and_bumps_generation():
     assert cache.generation == 2
 
 
-def test_policy_reset_clears_held_hierarchy():
-    """FAILS IF: held hierarchy survives an episode boundary.
+def test_policy_reset_clears_held_memory():
+    """FAILS IF: held memory survives an episode boundary.
 
-    A hierarchy carried into a new episode is stale by construction and nothing
+    Memory carried into a new episode is stale by construction and nothing
     downstream would notice.
 
     Note this override lands on an existing hook: BasePolicy.reset() is declared
@@ -335,33 +335,33 @@ def test_policy_reset_clears_held_hierarchy():
     assert issubclass(Policy, _base_policy.BasePolicy), "Policy must still implement the BasePolicy hook"
 
     policy = Policy.__new__(Policy)  # bypass model construction; only cache wiring is under test
-    policy._hierarchy_cache = HierarchyTokenCache()
+    policy._memory_cache = MemoryTokenCache()
     policy._cached_subtask_prompt = "stale"
-    policy._hierarchy_cache.store([1, 2, 3], text="<MEM>m</MEM>")
+    policy._memory_cache.store([1, 2, 3], text="Memory: m")
     assert policy._cached_subtask_tokens is not None
 
     policy.reset()  # exactly how ActionChunkBroker calls it
     assert policy._cached_subtask_tokens is None
     assert policy._cached_subtask_text is None
     assert policy._cached_subtask_prompt is None
-    assert policy._hierarchy_cache.invalidated_reason == "episode boundary"
+    assert policy._memory_cache.invalidated_reason == "episode boundary"
 
 
 def test_policy_recorder_forwards_reset_to_the_wrapped_policy(tmp_path):
     """FAILS IF: PolicyRecorder stops forwarding reset().
 
     PolicyRecorder wraps a policy but inherits BasePolicy's no-op reset. If it
-    does not forward, wrapping silently disarms hierarchy invalidation and the
-    held hierarchy leaks into the next episode -- the guard would exist but be
+    does not forward, wrapping silently disarms memory invalidation and the
+    held memory leaks into the next episode -- the guard would exist but be
     unreachable from this consumer.
     """
     from openpi.policies.policy import Policy, PolicyRecorder
 
     inner = Policy.__new__(Policy)
-    inner._hierarchy_cache = HierarchyTokenCache()
+    inner._memory_cache = MemoryTokenCache()
     inner._cached_subtask_prompt = None
-    inner._hierarchy_cache.store([1, 2, 3])
+    inner._memory_cache.store([1, 2, 3])
 
     recorder = PolicyRecorder(inner, str(tmp_path / "rec"))
     recorder.reset()
-    assert not inner._hierarchy_cache.is_populated, "reset did not reach the wrapped policy"
+    assert not inner._memory_cache.is_populated, "reset did not reach the wrapped policy"

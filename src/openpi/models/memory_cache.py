@@ -1,8 +1,8 @@
-"""Hierarchy token cache and prefix-KV staleness guard (design P1, item 2).
+"""Memory token cache and prefix-KV staleness guard (design P1, item 2).
 
 Two separate things live here, and keeping them separate is the point.
 
-1. :class:`HierarchyTokenCache` -- the *allowed* cache.  It holds hierarchy
+1. :class:`MemoryTokenCache` -- the *allowed* cache.  It holds memory
    **token ids** and nothing else, so that a Planner tick's output can be held
    across K action chunks (design section 2.2).
 
@@ -49,8 +49,8 @@ class StalePrefixKVError(RuntimeError):
     """
 
 
-class HierarchyCacheError(RuntimeError):
-    """Raised when the hierarchy cache is misused (wrong payload, or read while empty)."""
+class MemoryCacheError(RuntimeError):
+    """Raised when the memory cache is misused (wrong payload, or read while empty)."""
 
 
 def _tensor_digest(value: Any) -> tuple:
@@ -128,13 +128,13 @@ def assert_prefix_fresh(prefix_ctx: dict, expected_fingerprint: tuple | None, *,
             "prefix KV was encoded from a different observation than the one being acted on"
             f"{' at ' + where if where else ''}. Design section 4.5: the prefix encodes the image and "
             "(for pi05) the discretised state, so it must be recomputed every action chunk. "
-            "Cache the hierarchy token ids instead."
+            "Cache the memory token ids instead."
         )
 
 
 @dataclasses.dataclass
-class HierarchyTokenCache:
-    """Holds the hierarchy **token ids** produced by the most recent Planner tick.
+class MemoryTokenCache:
+    """Holds the memory **token ids** produced by the most recent Planner tick.
 
     This is the only thing design section 4.4 permits to persist across action
     chunks.  The cache therefore refuses any payload that is not an integer
@@ -159,8 +159,8 @@ class HierarchyTokenCache:
     def _reject_non_token_payload(self, tokens: Any) -> None:
         type_name = type(tokens).__name__.lower()
         if any(marker in type_name for marker in self._KV_MARKERS):
-            raise HierarchyCacheError(
-                f"refusing to cache a {type(tokens).__name__}: the hierarchy cache holds token ids only. "
+            raise MemoryCacheError(
+                f"refusing to cache a {type(tokens).__name__}: the memory cache holds token ids only. "
                 "Caching a prefix KV would carry a stale observation across action chunks "
                 "(design section 4.5)."
             )
@@ -175,12 +175,12 @@ class HierarchyTokenCache:
                 # the permissive direction here is what lets a KV through.
                 is_int = False
             if not is_int:
-                raise HierarchyCacheError(
-                    f"refusing to cache a non-integer tensor of dtype {dtype}: the hierarchy cache "
+                raise MemoryCacheError(
+                    f"refusing to cache a non-integer tensor of dtype {dtype}: the memory cache "
                     "holds token ids, not embeddings or KV tensors."
                 )
         elif not isinstance(tokens, list | tuple):
-            raise HierarchyCacheError(
+            raise MemoryCacheError(
                 f"refusing to cache payload of type {type(tokens).__name__}: expected an integer token array."
             )
 
@@ -197,15 +197,15 @@ class HierarchyTokenCache:
         explicitly, not something the cache does behind its back.
         """
         if tokens is None:
-            raise HierarchyCacheError(
-                "refusing to store None. To drop the held hierarchy call invalidate(reason=...); "
-                "to keep the previous hierarchy on an empty generation, skip the store."
+            raise MemoryCacheError(
+                "refusing to store None. To drop the held memory call invalidate(reason=...); "
+                "to keep the previous memory on an empty generation, skip the store."
             )
         self._reject_non_token_payload(tokens)
         length = len(tokens) if not hasattr(tokens, "shape") else int(np.prod(tokens.shape))
         if length == 0:
-            raise HierarchyCacheError(
-                "refusing to store an empty token array; skip the store to keep the previous hierarchy."
+            raise MemoryCacheError(
+                "refusing to store an empty token array; skip the store to keep the previous memory."
             )
         self.tokens = tokens
         self.mask = mask
@@ -214,10 +214,10 @@ class HierarchyTokenCache:
         self.invalidated_reason = None
 
     def get(self) -> tuple[Any, Any]:
-        """Read the held hierarchy. Raises if the cache was invalidated or never filled."""
+        """Read the held memory. Raises if the cache was invalidated or never filled."""
         if self.tokens is None:
-            raise HierarchyCacheError(
-                f"hierarchy cache is empty (reason: {self.invalidated_reason}). "
+            raise MemoryCacheError(
+                f"memory cache is empty (reason: {self.invalidated_reason}). "
                 "Run a Planner tick before reading, or handle the empty case explicitly."
             )
         return self.tokens, self.mask
@@ -229,13 +229,13 @@ class HierarchyTokenCache:
         return self.tokens, self.mask
 
     def invalidate(self, reason: str) -> None:
-        """Explicitly drop the held hierarchy.
+        """Explicitly drop the held memory.
 
         A reason is mandatory: an unexplained invalidation in a rollout log is
         indistinguishable from a bug.
         """
         if not reason:
-            raise HierarchyCacheError("invalidate() requires a non-empty reason")
+            raise MemoryCacheError("invalidate() requires a non-empty reason")
         self.tokens = None
         self.mask = None
         self.text = None
