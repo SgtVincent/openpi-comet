@@ -307,3 +307,182 @@ M4 只挂掉 1 个测试是符合预期的：stale-KV 那个测试里图像也�
 - **`hierarchy_text` 字段的上游数据生产没有做。** 本次只做了消费侧（transform、tokenizer、缓存）。P0 产出的 JSONL 里叫什么字段、怎么接进 LeRobot dataset，属于 item 4 的范围，未开始。
 - **指纹的碰撞概率没有量化。** 每个张量采样最多 512 个元素、取 sum 与 abs-max。理论上两个不同观测可能撞上同一个指纹。我没有做碰撞率测量；对本用途（发现"整段观测换了一批"）够用，但它不是密码学意义上的摘要。
 - **设计第九节其余待确认项没有回答**：每次 policy call 实际消费多少 action、是否用 temporal ensemble、K 按 chunk 还是物理秒、组合 primitive fallback 怎么处理、Action Expert 该读完整 hierarchy 还是只读 current+next skill。其中最后一条会影响 item 3/4 的做法。
+
+---
+---
+
+# 追加：P1 item 3（HeldMemory-K rollout）实施报告
+
+对应文档 **revision 8**（`MoMA-VLA：显式 Memory 推理与动作生成设计`）。提交 `e950baf`。item 4 仍被阻塞（用户还在迭代训练样本）。
+
+## 七、文档 revision 8 带来的改动，以及我怎么处理的
+
+| 改动 | 处理 |
+|---|---|
+| 更名 MoMA-VLA，`HeldHierarchy-K` → `HeldMemory-K`，术语统一到 Memory | 模块与符号全部改名：`hierarchy_tokens.py` → `memory_text.py`、`hierarchy_cache.py` → `memory_cache.py`，`HierarchyTokenCache` → `MemoryTokenCache` 等。用 `git mv` 保留历史。**没有**改 `build_hierarchical_observation` / `sample_actions_hierarchical` —— 那两个是仓库原有的名字，和本设计无关（已对照 base 树确认） |
+| 新增第 5 个生成字段 `next_primitive` | `MEMORY_FIELDS` 现在是 5 个字段，顺序 memory → primitive → skill → next_skill → next_primitive |
+| 标签从 `<MEM>` 等改成 `Memory:` / `Primitive:` / `Skill:` / `Next skill:` / `Next primitive:` | 文本内容按文档改。标签方案做成可切换（见下） |
+| §2.1 新增「PI-05 兼容的 Token 顺序」，把 state 在语言 prompt 里、不在 suffix 这件事写进正文 | 我上一轮的调查结论已成为文档正文。用户数据里的 `model_sequence_order` 字段与之逐项一致 |
+| §2.3 明确：Planner tick 带 Previous Memory 并生成 Current Memory；非 Planner tick **只**带 held Current Memory | 做成构造期校验的值对象，见 8.2 |
+
+### 标签方案：两套都能跑，默认按文档
+
+plain-text 与保留槽位的取舍还没定，所以 `MemoryTextCodec` 同时支持两套，`DEFAULT_LABEL_SCHEME` 是文档指定的 plain text。**rollout 模块里不含任何标签字符串、也不假设 token 数**，有测试 `test_rollout_holds_no_label_or_token_scheme_knowledge` 直接读源码断言这一点，所以将来定下来哪一套都不需要回头改 item 3。
+
+实测两套的代价差（同一批真实数据，1,899 条）：CE 目标 P99 分别是 **109**（plain text）与 **102**（保留槽位）。
+
+## 八、item 3 实现了什么
+
+### 8.1 K 是配置字段，不是常量
+
+`Pi05SubtaskConfig.planner_stride: int = 5`（`pi05_subtask_config.py:41-46`）。默认 5 对应文档 §6.4 的 arm C（主实验）。K=1/2/5/10 的对照不需要改代码，`dataclasses.replace(cfg, planner_stride=10)` 即可。有测试断言它确实是 `Pi05SubtaskConfig` 的字段，而不是散落在代码里的常量。
+
+拒绝的输入：`K < 1` 报错（没有"永不规划"这个 arm），`K` 是 `bool` 也报错 —— Python 里 `True == 1`，`stride=True` 会静默变成 K=1，等于用一个类型错误选中了一整个实验臂。
+
+### 8.2 §2.3 的两条路径，做成不可表示的非法组合
+
+`TickConditioning` 在 `__post_init__` 里校验：
+
+- Planner tick 带 Previous Memory，**不能**被喂 Current Memory（它是自回归生成 Current Memory 的，喂进去等于在 rollout 时 teacher-forcing 被测对象）
+- Fast Action tick 只带 held Current Memory，**不能**带 Previous Memory
+
+写成一个校验过的值对象而不是两个松散参数，是因为这样"忘记自己在哪条路径上"的调用方无法通过编译期之外的任何途径违反它。文档给的理由是 Action Expert 不能同时看到旧计划和新计划；如果这个约束失效，后果是模型行为轻微变差，看起来像策略没学好，而不像接线错误 —— 所以必须在构造点拦住。
+
+`begin_chunk(i)` 返回该 chunk 允许携带的内容，`action_tick(i)` 返回动作前向用的 conditioning（Planner tick 也要出动作，用的是它刚生成的 Current Memory，不是它规划时用的 Previous Memory）。
+
+### 8.3 Planner 触发点
+
+`PlannerSchedule.is_planner_tick(i)` = `i % K == 0`，chunk 0 恒为 Planner tick。负的 chunk index 报错 —— Python 的 `-1 % 5 == 4` 会安静地给出一个错的调度表。
+
+### 8.4 每个 chunk 重算 prefix KV
+
+`HeldMemoryRollout.check_prefix_is_fresh(chunk_index, prefix_ctx, obs_fingerprint)` 复用 item 2 的守卫，并在报错里带上 chunk 号（200 个 chunk 的 rollout 里，不带位置的报错很难处置）。缓存只收 token id，KV 载荷会被 `MemoryTokenCache` 拒绝。
+
+### 8.5 降级（§7）
+
+- 空生成 ⇒ 保留旧 tokens，`commit_planner_output` 返回 `False` 让调用方能记日志而不用自己推断。覆盖 `[]` / 空 numpy / 空 torch / `None` 四种形态。
+- Planner 超时 ⇒ `skip_planner_update(reason)`，理由必填。
+- 两者在**第一个 tick** 上都报错：那时没有"上一份 memory"可退，假装有会让整个 episode 无 conditioning 地跑完。
+- event-triggered refresh 属 P2，没做，并且有测试断言它没有漏进这个模块（防止范围漂移）。
+
+## 九、测试
+
+新增 `tests/test_memory_rollout.py` 38 个。四个文件合计 **88 个**，全绿。
+
+要求的五项：
+
+| 要求 | 测试 | 失败条件 |
+|---|---|---|
+| 非 Planner tick 不得同时带 Previous Memory | `test_fast_action_tick_cannot_carry_previous_memory` | §2.3 校验被去掉 |
+| prefix KV 跨 chunk 复用要失败 | `test_prefix_kv_reused_across_chunks_raises` | 守卫被删或 rollout 不再检查 |
+| K=1 精确退化为逐 chunk 重生成 | `test_k1_degenerates_to_per_chunk_regeneration` | K=1 漏掉某个 chunk，或把 memory 多持有一个 chunk（那样 arm A 这个参照点本身就是错的） |
+| Planner 只在 {0, K, 2K, …} 触发 | `test_planner_fires_on_exactly_the_multiples_of_k`（K ∈ {1,2,5,10}） | 任何 off-by-one；40 个 chunk 全量比对，不是抽查 |
+| 空生成保留旧 tokens | `test_empty_generation_keeps_the_previous_memory` | 空生成清空或覆盖了 held memory |
+
+### 变异测试
+
+| 变异 | 结果 |
+|---|---|
+| N1 去掉 §2.3 的 fast-tick 校验 | `test_fast_action_tick_cannot_carry_previous_memory` 失败 |
+| N2 去掉 planner 不得被喂 Current Memory 的校验 | `test_planner_tick_cannot_be_handed_current_memory` 失败 |
+| N3 Planner 跳过 chunk 0 | 23 个失败 |
+| N4 rollout 不再检查 prefix 新鲜度 | 2 个失败 |
+| N5 空生成不再特殊处理 | 3 个失败 |
+| N6 允许 K<1 | 3 个失败 |
+| N7 K 不再是配置字段 | `test_stride_comes_from_model_config_not_a_constant` 失败 |
+
+7 个全部命中预期测试，还原后回到 38 全绿，树里无 `MUTANT` 残留（rg 返回码 1）。
+
+**测试抓到一个真缺陷**：`_is_empty` 对无法取长度的对象直接抛 `TypeError`，抢在缓存的类型守卫之前 —— 结果是塞进一个 KV 载荷时拿到一个堆栈，而不是"缓存只存 token id"这句解释。已改为落到那个守卫上。
+
+## 十、上线前应当先定、不要在多机上发现的事项
+
+用户有 3×32 H20 keepalive 和一个已批的 Merlin job，所以这一节是实质内容而非形式。
+
+### 10.1 训练样本的 `State:` 是帧计数器（**高**）
+
+实测 1,899/1,899 条的 `model_input_text` 里 `State: Frame N of M`。分母 `of M` 是 episode 总长，只有 GT 回放才有；部署时不存在。同时它和运行时 `tokenizer.py:504-506` 往同一个 `State:` 槽位写的 256 档离散关节值含义完全不同，也违反文档 §3.1"模型文本不包含 frame index"。
+
+**为什么这一条必须在小机器上定掉**：如果它不是占位，模型会学到一个部署时拿不到的进度信号，**训练曲线会变好而不是变坏**，闭环却在悄悄退化。指标变好的失败模式是事后最难发现的一类。已上报，等用户确认。
+
+### 10.2 Memory 文本的 token 预算只剩 1.17 倍余量（**高**）
+
+`subtask_max_len=128`（全树 11 个训练配置**全部**硬编码 128，所以这是真实会用的值）。同一批 1,899 条实测：
+
+| 量 | P50 | P90 | P99 | max | 上限 | P99 余量 | 超限 |
+|---|---|---|---|---|---|---|---|
+| Current Memory（CE 目标），plain text | 88 | 109 | 109 | 119 | 128 | **1.17×** | 0 |
+| Current Memory，保留槽位 | 81 | 102 | 102 | 112 | 128 | 1.25× | 0 |
+| 完整 `model_input_text` | 136 | 157 | 157 | 167 | 512 | 3.26× | 0 |
+
+看起来"没超"，但这个余量会被吃掉，而且我测出了机制：
+
+- 长度与 **episode 进度**相关系数 **0.706**
+- 长度与 **Memory 行里 occurrence 个数**相关系数 **0.87**
+- 按 occurrence 个数分组的均值：0 个→62、1 个→73、2 个→89、3 个→101、4 个→**max 119**。**每多一个已完成 occurrence 约 +12 token。**
+
+即 128 的上限在 4 个 occurrence 时只剩 9 个 token，**再多一个就会溢出**。而这批预览里只有 21 条是 4 个 occurrence、1 条是 5 个 —— 尾部几乎没采到，全量语料（271,353 条 boundary）里步骤更多的任务必然更长。文档 §7 本来就把"completed history 随任务进度累积"列为风险，这里给出了它的斜率。
+
+**溢出的形态很不显眼**：截断砍掉的是**最后**的字段，也就是 `Next skill` / `Next primitive`，看起来像"模型不擅长预测 next skill"，而不像格式被截断。
+
+建议二选一（文档 §7 也提了后者）：把 `subtask_max_len` 提到 192 或 256，或者限制 completed occurrence 的条数 / 用固定窗口。已在 `tokenize_memory` 的截断警告里写明后果，但警告不是余量。
+
+### 10.3 `world_size × num_workers` 对新数据集的 chunk 数（**高**，Master 提出）
+
+全量 B1K 曾测到约 435,310 chunk、6,802 倍余量，但 MoMA-VLA 的样本是另一个小得多的语料（当前预览 1,899 条）。这正是 rank-blind sharding 缺陷的触发条件，而 3×32 = 96 个 rank 下余量可能很薄甚至为负。**拿到真实数据路径后第一件事就算这个不等式。**
+
+### 10.4 标签记法三方不一致（**中**）
+
+文档写 `#1`，用户数据实测 **3,199 次 `(N)`、`#N` 零命中**，我的实现原来是保留槽位。这是监督目标本身，只能取一个。已做成可切换、默认按文档 plain text；**具体记法由用户裁决**，我不自行统一。定下来之后只需改 `MEMORY_FIELDS` 一处。
+
+### 10.5 文档示例里的 `END_OF_PRIMITIVE` 哨兵在数据里不存在（**中**）
+
+文档 §3.1 的例子写着 `Next skill: END_OF_PRIMITIVE`，但**当前数据里这个字符串零命中**（正对照：同文件 `Next skill:` 命中 1,899），1,899 条的 `next_skill` 全是普通文本，全大写的哨兵型 token 一个都没有。
+
+所以这是文档与数据不一致，方向是"文档有、数据没有"。需要定的是：到底有没有哨兵值（episode 结束、无后续 skill 该写什么）？如果有，它是训练目标里的一个字面量，模型会学到它；如果没有，文档的例子应当改掉，否则后来的人会照着例子去实现一个不存在的约定。P1 不解析生成文本，所以现在不影响运行。
+
+（我原先在这一节写的是"数据里会出现 `END_OF_PRIMITIVE`"，那是照文档例子推的，实测后更正为零命中。）
+
+### 10.6 已验证不成问题的项
+
+- prefix 的 token 顺序：文档 §2.1、用户数据的 `model_sequence_order`、我实测的代码结构，三方一致。
+- checkpoint 兼容性：两套标签方案都不改词表大小，不触发任何加载路径的形状检查。
+
+## 十一、item 3 的未验证项
+
+- **没有跑过真实闭环 rollout。** 本节全部是单元/集成级。调度表、两条路径的约束、降级分支都是在没有模型的情况下测的；`HeldMemoryRollout` 与真实 `sample_actions` 的接线**未验证**。
+- **K 的物理含义未定。** 文档 §2.4 说 Planner 周期是 `K × H × Δt_sim`，而每次 policy call 实际消费多少 action（§9 待确认项）还没答案，所以 K=5 对应多少仿真时间**未知**。K 作为 chunk 计数是实现好的，作为物理时间是未定的。
+- **`planner_stride` 还没有被任何模型代码读取。** 它是配置字段并有测试守着，但把它接到实际推理路径要等 item 4 之后的 rollout 集成。现在它是"可配置且已校验"，不是"已生效"。
+- **Action Expert 该读完整 memory 还是只读 current+next skill**（§9 待确认）仍未定。当前实现传完整 memory。
+- token 长度统计基于 1,899 条**预览**样本，不是全量 271,353 条 boundary 数据。上面的斜率是实测的，全量的尾部**未测**。
+
+## 十二、测试数量：三点对比（同口径）
+
+跑法与第五节相同：每文件一进程（32 GiB cgroup 上限），前后用同一个解析脚本，并在两侧同时排除第五节说明过的那 2 个「基线放在 /tmp」造成的位置相关文件。
+
+| | 文件数 | passed | failed | errors | skipped |
+|---|---|---|---|---|---|
+| 改动前（`41df7a6` 纯净解包） | 55 | 740 | 10 | 0 | 12 |
+| item 1 + 2 之后 | 58 | 785 | 10 | 0 | 12 |
+| item 1 + 2 + 3 之后 | 59 | **828** | 10 | 0 | 12 |
+
+差值对得上：相对基线文件 +4（我的 4 个测试文件），passed +88（21 + 17 + 12 + 38 = 88），failed 与 skipped 全程未动，且那 10 个失败一直是同两个文件里的同一批（`test_pi05_ki_a100_bf16_formal.py` 2 个 numba/NumPy，`test_skill_bridge_integration.py` 8 个路径不存在）。
+
+没能跑的部分与第五节完全一致（4 个文件收集期失败，均为既有环境问题；2 个位置相关文件两侧同时排除，它们在本分支上是全过的）。**这部分我没有跑，不算通过。**
+
+## 十三、新增的上线前闸门脚本
+
+`scripts/hier/memory_token_budget.py` —— 把第 10.2 节那次测量做成可重复执行的闸门，因为真实语料到手后必须重测，不能拿预览的结论当结论。
+
+```
+PYTHONPATH=<worktree>/src python scripts/hier/memory_token_budget.py --jsonl <path> [--min-headroom 1.5]
+```
+
+它报 P50/P90/P99、P99 余量倍数、超限条数，以及「按 occurrence 个数分组的长度」这张表（余量是被这个吃掉的），P99 余量不足或有样本超限就以非零退出，可以直接挂在启动脚本前面。
+
+三种行为都实测过，不是只验证了会失败的那一种：
+
+- 当前数据 + 默认 1.5× 门槛 ⇒ 退出 1，提示余量 1.17× 不足
+- 同一数据 + 1.1× 门槛 ⇒ 退出 0（说明它不是恒失败）
+- 把上限压到 100 ⇒ 正确报出 195/1899 超限、退出 1（说明它真能发现溢出）
+- 字段名写错 ⇒ 干净报错并列出可用字段，不是抛栈
