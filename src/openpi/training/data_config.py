@@ -45,12 +45,22 @@ def _add_conditioning_text_keys(repack_patterns: dict, model_type, subtask_sourc
     """
     from openpi.training.memory_annotation import MEMORY_SUBTASK_SOURCE
 
-    if _uses_subtask_text(model_type):
-        repack_patterns["subtask_text"] = "subtask_text"
+    if not _uses_subtask_text(model_type):
+        return repack_patterns
+
     if subtask_source == MEMORY_SUBTASK_SOURCE:
-        # Memory subsumes the subtask segment, so these travel the same route.
+        # Memory SUBSUMES the subtask segment: the dataset deliberately does not
+        # attach `subtask_text` on memory items, because two writers into the same
+        # conditioning slot would let something downstream pick a winner.
+        #
+        # So `subtask_text` must not be requested here either.  RepackTransform is
+        # strict -- it does `flat_item[k]` -- so naming a key the dataset does not
+        # emit raises KeyError('subtask_text') on the very first batch of every
+        # memory run.  Asking for both is not a harmless superset.
         repack_patterns["memory_text"] = "memory_text"
         repack_patterns["previous_memory_text"] = "previous_memory_text"
+    else:
+        repack_patterns["subtask_text"] = "subtask_text"
     return repack_patterns
 
 

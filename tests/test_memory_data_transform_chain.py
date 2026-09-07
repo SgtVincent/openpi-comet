@@ -58,12 +58,26 @@ class TestRepackAllowlist:
         for k in MEMORY_KEYS:
             assert k not in pats, f"{k} leaked into a non-memory run"
 
-    @pytest.mark.parametrize("source", [MEMORY_SUBTASK_SOURCE, "annotations_skill", "orchestrator"])
-    def test_subtask_text_is_unaffected(self, source):
-        """Positive control: the pre-existing key must keep working in every arm."""
+    @pytest.mark.parametrize("source", ["annotations_skill", "orchestrator"])
+    def test_subtask_text_still_requested_for_non_memory_sources(self, source):
+        """Positive control: the pre-existing key keeps working where it applies."""
         pats: dict = {}
         dc._add_conditioning_text_keys(pats, _model.ModelType.PI05_SUBTASK, source)
         assert pats.get("subtask_text") == "subtask_text"
+
+    def test_memory_source_does_NOT_request_subtask_text(self):
+        """The two channels are mutually exclusive, and this is not cosmetic.
+
+        An earlier version of this test asserted subtask_text was present in every
+        arm including memory. That assumption was wrong, and asserting it locked
+        the wrong belief in: the dataset does not attach subtask_text on memory
+        items, and RepackTransform is strict, so requesting it raises
+        KeyError('subtask_text') on the first batch of every memory run.
+        """
+        pats: dict = {}
+        dc._add_conditioning_text_keys(pats, _model.ModelType.PI05_SUBTASK, MEMORY_SUBTASK_SOURCE)
+        assert "subtask_text" not in pats
+        assert "memory_text" in pats
 
     def test_non_subtask_model_gets_neither(self):
         pats: dict = {}
@@ -135,10 +149,14 @@ class TestMemoryTrainConfig:
     def test_registered_configs_pin_the_decided_budgets(self):
         import openpi.training.moma_memory_config as mm
 
-        assert mm.MOMA_MEMORY_CONFIGS, "no memory configs registered"
-        for cfg in mm.MOMA_MEMORY_CONFIGS:
+        assert mm.memory_configs(), "no memory configs registered"
+        for cfg in mm.memory_configs():
             assert cfg.model.subtask_max_len == 192
             assert cfg.model.max_token_len == 320
+            # `pytorch_model_name` is the factory dispatch key, not ModelType's
+            # value. "pi05_subtask" falls through to PI0Pytorch; "subtask" is the
+            # registered branch used by every other Pi05SubtaskConfig.
+            assert cfg.pytorch_model_name == "subtask"
             data = cfg.data[0] if isinstance(cfg.data, (list, tuple)) else cfg.data
             assert data.base_config.subtask_source == MEMORY_SUBTASK_SOURCE
 
@@ -150,7 +168,7 @@ class TestMemoryTrainConfig:
         """
         import openpi.training.moma_memory_config as mm
 
-        cfg = mm.MOMA_MEMORY_CONFIGS[0]
+        cfg = mm.memory_configs()[0]
         data = cfg.data[0] if isinstance(cfg.data, (list, tuple)) else cfg.data
         pats: dict = {}
         dc._add_conditioning_text_keys(

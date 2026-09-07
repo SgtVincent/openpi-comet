@@ -63,7 +63,10 @@ def _make_tiny_model(seed: int = 42) -> PaliGemmaWithExpertModel:
     model = PaliGemmaWithExpertModel(cfg, cfg, precision="float32")
     if hasattr(model.gemma_expert.model, "gradient_checkpointing"):
         model.gemma_expert.model.gradient_checkpointing = False
-    model.training = False
+    # ``model.training = False`` only flips the top-level flag; the ~400 submodules
+    # that actually decide dropout/attention behaviour stay in training mode.
+    # ``.eval()`` recurses, which is what an inference-mode comparison needs.
+    model.eval()
     return model
 
 
