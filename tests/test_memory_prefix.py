@@ -237,3 +237,81 @@ def test_tokenize_subtask_default_output_is_unchanged_for_normal_text(tok):
     b = tok.tokenize_subtask("press the radio", strict_length=True)
     for x, y in zip(a, b):
         assert (x == y).all()
+
+
+# --------------------------------------------------------------------------
+# the MoMA-VLA path must never reach the lenient tokenizer
+# --------------------------------------------------------------------------
+# tokenize_subtask keeps warning-and-truncate as its default because live
+# annotations_skill runs share it. That is only safe if our path provably never
+# calls it: a future call site that forgets strict_length=True would silently
+# fall back to truncation, and the symptom is "the model is bad at predicting
+# next skill", not an error. So this is asserted with a spy, not by reading code.
+
+class _SpyTokenizer:
+    """Wraps a real tokenizer and records which tokenise method was used."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.subtask_calls = 0
+        self.memory_calls = 0
+        self.strict_flags = []
+
+    def tokenize_prompt(self, *a, **k):
+        return self._inner.tokenize_prompt(*a, **k)
+
+    def tokenize_subtask(self, text, *, strict_length=False):
+        self.subtask_calls += 1
+        self.strict_flags.append(strict_length)
+        return self._inner.tokenize_subtask(text, strict_length=strict_length)
+
+    def tokenize_memory(self, text, **k):
+        self.memory_calls += 1
+        return self._inner.tokenize_memory(text, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _run_transform(tok, state, *, memory_text=None, subtask_text=None):
+    from openpi.transforms import TokenizeSubtaskInputs
+    spy = _SpyTokenizer(tok)
+    data = {"prompt": "turn on the radio", "state": state}
+    if memory_text is not None:
+        data["memory_text"] = memory_text
+    if subtask_text is not None:
+        data["subtask_text"] = subtask_text
+    TokenizeSubtaskInputs(tokenizer=spy, require_memory=memory_text is not None)(data)
+    return spy
+
+
+def test_memory_items_never_touch_tokenize_subtask(tok, state):
+    spy = _run_transform(tok, state, memory_text=_five_field_target("no steps completed"))
+    assert spy.memory_calls == 1, "memory text must go through tokenize_memory"
+    assert spy.subtask_calls == 0, (
+        "the memory path reached tokenize_subtask, whose default silently truncates"
+    )
+
+
+def test_the_spy_would_catch_a_violation(tok, state):
+    """Positive control: without it, the assertion above proves nothing.
+
+    A subtask-only item must make the counter move, showing the spy is wired to
+    the method it claims to watch.
+    """
+    spy = _run_transform(tok, state, subtask_text="press the radio")
+    assert spy.subtask_calls == 1
+    assert spy.memory_calls == 0
+    assert spy.strict_flags == [False], (
+        "records the legacy default, which is what makes the check above meaningful"
+    )
+
+
+def test_memory_text_takes_precedence_when_both_fields_are_present(tok, state):
+    """If both arrive, memory must win and the lenient path stay untouched."""
+    spy = _run_transform(
+        tok, state,
+        memory_text=_five_field_target("no steps completed"),
+        subtask_text="press the radio",
+    )
+    assert (spy.memory_calls, spy.subtask_calls) == (1, 0)

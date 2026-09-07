@@ -417,6 +417,9 @@ class PromptFromLeRobotItem(DataTransformFn):
             )
         if not self.include_memory_text:
             result.pop("memory_text", None)
+            # Travels with memory_text: leaving it behind as an unconsumed
+            # passenger key is how a broken wiring looks like a working one.
+            result.pop("previous_memory_text", None)
         elif result.get("memory_text") is None and self.require_memory_text:
             raise ValueError(
                 "memory_text is required but missing from this dataset item. "
@@ -424,6 +427,13 @@ class PromptFromLeRobotItem(DataTransformFn):
                 "(see this class's docstring). Regenerate the dataset with memory "
                 "annotations, or set require_memory_text=False to accept an "
                 "unconditioned run."
+            )
+        elif result.get("previous_memory_text") is None and self.require_memory_text:
+            raise ValueError(
+                "previous_memory_text is required but missing from this dataset item. "
+                "Without it the prefix silently falls back to the legacy "
+                "'Subtask: ' cue and carries no previous memory at all, which is "
+                "indistinguishable from a healthy run in the loss."
             )
         return result
 
@@ -461,11 +471,29 @@ class TokenizeSubtaskInputs(DataTransformFn):
         if state is None:
             raise ValueError("State is required for subtask tokenization.")
 
-        # Tokenize the task prompt + state for the prefix
-        prompt_tokens, prompt_mask = self.tokenizer.tokenize_prompt(prompt, state)
-
         memory_text = data.pop("memory_text", None)
         subtask_text = data.pop("subtask_text", None)
+        previous_memory_text = data.pop("previous_memory_text", None)
+
+        # The prefix must carry Previous memory whenever this is a memory item.
+        # Calling tokenize_prompt(prompt, state) unconditionally is what made the
+        # prefix byte-identical to an unconditioned one while previous_memory_text
+        # sat unused on the item -- present, and therefore easy to believe wired.
+        if memory_text is not None and previous_memory_text is None:
+            raise ValueError(
+                "this item carries memory_text but no previous_memory_text, so the "
+                "prefix would fall back to the legacy 'Subtask: ' cue and condition "
+                "on no memory at all. Fix the dataset or the "
+                "PromptFromLeRobotItem(include_memory_text=...) wiring."
+            )
+        if self.require_memory and previous_memory_text is None:
+            raise ValueError(
+                "require_memory=True but this item carries no previous_memory_text; "
+                "the prefix would silently carry no memory."
+            )
+        prompt_tokens, prompt_mask = self.tokenizer.tokenize_prompt(
+            prompt, state, previous_memory=previous_memory_text
+        )
 
         if memory_text is not None:
             if not isinstance(memory_text, str):

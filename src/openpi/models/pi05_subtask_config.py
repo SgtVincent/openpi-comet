@@ -48,6 +48,14 @@ class Pi05SubtaskConfig(_model.BaseModelConfig):
     # Combined loss trade-off parameter (alpha in Eq. 1).
     alpha: float = 10.0
 
+    # Weight on the planner text CE term.  Was an implicit hardcoded 1.0 with
+    # no way to set it, which meant the only way to rebalance the objective was
+    # to move the *action* weight.  Default stays 1.0 so behaviour is unchanged;
+    # it exists so that `ce_loss + alpha * flow_loss` with alpha=10.0 -- i.e. the
+    # planner term carrying a tenth of the action term's weight -- is a decision
+    # that can be revisited by configuration rather than by editing the model.
+    ce_weight: float = 1.0
+
     # Pi05 settings.
     pi05: bool = True
     discrete_state_input: bool = True

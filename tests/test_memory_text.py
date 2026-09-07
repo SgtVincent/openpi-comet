@@ -244,10 +244,12 @@ def test_no_vocabulary_growth(sp_tokenizer):
 
 
 def test_section_cues_are_defined_in_one_place():
-    """FAILS IF: the 'Current Memory:' / 'Previous Memory:' cues get spelled by
+    """FAILS IF: the 'Current memory:' / 'Previous memory:' cues get spelled by
     callers instead of taken from here, which is how two spellings diverge."""
-    assert CURRENT_MEMORY_CUE == "Current Memory:"
-    assert mem.PREVIOUS_MEMORY_CUE == "Previous Memory:"
+    # Lower-case per the design document; the upper-case form shared two token
+    # ids with the target's own "Memory:" label.
+    assert CURRENT_MEMORY_CUE == "Current memory:"
+    assert mem.PREVIOUS_MEMORY_CUE == "Previous memory:"
 
 
 def test_decode_accepts_numpy_ids(sp_tokenizer):

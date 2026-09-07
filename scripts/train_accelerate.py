@@ -4856,9 +4856,17 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
         import openpi.models_pytorch.pi05_subtask as _pi05_subtask
 
         alpha = getattr(model_cfg, "alpha", 10.0)
+        ce_weight = getattr(model_cfg, "ce_weight", 1.0)
+        # Log the effective values: which weights a run used has to be readable
+        # from the run's own output, not inferred from today's defaults.
+        logging.info(
+            f"[subtask] loss weights in effect: ce_weight={ce_weight} alpha={alpha} "
+            f"(combined = ce_weight * ce_loss + alpha * flow_loss)"
+        )
         model = _pi05_subtask.PI05SubtaskPytorch(
             model_cfg,
             alpha=alpha,
+            ce_weight=ce_weight,
             action_expert_name="subtask",
         )
     elif config.pytorch_model_name in ("pi05_ki_joint_query", "pi05_ki_joint_fast"):

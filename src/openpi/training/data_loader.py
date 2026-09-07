@@ -25,6 +25,20 @@ def _include_subtask_text(model_config: _model.BaseModelConfig) -> bool:
     return model_config.model_type == _model.ModelType.PI05_SUBTASK
 
 
+def _memory_source_active(data_config) -> bool:
+    """True when the CE target is Memory text rather than skill text.
+
+    Both flags below default to False, and with them off `memory_text` is
+    dropped before it reaches the tokenizer, the subtask segment is fabricated
+    all-zero, `encode_prefix` discards it, and the run trains with no memory
+    conditioning and no planner CE while still reporting a loss.  So the
+    branch has to be driven off the data config, not left to the default.
+    """
+    from openpi.training.memory_annotation import MEMORY_SUBTASK_SOURCE
+
+    return getattr(data_config, "subtask_source", None) == MEMORY_SUBTASK_SOURCE
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -138,7 +152,13 @@ def create_torch_dataset(
         dataset = _behavior_dataset.create_behavior_dataset(data_config, action_horizon=action_horizon)
         dataset = TransformedDataset(
             dataset,
-            [_transforms.PromptFromLeRobotItem(include_subtask_text=_include_subtask_text(model_config))],
+            [
+                _transforms.PromptFromLeRobotItem(
+                    include_subtask_text=_include_subtask_text(model_config),
+                    include_memory_text=_memory_source_active(data_config),
+                    require_memory_text=_memory_source_active(data_config),
+                )
+            ],
         )
         return dataset
 
@@ -250,7 +270,13 @@ def create_data_loader(
         data_config = data_configs[0]
         dataset = TransformedDataset(
             dataset,
-            [_transforms.PromptFromLeRobotItem(include_subtask_text=_include_subtask_text(config.model))],
+            [
+                _transforms.PromptFromLeRobotItem(
+                    include_subtask_text=_include_subtask_text(config.model),
+                    include_memory_text=_memory_source_active(data_config),
+                    require_memory_text=_memory_source_active(data_config),
+                )
+            ],
         )
         dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 

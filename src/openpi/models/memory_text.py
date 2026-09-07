@@ -78,8 +78,14 @@ FIELD_NAMES: Final[tuple[str, ...]] = tuple(f.name for f in MEMORY_FIELDS)
 
 #: Section cue that the design appends after Previous Memory so the model knows
 #: to start generating. Kept here so callers never spell it themselves.
-CURRENT_MEMORY_CUE: Final[str] = "Current Memory:"
-PREVIOUS_MEMORY_CUE: Final[str] = "Previous Memory:"
+# Lower-case, matching the design document verbatim.  This is not cosmetic:
+# the upper-case form "Previous Memory:" tokenises to [24226, 22021, 235292],
+# whose last two ids are exactly "Memory:" in its after-a-space form -- so the
+# prefix cue and the target's own first label would share two tokens.  The
+# lower-case form [24226, 6884, 235292] shares nothing but the colon, keeping
+# "what to copy" and "what to update" distinct at the token level.
+CURRENT_MEMORY_CUE: Final[str] = "Current memory:"
+PREVIOUS_MEMORY_CUE: Final[str] = "Previous memory:"
 
 # Longest-first, so "Next skill:" can never be matched as "Skill:" and
 # "Next primitive:" never as "Primitive:".
