@@ -276,3 +276,89 @@ def test_real_data_first_start_is_sometimes_nonzero():
             if episode["memory_annotation"][0]["frame_duration"][0] != 0:
                 shifted += 1
     assert shifted > 0, "no shifted-origin episode in sample; the i<0 guard is untested on real data"
+
+
+# --------------------------------------------------------------------------
+# BehaviorLeRobotDataset producer integration
+# --------------------------------------------------------------------------
+
+
+def _memory_dataset_shell(indices, lengths):
+    """Build only the state needed by the production chunk filter."""
+    from types import SimpleNamespace
+
+    from behavior.learning.datas.dataset import BehaviorLeRobotDataset
+    from behavior.learning.datas.dataset import MEMORY_SUBTASK_SOURCE
+
+    dataset = object.__new__(BehaviorLeRobotDataset)
+    dataset.subtask_source = MEMORY_SUBTASK_SOURCE
+    dataset.episodes = list(lengths)
+    dataset.meta = SimpleNamespace(episodes={ep: {"length": length} for ep, length in lengths.items()})
+    dataset._memory_index_for_episode = lambda ep: indices[ep]
+    return dataset
+
+
+def test_dataset_memory_chunk_filter_preserves_global_and_local_coordinates():
+    """Dead chunks are dropped and straddling chunks are clipped before sharding.
+
+    Episode 10 has a shifted annotation origin and its first 250-frame chunk is
+    entirely dead. Episode 20's annotation overruns its 200-frame video, so the
+    sampling range must be clipped to the video while the returned tuple keeps a
+    global start/end and an episode-local anchor.
+    """
+    indices = {
+        10: ma.MemoryIntervalIndex([_row(0, 260, 280)]),
+        20: ma.MemoryIntervalIndex([_row(0, 50, 300)]),
+    }
+    dataset = _memory_dataset_shell(indices, {10: 300, 20: 200})
+
+    chunks = dataset._get_keyframe_chunk_indices(chunk_size=250)
+
+    assert chunks == [
+        (260, 280, 260),  # episode 10: shifted origin, first raw chunk dropped
+        (350, 500, 50),   # episode 20: base=300, local [50, 200)
+    ]
+    assert dataset.memory_chunk_stats() == {
+        "memory_chunks_kept": 2,
+        "memory_dead_chunks_dropped": 1,
+        "memory_chunks_clipped": 2,
+    }
+
+
+def test_dataset_memory_chunk_filter_reuses_one_bisect_key(monkeypatch):
+    """The 10k-episode bisect key must not be rebuilt for every chunk.
+
+    Full data has about 481k chunks. Rebuilding a 10k-element offsets list in
+    that loop performs about 4.8 billion element visits during Dataset startup.
+    Recording object identity makes this regression fail deterministically,
+    without relying on a timing threshold.
+    """
+    import behavior.learning.datas.dataset as dataset_module
+
+    indices = {
+        10: ma.MemoryIntervalIndex([_row(0, 0, 300)]),
+        20: ma.MemoryIntervalIndex([_row(0, 0, 200)]),
+    }
+    dataset = _memory_dataset_shell(indices, {10: 300, 20: 200})
+    original = dataset_module.bisect.bisect_right
+    seen_keys = []
+
+    def recording_bisect_right(keys, value, *args, **kwargs):
+        seen_keys.append(keys)
+        return original(keys, value, *args, **kwargs)
+
+    monkeypatch.setattr(dataset_module.bisect, "bisect_right", recording_bisect_right)
+    dataset._get_keyframe_chunk_indices(chunk_size=125)
+
+    assert len(seen_keys) == 5
+    assert all(keys is seen_keys[0] for keys in seen_keys), (
+        "episode offsets were rebuilt inside the chunk loop"
+    )
+
+
+def test_dataset_memory_chunk_filter_fails_if_every_chunk_is_dead():
+    index = ma.MemoryIntervalIndex([_row(0, 100, 200)])
+    dataset = _memory_dataset_shell({10: index}, {10: 250})
+
+    with pytest.raises(RuntimeError, match="every one of the 1 chunks was dropped"):
+        dataset._restrict_chunks_to_memory_coverage([(0, 50, 0)], [250])
