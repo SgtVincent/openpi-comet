@@ -196,7 +196,8 @@ class PI05SubtaskPytorch(PI0Pytorch):
                 time=time,
                 subtask_tokens=subtask_tokens,
                 subtask_mask=subtask_mask,
-                subtask_ar_mask=subtask_ar_mask,
+                # subtask_ar_mask is intentionally not forwarded: the callee
+                # forces per-token causal blocks, so it cannot act on one.
                 subtask_loss_mask=subtask_loss_mask,
             )
             v_t = result["v_t"]

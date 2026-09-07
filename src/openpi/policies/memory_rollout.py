@@ -155,6 +155,31 @@ class HeldMemoryRollout:
     def __post_init__(self) -> None:
         self._schedule = PlannerSchedule(stride=self.stride)
 
+    @classmethod
+    def from_model_config(cls, model_config, **kwargs) -> "HeldMemoryRollout":
+        """Build a rollout whose stride comes from the model config.
+
+        Until now ``planner_stride`` was a config field with no reader: the whole
+        worktree contained four mentions of it -- the definition, a telemetry
+        label in ``stats()``, tests, and docs -- so setting it changed nothing and
+        the K=1/2/5/10 sweep was not launchable. ``stride`` defaulting to
+        ``DEFAULT_PLANNER_STRIDE`` is a *separate* constant from the config field,
+        which is exactly how the two could silently disagree.
+
+        This constructor makes the config the single source of truth and refuses
+        to fall back: a missing field raises rather than quietly using 5, because
+        "the sweep ran but every arm used the same K" is indistinguishable from a
+        successful sweep in the output.
+        """
+        stride = getattr(model_config, "planner_stride", None)
+        if stride is None:
+            raise PlannerScheduleError(
+                f"{type(model_config).__name__} has no planner_stride field. Refusing to "
+                f"fall back to {DEFAULT_PLANNER_STRIDE}: every arm of the K sweep would "
+                "then use the same stride while appearing to be configured."
+            )
+        return cls(stride=stride, **kwargs)
+
     @property
     def schedule(self) -> PlannerSchedule:
         return self._schedule

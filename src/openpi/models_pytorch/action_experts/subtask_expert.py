@@ -167,7 +167,6 @@ class SubtaskActionExpert(ActionExpert):
         time: torch.Tensor,
         subtask_tokens: torch.Tensor,
         subtask_mask: torch.Tensor,
-        subtask_ar_mask: torch.Tensor,
         subtask_loss_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Compute both flow matching loss and text CE loss in a single pass.
@@ -183,6 +182,15 @@ class SubtaskActionExpert(ActionExpert):
         - Action expert output predicts flow velocity -> MSE loss
 
         Returns dict with 'flow_loss', 'ce_loss', and 'v_t' tensors.
+
+        Deliberately does NOT take a ``subtask_ar_mask``. This method calls
+        ``_embed_conditioning_subtask(..., causal=True)`` unconditionally, which
+        sets the segment attention to ``ones_like(subtask_mask)`` -- one block per
+        token. So an ar_mask could not be honoured even if supplied, and a
+        parameter that is accepted and ignored advertises a capability that does
+        not exist: a caller passing an all-zero (single bidirectional block) mask
+        would get causal behaviour anyway, with nothing raised. The value is still
+        carried on the observation for consumers that do act on it.
         """
         # === Build prefix: images + prompt/state + subtask tokens ===
         prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(

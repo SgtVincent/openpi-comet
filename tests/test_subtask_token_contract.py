@@ -505,183 +505,63 @@ class TestLMHeadVsEmbedTokensConsistency:
 # ===========================================================================
 
 
-class TestSubtaskArMaskUnused:
-    """subtask_ar_mask is threaded through the interface but never consumed.
+class TestSubtaskArMaskResolved:
+    """subtask_ar_mask is no longer a parameter of compute_subtask_loss_train.
 
-    MAJ-3 audit finding:
-      - SubtaskTokenizer produces ar_mask
-      - PI05SubtaskPytorch.forward passes subtask_ar_mask to compute_subtask_loss_train
-      - compute_subtask_loss_train accepts subtask_ar_mask as a parameter
-      - BUT subtask_ar_mask is never actually used in the computation
+    History: the MAJ-3 audit recorded a dead parameter -- the tokenizer produced
+    an ar_mask, PI05SubtaskPytorch.forward passed it down, and the callee accepted
+    it and never read it. The attention for the subtask segment is decided inside
+    _embed_conditioning_subtask by the `causal` flag, which compute_subtask_loss_train
+    hardcodes to True, giving subtask_att = ones_like(subtask_mask).
 
-    The actual attention mask for subtask tokens is built inside
-    _embed_conditioning_subtask using the `causal` flag, which always sets
-    subtask_att = all-ones (causal) during training.
+    Resolved by removing the parameter rather than by honouring it: the method
+    cannot honour an ar_mask while `causal=True` is hardcoded, so accepting one
+    advertised a capability that did not exist. A caller passing an all-zero mask
+    (meaning one bidirectional block) would have received causal behaviour anyway,
+    with nothing raised. The value is still carried on the observation for
+    consumers that do act on it.
 
-    This test documents the dead parameter. It PASSES on current code.
+    These tests now pin the resolution, so re-adding an ignored parameter fails.
     """
 
-    def test_ar_mask_parameter_accepted_but_not_used_in_signature(self):
-        """subtask_expert.compute_subtask_loss_train accepts subtask_ar_mask
-        but never references it in the function body.
-
-        This is a static check that verifies the parameter name exists in the
-        function signature but is not used in the body — documenting MAJ-3.
-        """
+    def test_ar_mask_is_not_a_parameter_of_compute_subtask_loss_train(self):
         import inspect
 
         from openpi.models_pytorch.action_experts import subtask_expert as se
 
-        # Check the parameter exists in the signature
-        sig = inspect.signature(se.SubtaskActionExpert.compute_subtask_loss_train)
-        assert "subtask_ar_mask" in sig.parameters, (
-            "Expected subtask_ar_mask parameter in compute_subtask_loss_train signature"
+        params = inspect.signature(se.SubtaskActionExpert.compute_subtask_loss_train).parameters
+        assert "subtask_ar_mask" not in params, (
+            "subtask_ar_mask is back in the signature; the method still cannot act on "
+            f"it because causal=True is hardcoded. Parameters were: {list(params)}"
         )
+        # positive control: the masks the method DOES consume are still declared,
+        # so this is not passing merely because the signature was renamed away
+        assert "subtask_mask" in params
+        assert "subtask_loss_mask" in params
+        assert "subtask_tokens" in params
 
-        # Check that it's not actually used in the function body
-        source = inspect.getsource(se.SubtaskActionExpert.compute_subtask_loss_train)
-        # Count occurrences: 1 in signature = not used in body
-        # We look for the identifier used as a variable (not just in docstring)
-        # Strip the signature line and docstring
-        lines = source.split("\n")
-        # Find where the body starts (after def line + docstring)
-        body_lines = []
-        in_docstring = False
-        past_sig = False
-        for line in lines:
-            stripped = line.strip()
-            if not past_sig:
-                if stripped.endswith("):"):
-                    past_sig = True
-                continue
-            if not body_lines and stripped.startswith('"""'):
-                in_docstring = True
-                # Handle single-line docstring
-                if stripped.endswith('"""') and len(stripped) > 3:
-                    in_docstring = False
-                continue
-            if in_docstring:
-                if '"""' in stripped:
-                    in_docstring = False
-                continue
-            body_lines.append(line)
+    def test_the_caller_no_longer_forwards_it(self):
+        import inspect
 
-        body_text = "\n".join(body_lines)
-        # Check if subtask_ar_mask appears as more than just parameter passing
-        # It might appear in the signature (already passed), but in the body
-        # it should NOT be referenced if it's truly unused.
-        ar_mask_refs = body_text.count("subtask_ar_mask")
-        assert ar_mask_refs == 0, (
-            f"subtask_ar_mask is referenced {ar_mask_refs} time(s) in the body "
-            "of compute_subtask_loss_train. MAJ-3 finding may be resolved or "
-            "partially resolved. Update this test accordingly."
+        from openpi.models_pytorch import pi05_subtask as ps
+
+        src = inspect.getsource(ps.PI05SubtaskPytorch.forward)
+        code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+        assert "subtask_ar_mask=subtask_ar_mask" not in code, (
+            "forward() forwards subtask_ar_mask again; the callee ignores it"
         )
+        # positive control: forward still reads it off the observation, because the
+        # field remains part of the observation contract for other consumers
+        assert "subtask_ar_mask" in src
 
-    def test_ar_mask_does_not_affect_loss_output(self, mini_lm, rng):
-        """Different subtask_ar_mask values must produce identical loss.
+    def test_segment_attention_is_still_causal_per_token(self):
+        """The behaviour the removed parameter could never have changed."""
+        import inspect
 
-        If the parameter were actually used, changing it would change the
-        attention mask and thus the loss. Since it's dead code, different
-        values produce the same result.
-        """
-        vocab_size = mini_lm.vocab_size
-        hidden_size = mini_lm.hidden_size
+        from openpi.models_pytorch.action_experts import subtask_expert as se
 
-        batch_size = 2
-        prefix_len = 4
-        subtask_len = 5
-
-        # Build mock prefix embeddings
-        prefix_embs = torch.randn(batch_size, prefix_len, hidden_size, generator=rng)
-        prefix_pad = torch.ones(batch_size, prefix_len, dtype=torch.bool)
-        prefix_att = torch.zeros(batch_size, prefix_len, dtype=torch.int32)
-
-        # Build mock subtask tokens
-        subtask_tokens = torch.randint(0, vocab_size, (batch_size, subtask_len), generator=rng)
-        subtask_mask = torch.ones(batch_size, subtask_len, dtype=torch.bool)
-        subtask_loss_mask = torch.tensor([
-            [False, True, True, True, True],
-            [False, True, True, True, True],
-        ], dtype=torch.bool)
-
-        # Two different ar_mask values that should produce different results
-        # IF the parameter were actually used
-        ar_mask_all_causal = torch.ones(batch_size, subtask_len, dtype=torch.int32)
-        ar_mask_all_bidir = torch.zeros(batch_size, subtask_len, dtype=torch.int32)
-
-        # Simulate what compute_subtask_loss_train does:
-        # It uses _embed_conditioning_subtask with causal=True,
-        # which ALWAYS sets subtask_att = ones_like (causal),
-        # ignoring subtask_ar_mask entirely.
-
-        def simulate_loss(subtask_ar_mask):
-            """Replicate the relevant parts of compute_subtask_loss_train.
-
-            We reproduce the exact pattern from subtask_expert.py to show
-            that subtask_ar_mask is never consumed.
-            """
-            # This is what _embed_conditioning_subtask does:
-            subtask_embs = mini_lm.embed_tokens(subtask_tokens)
-            subtask_embs = subtask_embs * (hidden_size ** 0.5)
-
-            extended_embs = torch.cat([prefix_embs, subtask_embs], dim=1)
-            extended_pad = torch.cat([prefix_pad, subtask_mask], dim=1)
-
-            # KEY LINE: causal=True → always ones, subtask_ar_mask is IGNORED
-            causal = True  # training always uses causal
-            if causal:
-                subtask_att = torch.ones_like(subtask_mask, dtype=prefix_att.dtype)
-            else:
-                subtask_att = torch.zeros_like(subtask_mask, dtype=prefix_att.dtype)
-            extended_att = torch.cat(
-                [prefix_att, subtask_att], dim=1
-            )
-
-            # Build 2D attention mask
-            from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
-
-            att_2d = make_att_2d_masks(extended_pad, extended_att)
-
-            # Forward pass
-            out = mini_lm(extended_embs)
-            hidden = out.last_hidden_state
-
-            # Get subtask hidden states
-            subtask_hidden = hidden[:, prefix_len:prefix_len + subtask_len, :]
-
-            # Compute text logits via embed_tokens.weight.T (training path)
-            text_logits = torch.matmul(subtask_hidden, mini_lm.embed_tokens.weight.T)
-
-            # CE loss with shift
-            shift_logits = text_logits[:, :-1].contiguous()
-            shift_targets = subtask_tokens[:, 1:].contiguous().to(torch.long)
-            shift_loss_mask = subtask_loss_mask[:, 1:].contiguous().float()
-
-            ce_per_token = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_targets.view(-1),
-                reduction="none",
-            ).view(shift_logits.shape[0], -1)
-
-            total_ce = (ce_per_token * shift_loss_mask).sum()
-            total_valid = shift_loss_mask.sum().clamp(min=1)
-            return total_ce / total_valid
-
-        loss_causal = simulate_loss(ar_mask_all_causal)
-        loss_bidir = simulate_loss(ar_mask_all_bidir)
-
-        # Both produce identical results because subtask_ar_mask is ignored
-        assert torch.allclose(loss_causal, loss_bidir, atol=1e-7), (
-            "MAJ-3 verification: subtask_ar_mask values produce identical loss "
-            "because the parameter is never consumed in compute_subtask_loss_train. "
-            "If this assertion fails, the parameter may have been wired up — "
-            "update the MAJ-3 finding."
-        )
-
-
-# ===========================================================================
-#  Test 6: BOS conditioning in build_hierarchical_observation (Gap 1)
-# ===========================================================================
+        src = inspect.getsource(se.SubtaskActionExpert.compute_subtask_loss_train)
+        assert "causal=True" in src, "training path must keep per-token causal blocks"
 
 
 class TestBuildHierarchicalObservationBOS:

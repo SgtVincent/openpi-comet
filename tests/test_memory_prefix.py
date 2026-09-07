@@ -279,6 +279,8 @@ def _run_transform(tok, state, *, memory_text=None, subtask_text=None):
     data = {"prompt": "turn on the radio", "state": state}
     if memory_text is not None:
         data["memory_text"] = memory_text
+        # A memory run carries both fields; the dataset sets them atomically.
+        data["previous_memory_text"] = "No task steps have been completed."
     if subtask_text is not None:
         data["subtask_text"] = subtask_text
     TokenizeSubtaskInputs(tokenizer=spy, require_memory=memory_text is not None)(data)

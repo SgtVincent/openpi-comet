@@ -484,3 +484,60 @@ def test_rollout_can_share_an_externally_owned_cache():
     rollout.commit_planner_output([4, 5, 6])
     assert shared.is_populated
     assert list(shared.get()[0]) == [4, 5, 6]
+
+
+# --------------------------------------------------------------------------
+# planner_stride wiring: config field -> rollout
+# --------------------------------------------------------------------------
+# Before this, planner_stride had no reader anywhere: the four mentions in the
+# worktree were the definition, a telemetry label in stats(), tests, and docs.
+# Setting it changed nothing, so the K=1/2/5/10 sweep could not actually run --
+# and every arm would have reported a different configured K while using 5.
+
+def test_from_model_config_takes_the_stride_from_the_config():
+    import dataclasses
+
+    from openpi.models.pi05_subtask_config import Pi05SubtaskConfig
+    from openpi.policies.memory_rollout import HeldMemoryRollout
+
+    cfg = Pi05SubtaskConfig()
+    assert HeldMemoryRollout.from_model_config(cfg).stride == cfg.planner_stride
+
+    for k in (1, 2, 5, 10):                       # the design's four arms
+        r = HeldMemoryRollout.from_model_config(dataclasses.replace(cfg, planner_stride=k))
+        assert r.stride == k, f"arm K={k} did not reach the rollout"
+        assert r.stats()["planner_stride"] == k
+
+
+def test_a_config_without_the_field_raises_rather_than_defaulting_to_five():
+    """A silent fallback would make "every arm used K=5" look like a real sweep."""
+    from openpi.policies.memory_rollout import (
+        DEFAULT_PLANNER_STRIDE,
+        HeldMemoryRollout,
+        PlannerScheduleError,
+    )
+
+    class ConfigWithoutTheField:
+        pass
+
+    with pytest.raises(PlannerScheduleError, match="no planner_stride field"):
+        HeldMemoryRollout.from_model_config(ConfigWithoutTheField())
+    # the independent module constant still exists but must no longer be reachable
+    # by accident from a config that lacks the field
+    assert DEFAULT_PLANNER_STRIDE == 5
+
+
+def test_arms_are_distinguishable_from_each_other():
+    """Positive control: if from_model_config ignored its argument, every arm
+    above would still pass its own assertion while all being identical."""
+    import dataclasses
+
+    from openpi.models.pi05_subtask_config import Pi05SubtaskConfig
+    from openpi.policies.memory_rollout import HeldMemoryRollout
+
+    cfg = Pi05SubtaskConfig()
+    strides = {
+        HeldMemoryRollout.from_model_config(dataclasses.replace(cfg, planner_stride=k)).stride
+        for k in (1, 2, 5, 10)
+    }
+    assert strides == {1, 2, 5, 10}, f"arms collapsed to {strides}"
