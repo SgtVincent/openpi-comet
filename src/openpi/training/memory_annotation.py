@@ -49,6 +49,11 @@ import bisect
 import dataclasses
 from typing import Any, Mapping, Sequence
 
+#: ``subtask_source`` value that switches the CE target to Memory text.  Defined
+#: here rather than in the dataset module so the light-weight consumers
+#: (data_loader, data_config) can branch on it without importing the dataset.
+MEMORY_SUBTASK_SOURCE = "annotations_memory"
+
 SCHEMA_VERSION = "b1k_fixed_compact_memory_v1"
 INTERVAL_CONVENTION = "half-open [start,end)"
 

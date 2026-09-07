@@ -160,3 +160,159 @@ def test_realistic_memory_prefix_stays_well_inside_the_budget(tok, state):
         previous_memory=mem)
     used = int(mask.sum())
     assert used < 300, f"memory-conditioned prefix used {used} tokens; expected well under 300"
+
+
+# --------------------------------------------------------------------------
+# subtask-side length budget: 27 tokens of headroom, not 322
+# --------------------------------------------------------------------------
+# Measured over all 261,353 rows with the training-side sentencepiece:
+# planner_target_text max = 101 of subtask_max_len 128 -> 27 tokens spare, while
+# the prompt segment has 322. The thin side is the one a phrase-template backfill
+# will eat, and right-truncation there drops EOS first.
+
+def _five_field_target(memory_body: str) -> str:
+    return "\n".join([
+        f"Memory: {memory_body}",
+        "Primitive: press the radio",
+        "Skill: press the radio",
+        "Next skill: END_OF_PRIMITIVE",
+        "Next primitive: place the radio on the coffee table",
+    ])
+
+
+def test_tokenize_memory_raises_instead_of_dropping_eos(tok):
+    """Over-length memory must raise, not silently lose EOS + trailing fields."""
+    with pytest.raises(ValueError) as e:
+        tok.tokenize_memory(_five_field_target("completed " + "a long completed step; " * 30))
+    msg = str(e.value)
+    assert "exceeds subtask_max_len" in msg
+    assert "128" in msg, "error must state the limit"
+    assert "Longest field is" in msg, "error must name which field to shorten"
+    assert "Memory" in msg
+
+
+def test_tokenize_memory_reports_the_actual_token_count(tok):
+    with pytest.raises(ValueError) as e:
+        tok.tokenize_memory(_five_field_target("x " * 200))
+    msg = str(e.value)
+    import re as _re
+    nums = [int(n) for n in _re.findall(r"\b(\d{3,4})\b", msg)]
+    assert any(n > 128 for n in nums), f"no actual over-limit token count in: {msg}"
+
+
+def test_tokenize_memory_eos_is_inside_the_loss_mask_when_it_fits(tok):
+    tokens, mask, ar_mask, loss_mask = tok.tokenize_memory(_five_field_target("no steps completed"))
+    eos_at = [i for i, t in enumerate(tokens) if int(t) == tok._tokenizer.eos_id()]
+    assert eos_at, "EOS must be present"
+    assert loss_mask[eos_at[-1]], "EOS must be supervised"
+    assert not loss_mask[0], "BOS must not be supervised"
+    assert mask[eos_at[-1]]
+    assert not mask[eos_at[-1] + 1:].any(), "padding must be masked out"
+
+
+def test_tokenize_memory_accepts_a_target_at_the_measured_real_maximum(tok):
+    """101 tokens is the measured global max; it must NOT raise."""
+    text = _five_field_target(
+        "Completed picking up the radio from the coffee table and pressing the radio twice; "
+        "currently placing the radio on the coffee table, next step is to turn it off.")
+    n = tok.memory_token_length(text)
+    assert n <= 128, f"fixture itself is over budget ({n})"
+    tokens, mask, _, loss_mask = tok.tokenize_memory(text)
+    assert int(mask.sum()) == n
+
+
+def test_tokenize_subtask_strict_length_raises_but_default_still_truncates(tok, caplog):
+    """The shared legacy path must keep its behaviour; strict is opt-in."""
+    long_text = "press the radio " * 60
+    with pytest.raises(ValueError, match="exceeds subtask_max_len"):
+        tok.tokenize_subtask(long_text, strict_length=True)
+    # default path: truncates, does not raise
+    tokens, mask, _, _ = tok.tokenize_subtask(long_text)
+    assert int(mask.sum()) == 128
+
+
+def test_tokenize_subtask_default_output_is_unchanged_for_normal_text(tok):
+    """Adding the keyword must not perturb the legacy result."""
+    a = tok.tokenize_subtask("press the radio")
+    b = tok.tokenize_subtask("press the radio", strict_length=True)
+    for x, y in zip(a, b):
+        assert (x == y).all()
+
+
+# --------------------------------------------------------------------------
+# the MoMA-VLA path must never reach the lenient tokenizer
+# --------------------------------------------------------------------------
+# tokenize_subtask keeps warning-and-truncate as its default because live
+# annotations_skill runs share it. That is only safe if our path provably never
+# calls it: a future call site that forgets strict_length=True would silently
+# fall back to truncation, and the symptom is "the model is bad at predicting
+# next skill", not an error. So this is asserted with a spy, not by reading code.
+
+class _SpyTokenizer:
+    """Wraps a real tokenizer and records which tokenise method was used."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.subtask_calls = 0
+        self.memory_calls = 0
+        self.strict_flags = []
+
+    def tokenize_prompt(self, *a, **k):
+        return self._inner.tokenize_prompt(*a, **k)
+
+    def tokenize_subtask(self, text, *, strict_length=False):
+        self.subtask_calls += 1
+        self.strict_flags.append(strict_length)
+        return self._inner.tokenize_subtask(text, strict_length=strict_length)
+
+    def tokenize_memory(self, text, **k):
+        self.memory_calls += 1
+        return self._inner.tokenize_memory(text, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _run_transform(tok, state, *, memory_text=None, subtask_text=None):
+    from openpi.transforms import TokenizeSubtaskInputs
+    spy = _SpyTokenizer(tok)
+    data = {"prompt": "turn on the radio", "state": state}
+    if memory_text is not None:
+        data["memory_text"] = memory_text
+        data["previous_memory_text"] = "no steps completed"
+    if subtask_text is not None:
+        data["subtask_text"] = subtask_text
+    TokenizeSubtaskInputs(tokenizer=spy, require_memory=memory_text is not None)(data)
+    return spy
+
+
+def test_memory_items_never_touch_tokenize_subtask(tok, state):
+    spy = _run_transform(tok, state, memory_text=_five_field_target("no steps completed"))
+    assert spy.memory_calls == 1, "memory text must go through tokenize_memory"
+    assert spy.subtask_calls == 0, (
+        "the memory path reached tokenize_subtask, whose default silently truncates"
+    )
+
+
+def test_the_spy_would_catch_a_violation(tok, state):
+    """Positive control: without it, the assertion above proves nothing.
+
+    A subtask-only item must make the counter move, showing the spy is wired to
+    the method it claims to watch.
+    """
+    spy = _run_transform(tok, state, subtask_text="press the radio")
+    assert spy.subtask_calls == 1
+    assert spy.memory_calls == 0
+    assert spy.strict_flags == [False], (
+        "records the legacy default, which is what makes the check above meaningful"
+    )
+
+
+def test_memory_text_takes_precedence_when_both_fields_are_present(tok, state):
+    """If both arrive, memory must win and the lenient path stay untouched."""
+    spy = _run_transform(
+        tok, state,
+        memory_text=_five_field_target("no steps completed"),
+        subtask_text="press the radio",
+    )
+    assert (spy.memory_calls, spy.subtask_calls) == (1, 0)

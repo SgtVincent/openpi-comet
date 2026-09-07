@@ -285,8 +285,17 @@ class ModelTransformFactory(GroupFactory):
                         ),
                     )
                 else:
+                    from openpi.training.memory_annotation import (
+                        MEMORY_SUBTASK_SOURCE as _MEMORY_SUBTASK_SOURCE,
+                    )
+
                     tokenize_transform = _transforms.TokenizeSubtaskInputs(
                         tokenizer=subtask_tokenizer,
+                        # Without this a missing memory_text is silently turned into
+                        # an all-zero, mask-False segment that encode_prefix drops,
+                        # so the run serves an unconditioned model and still reports
+                        # a loss.  Fail closed on the runs that depend on memory.
+                        require_memory=self.subtask_source == _MEMORY_SUBTASK_SOURCE,
                     )
                 return _transforms.Group(
                     inputs=[
