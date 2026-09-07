@@ -560,6 +560,33 @@ on_signal() {
 trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
 
+# >>> BEGIN mount preflight hook (added 2026-09-07; see scripts/hier/mount_preflight.sh) >>>
+# STEP 0: per-rank mount preflight. Runs on EVERY rank before training starts.
+# Content-level (reads a known file per mount and asserts bytes_read > 0) --
+# existence is not enough, a failed mount leaves the mount point directory
+# behind. Rank comes from ARNOLD_ID inside the pod. A cross-rank veto barrier
+# makes one rank's missing mount fail every rank, because partial failure
+# presents as "training hung", not as "a mount was missing".
+#
+# On failure we do NOT abort the wrapper: we rewrite TRAIN_COMMAND so the
+# existing STEP 1..4 machinery (status file, keepalive-on-failure, verbatim rc
+# propagation under KEEPALIVE_DISABLE=1) applies unchanged. That keeps this
+# hook at 20 lines and leaves the GPU allocation held on the very node whose
+# mount vanished -- the only place the evidence exists.
+if [[ "${MOUNT_PREFLIGHT_ENABLE:-1}" == "1" ]]; then
+  MOUNT_PREFLIGHT_SH="${MOUNT_PREFLIGHT_SH:-${REPO_ROOT}/scripts/hier/mount_preflight.sh}"
+  log "STEP 0/4: per-rank mount preflight: ${MOUNT_PREFLIGHT_SH}"
+  bash "${MOUNT_PREFLIGHT_SH}" 2>&1 | tee -a "${WRAPPER_LOG}"
+  MOUNT_PREFLIGHT_RC="${PIPESTATUS[0]}"  # NOT $? -- after a pipeline that is tee's rc
+  record_event "mount preflight rc=${MOUNT_PREFLIGHT_RC}"
+  if [[ "${MOUNT_PREFLIGHT_RC}" -ne 0 ]]; then
+    log_err "FATAL: mount preflight FAILED rc=${MOUNT_PREFLIGHT_RC} -- training will NOT be launched"
+    write_status "mount_preflight_failed" "${MOUNT_PREFLIGHT_RC}" "mount preflight rc=${MOUNT_PREFLIGHT_RC}; see the [mount-preflight] VERDICT line"
+    TRAIN_COMMAND="printf '%s\\n' '[mount-preflight] ABORT: preflight rc=${MOUNT_PREFLIGHT_RC} on node_rank=${NODE_RANK} host=${HOST_NAME}; training not launched' >&2; exit ${MOUNT_PREFLIGHT_RC}"
+  fi
+fi
+# <<< END mount preflight hook <<<
+
 # ---------------------------------------------------------------------------
 # STEP 1 — run the underlying training (output preserved, never swallowed)
 # ---------------------------------------------------------------------------
