@@ -176,6 +176,16 @@ class B1kInputs(transforms.DataTransformFn):
         if self.model_type == _model.ModelType.PI05_SUBTASK and "subtask_text" in data:
             inputs["subtask_text"] = data["subtask_text"]
 
+        # This transform REBUILDS the item instead of spreading `**data`, so any
+        # field not named here is dropped with no error.  Memory text has to be
+        # forwarded explicitly for the same reason `subtask_text` is: without
+        # these two lines the dataset produces memory, the repack passes it, and
+        # this transform silently discards it one step before tokenization.
+        if self.model_type == _model.ModelType.PI05_SUBTASK:
+            for _memory_key in ("memory_text", "previous_memory_text"):
+                if _memory_key in data:
+                    inputs[_memory_key] = data[_memory_key]
+
         if self.depth_as_pcd:
             inputs["pcd_xyz"] = pcd_xyz
         return inputs

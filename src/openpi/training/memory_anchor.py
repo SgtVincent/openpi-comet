@@ -209,3 +209,65 @@ class AnchorSchedule:
                 f"control_mode == {REQUIRED_CONTROL_MODE!r}"
             ),
         }
+
+def validate_planner_stride_spec(
+    planner_stride: int,
+    planner_stride_weights: "tuple[tuple[int, float], ...] | None" = None,
+) -> None:
+    """Validate a planner-stride spec at CONFIG BUILD time.
+
+    Two failure modes are specifically excluded, because both produce a wrong
+    schedule instead of an error:
+
+    * ``bool``: Python has ``True == 1``, so ``planner_stride=True`` would
+      silently select the K=1 experiment arm.
+    * ``<= 0``: ``-1 % 5 == 4``, so a negative stride yields a plausible-looking
+      anchor schedule rather than a crash.
+
+    ``planner_stride_weights`` is the slot for the mixed-K arm (one K drawn per
+    sample).  It is validated here but not implemented: it raises instead of
+    being ignored, since a silently dropped sweep parameter yields a run that is
+    labelled mixed-K and is really single-K.
+    """
+    if isinstance(planner_stride, bool):
+        raise TypeError(
+            f"planner_stride must be an int, got bool ({planner_stride!r}). "
+            "Python treats True as 1, so this would silently select the K=1 arm."
+        )
+    if not isinstance(planner_stride, int):
+        raise TypeError(f"planner_stride must be an int, got {type(planner_stride).__name__}")
+    if planner_stride <= 0:
+        raise ValueError(
+            f"planner_stride must be >= 1, got {planner_stride}. Negative strides do not "
+            "raise later: -1 % 5 == 4, which produces a wrong-but-plausible schedule."
+        )
+    if planner_stride_weights is None:
+        return
+
+    if not planner_stride_weights:
+        raise ValueError("planner_stride_weights was provided but empty; pass None to disable it")
+    seen = set()
+    total = 0.0
+    for entry in planner_stride_weights:
+        if not (isinstance(entry, tuple) and len(entry) == 2):
+            raise TypeError(f"planner_stride_weights entries must be (K, weight) pairs, got {entry!r}")
+        k, w = entry
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError(f"mixed-K keys must be ints, got {k!r}")
+        if k <= 0:
+            raise ValueError(f"mixed-K keys must be >= 1, got {k}")
+        if k in seen:
+            raise ValueError(f"duplicate K in planner_stride_weights: {k}")
+        seen.add(k)
+        if not isinstance(w, (int, float)) or isinstance(w, bool):
+            raise TypeError(f"mixed-K weights must be numbers, got {w!r}")
+        if w < 0:
+            raise ValueError(f"mixed-K weights must be non-negative, got {w}")
+        total += float(w)
+    if total <= 0:
+        raise ValueError("planner_stride_weights sum to 0, which selects nothing")
+    raise NotImplementedError(
+        "planner_stride_weights (mixed-K sampling) is validated but not implemented yet. "
+        "It is rejected rather than ignored: ignoring it would train a single-K run "
+        f"(K={planner_stride}) while labelling it mixed-K. Spec: {planner_stride_weights!r}"
+    )
