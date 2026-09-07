@@ -58,6 +58,13 @@
 #                            skill-bridge multinode launcher)
 #   TRAIN_COMMAND            full shell command string; overrides LAUNCHER
 #                            entirely (used by the no-GPU smoke test)
+#   WEIGHT_PREFLIGHT_ENABLE  default 1. Runs strict checkpoint validation before
+#                            TRAIN_COMMAND/LAUNCHER and refuses launch on failure
+#   WEIGHT_PREFLIGHT_CONFIG  registered TrainConfig name (required when enabled)
+#   WEIGHT_PREFLIGHT_PYTHON  Python used by the gate (defaults to OCCUPIER_PYTHON)
+#   WEIGHT_PREFLIGHT_SH      gate path (default <REPO_ROOT>/scripts/hier/preflight_weight_load.py)
+#   WEIGHT_PREFLIGHT_LOAD_MODE  default stream; bounded checkpoint reads
+#   WEIGHT_PREFLIGHT_HASH_MODE  default partial; logs exact covered ranges
 #   KEEPALIVE_DISABLE=1      disable keepalive completely; wrapper then exits
 #                            with the training exit code (transparent mode)
 #   KEEPALIVE_ON_SUCCESS     default 0 -> success path exits 0 without
@@ -586,6 +593,50 @@ if [[ "${MOUNT_PREFLIGHT_ENABLE:-1}" == "1" ]]; then
   fi
 fi
 # <<< END mount preflight hook <<<
+
+# >>> BEGIN strict weight preflight hook >>>
+# This runs after mount validation and before either TRAIN_COMMAND or LAUNCHER.
+# A PASS requires the configured file to exist, the exact registered config to
+# resolve, strict=True key/shape checks to succeed, every floating tensor to be
+# overwritten from the checkpoint, and sampled values to match the file opened.
+# On failure we reuse STEP 1..4's existing status/keepalive machinery, but replace
+# the training command with an explicit refusal so no training-side effect occurs.
+if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" ]]; then
+  WEIGHT_PREFLIGHT_CONFIG="${WEIGHT_PREFLIGHT_CONFIG:-}"
+  WEIGHT_PREFLIGHT_SH="${WEIGHT_PREFLIGHT_SH:-${REPO_ROOT}/scripts/hier/preflight_weight_load.py}"
+  WEIGHT_PREFLIGHT_PYTHON="${WEIGHT_PREFLIGHT_PYTHON:-${OCCUPIER_PYTHON}}"
+  WEIGHT_PREFLIGHT_LOAD_MODE="${WEIGHT_PREFLIGHT_LOAD_MODE:-stream}"
+  WEIGHT_PREFLIGHT_HASH_MODE="${WEIGHT_PREFLIGHT_HASH_MODE:-partial}"
+  WEIGHT_PREFLIGHT_RC=0
+  if [[ -z "${WEIGHT_PREFLIGHT_CONFIG}" ]]; then
+    log_err "FATAL: WEIGHT_PREFLIGHT_CONFIG is required when WEIGHT_PREFLIGHT_ENABLE=1"
+    WEIGHT_PREFLIGHT_RC=2
+  elif [[ ! -x "${WEIGHT_PREFLIGHT_PYTHON}" ]]; then
+    log_err "FATAL: WEIGHT_PREFLIGHT_PYTHON is not executable: ${WEIGHT_PREFLIGHT_PYTHON}"
+    WEIGHT_PREFLIGHT_RC=2
+  elif [[ ! -s "${WEIGHT_PREFLIGHT_SH}" ]]; then
+    log_err "FATAL: weight preflight script is missing or empty: ${WEIGHT_PREFLIGHT_SH}"
+    WEIGHT_PREFLIGHT_RC=2
+  else
+    log "STEP 0.5/4: strict weight preflight config=${WEIGHT_PREFLIGHT_CONFIG}"
+    PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+      "${WEIGHT_PREFLIGHT_PYTHON}" "${WEIGHT_PREFLIGHT_SH}" \
+        --config "${WEIGHT_PREFLIGHT_CONFIG}" \
+        --load-mode "${WEIGHT_PREFLIGHT_LOAD_MODE}" \
+        --hash-mode "${WEIGHT_PREFLIGHT_HASH_MODE}" \
+        --verify-sample 8 \
+        --require-openpi-under "${REPO_ROOT}/src" \
+        2>&1 | tee -a "${WRAPPER_LOG}"
+    WEIGHT_PREFLIGHT_RC="${PIPESTATUS[0]}"  # gate rc, never tee's rc
+  fi
+  record_event "weight preflight config=${WEIGHT_PREFLIGHT_CONFIG:-<unset>} rc=${WEIGHT_PREFLIGHT_RC}"
+  if [[ "${WEIGHT_PREFLIGHT_RC}" -ne 0 ]]; then
+    log_err "FATAL: strict weight preflight FAILED rc=${WEIGHT_PREFLIGHT_RC} -- training will NOT be launched"
+    write_status "weight_preflight_failed" "${WEIGHT_PREFLIGHT_RC}" "config=${WEIGHT_PREFLIGHT_CONFIG:-<unset>}; see WEIGHT_LOAD_GATE_VERDICT"
+    TRAIN_COMMAND="printf '%s\\n' '[weight-preflight] ABORT: gate rc=${WEIGHT_PREFLIGHT_RC} config=${WEIGHT_PREFLIGHT_CONFIG:-<unset>}; training not launched' >&2; exit ${WEIGHT_PREFLIGHT_RC}"
+  fi
+fi
+# <<< END strict weight preflight hook <<<
 
 # ---------------------------------------------------------------------------
 # STEP 1 — run the underlying training (output preserved, never swallowed)
