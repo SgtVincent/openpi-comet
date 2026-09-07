@@ -495,15 +495,43 @@ class SubtaskTokenizer:
     def vocab_size(self) -> int:
         return self._tokenizer.vocab_size()
 
-    def tokenize_prompt(self, prompt: str, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize_prompt(
+        self, prompt: str, state: np.ndarray, previous_memory: str | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Tokenize the task prompt + discretized state (same as PI05 PaligemmaTokenizer).
 
         Returns (tokens, mask) for the prefix.
+
+        MoMA-VLA: when ``previous_memory`` is given, the prefix instead ends with
+        ``;\\nPrevious memory: {previous_memory}`` per design doc §3.4.3, replacing
+        the ``Subtask: `` cue.  The Memory target supplies its own ``Memory:``
+        label, so no trailing generation cue is needed.
+
+        ``previous_memory=None`` reproduces the historical prefix byte for byte;
+        the existing ``annotations_skill`` runs share this method, so the default
+        path is locked by a regression test rather than by inspection.
+
+        Truncation policy differs between the two, deliberately.  The legacy path
+        keeps its warning so existing runs behave identically.  The memory path
+        raises: the previous-memory text sits at the *end* of the prefix, so a
+        right-truncation eats exactly the conditioning it was added to provide,
+        and the run would continue reporting a healthy loss while the model saw
+        no memory at all.
         """
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         state_str = " ".join(map(str, discretized_state))
-        full_prompt = f"Task: {cleaned_text}, State: {state_str};\nSubtask: "
+        if previous_memory is None:
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nSubtask: "
+        else:
+            cleaned_memory = str(previous_memory).strip().replace("_", " ").replace("\n", " ")
+            if not cleaned_memory:
+                raise ValueError(
+                    "previous_memory was provided but is empty after cleaning. An empty "
+                    "memory would train the model on a 'Previous memory:' label with no "
+                    "content, which is not the same as an unconditioned run."
+                )
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nPrevious memory: {cleaned_memory}"
         tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         tokens_len = len(tokens)
 
@@ -513,6 +541,14 @@ class SubtaskTokenizer:
             tokens = tokens + padding
         else:
             if tokens_len > self._prompt_max_len:
+                if previous_memory is not None:
+                    raise ValueError(
+                        f"Prefix token length ({tokens_len}) exceeds prompt_max_len "
+                        f"({self._prompt_max_len}) on a memory-conditioned sample. The "
+                        "previous-memory text is at the end of the prefix, so truncating "
+                        "here would silently drop the memory conditioning. Refusing to "
+                        "truncate; shorten the memory text or raise prompt_max_len."
+                    )
                 logging.warning(
                     f"Prompt token length ({tokens_len}) exceeds max ({self._prompt_max_len}), truncating."
                 )
