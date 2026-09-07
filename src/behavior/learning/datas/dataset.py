@@ -1308,10 +1308,26 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if self._accept_rng is None:
             self._accept_rng = random.Random(self.seed + 1000003 * global_worker_id + 17)
         if self._active_chunks is None:
-            # Existing approximate worker partitioning is intentionally retained.
+            # Guard, and no fallback. `range(g, N, W)` is empty exactly when
+            # g = rank*num_workers + worker_id >= N. The removed fallback then
+            # re-partitioned with `range(worker_id, N, num_workers)`, which does
+            # NOT contain the rank: same-numbered workers on different ranks got
+            # bit-identical chunk sets, i.e. silent cross-rank data duplication.
+            # It was invisible because every RNG seed here carries `g`, so the two
+            # ranks read the same chunks in *different orders* -- logs and metrics
+            # look normal while effective sample diversity collapses and DDP
+            # gradients become correlated. In the extreme (N < num_workers) the
+            # fallback was empty too and `rng.integers(0, 0)` raised an opaque
+            # numpy ValueError about low >= high, naming nothing about shards.
+            if len(self.chunks) < global_num_workers:
+                raise RuntimeError(
+                    f"only {len(self.chunks)} chunks for {global_num_workers} global "
+                    f"dataloader workers (world_size={world_size} x num_workers="
+                    f"{num_workers}); at least one worker would get nothing. Reduce "
+                    "num_workers or widen the task/episode selection. Refusing the old "
+                    "rank-agnostic fallback, which duplicated data across ranks silently."
+                )
             indices = list(range(global_worker_id, len(self.chunks), global_num_workers))
-            if len(indices) == 0:
-                indices = list(range(worker_id, len(self.chunks), num_workers))
             worker_chunks = [self.chunks[i] for i in indices]
             rng = np.random.default_rng(self.seed + global_worker_id)
             rng.shuffle(worker_chunks)

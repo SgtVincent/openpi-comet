@@ -87,6 +87,10 @@ FIELD_NAMES: Final[tuple[str, ...]] = tuple(f.name for f in MEMORY_FIELDS)
 CURRENT_MEMORY_CUE: Final[str] = "Current memory:"
 PREVIOUS_MEMORY_CUE: Final[str] = "Previous memory:"
 
+#: Trailing sequence marker of ``model_target_text``. A marker for end-to-end
+#: checks, never encoded as part of the CE target (design section 3.4.3).
+ACTION_QUERY_MARKER: Final[str] = "Action Query:"
+
 # Longest-first, so "Next skill:" can never be matched as "Skill:" and
 # "Next primitive:" never as "Primitive:".
 _LABEL_RE: Final[re.Pattern[str]] = re.compile(
@@ -136,6 +140,124 @@ def build_memory_text(**fields: str) -> str:
             )
         lines.append(f"{field.label} {body}" if body else field.label)
     return "\n".join(lines)
+
+
+def parse_memory_text(text: str, *, strict: bool = True) -> dict[str, str]:
+    """Inverse of :func:`build_memory_text`: split generated text back into fields.
+
+    Design section 6.2's six Planner metrics all require the generated text split
+    back into fields before anything can be computed, so this is on the critical
+    path for evaluation rather than a convenience.
+
+    **Splits on newline, not on the colon.** ``build_memory_text`` collapses
+    whitespace inside every value precisely so that newline is the only field
+    separator, and the production tokenizer path (``tokenize_memory``) preserves
+    newlines -- unlike ``tokenize_subtask``, which flattens them to spaces. A
+    colon-based split would be silently wrong on the 2.61% of real rows whose
+    ``Memory:`` value contains its own colon (measured: 274 of 10,489 sampled
+    rows, e.g. ``..., next: grab chocolate chip cookie.``): those rows would be
+    cut in the middle of a value and every downstream metric would be computed on
+    mangled fields with nothing raised.
+
+    Label matching is used only to *verify* each line's prefix, longest-first so
+    ``Next skill:`` can never be consumed as ``Skill:``, and case-sensitively --
+    bare lower-case ``skill:`` does not occur in the corpus (0 of 10,489), so a
+    case-insensitive match would only add ways to be wrong.
+
+    ``strict=True`` raises unless exactly the five fields are recovered in order.
+    That is deliberate: a partial result would let evaluation proceed on fields it
+    silently failed to find, and "the model is bad at next-skill" is what a
+    truncated parse looks like. Set ``strict=False`` only to compute the section
+    6.2 format-completion diagnostic, which is meant to observe malformed output
+    rather than reject it.
+    """
+    if text is None:
+        raise MemoryTextError("parse_memory_text() requires text, got None")
+    body = str(text).strip()
+    # Tolerate a trailing Action Query marker: it is a sequence marker for
+    # end-to-end checks, never part of the CE target (design section 3.4.3).
+    lines = [ln for ln in body.split("\n") if ln.strip()]
+    if lines and lines[-1].strip() == ACTION_QUERY_MARKER:
+        lines = lines[:-1]
+
+    if len(lines) != len(MEMORY_FIELDS):
+        if strict:
+            raise MemoryTextError(
+                f"expected {len(MEMORY_FIELDS)} newline-separated fields, got {len(lines)}. "
+                f"Refusing to return a partial parse. Lines were: {lines!r}"
+            )
+        lines = _split_by_labels(body)
+
+    out: dict[str, str] = {}
+    for field, line in zip(MEMORY_FIELDS, lines):
+        prefix = field.label + " "
+        if line.startswith(prefix):
+            value = line[len(prefix):]
+        elif line.startswith(field.label):
+            value = line[len(field.label):]
+        elif strict:
+            raise MemoryTextError(
+                f"field {field.name!r} should start with {field.label!r}, got {line!r}. "
+                "Field order is part of the supervision contract, not a presentation choice."
+            )
+        else:
+            value = line
+        out[field.name] = value.strip()
+
+    if strict:
+        empty = [n for n, v in out.items() if not v]
+        if empty:
+            raise MemoryTextError(f"fields parsed but empty: {empty}; text was {text!r}")
+    return out
+
+
+def _split_by_labels(body: str) -> list[str]:
+    """Fallback for text that lost its newlines (e.g. a flattened generation).
+
+    Only reachable from ``strict=False``. Longest-first via ``_LABEL_RE`` so
+    ``Next primitive:`` is never consumed as ``Primitive:``.
+    """
+    hits = list(_LABEL_RE.finditer(body))
+    if not hits:
+        return [body]
+    spans = []
+    for i, m in enumerate(hits):
+        end = hits[i + 1].start() if i + 1 < len(hits) else len(body)
+        spans.append(body[m.start():end].strip())
+    return spans
+
+
+def format_completion(text: str) -> dict[str, object]:
+    """Design section 6.2 "Format completion" -- diagnostic only, never raises.
+
+    Reports what a strict parse would have rejected, so a malformed generation is
+    counted rather than thrown away. Explicitly not a parser gate: section 6.2
+    says this metric is for diagnosis and must not become a hard parser門.
+    """
+    body = str(text or "").strip()
+    lines = [ln for ln in body.split("\n") if ln.strip()]
+    had_marker = bool(lines) and lines[-1].strip() == ACTION_QUERY_MARKER
+    if had_marker:
+        lines = lines[:-1]
+    labels_in_order = [f.label for f in MEMORY_FIELDS]
+    present = [lab for lab in labels_in_order if lab in body]
+    prefixes_ok = sum(
+        1 for f, ln in zip(MEMORY_FIELDS, lines) if ln.startswith(f.label)
+    )
+    try:
+        parse_memory_text(body, strict=True)
+        strict_ok = True
+    except MemoryTextError:
+        strict_ok = False
+    return {
+        "newline_field_count": len(lines),
+        "expected_field_count": len(MEMORY_FIELDS),
+        "labels_present": len(present),
+        "labels_in_expected_order": present == labels_in_order[: len(present)],
+        "line_prefixes_matching": prefixes_ok,
+        "had_action_query_marker": had_marker,
+        "strict_parse_ok": strict_ok,
+    }
 
 
 def validate_field_structure(text: str) -> None:
