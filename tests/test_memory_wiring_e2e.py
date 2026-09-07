@@ -13,6 +13,8 @@ assert on its output.
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -178,12 +180,32 @@ def test_production_call_sites_derive_the_flags_from_the_data_config():
 
     root = pathlib.Path(__file__).resolve().parents[1]
     loader = code_only((root / "src/openpi/training/data_loader.py").read_text())
-    assert loader.count("include_memory_text=_memory_source_active(data_config)") == 2, (
-        "both PromptFromLeRobotItem construction sites must derive the flag"
+    # Both construction sites now route through one helper, so the flags are set
+    # in a single place that tests can actually CALL. The semantics are covered
+    # behaviourally in tests/test_memory_wiring_callable.py; what remains here is
+    # only "both sites go through the helper", which is a structural claim.
+    # Count CALL sites, not the substring: the `def` line matches it too. Three
+    # earlier source assertions in this change set misfired the same way -- one
+    # matched its own explanatory comment, one matched `model_action_horizon`, and
+    # this one matched the function definition. Substring counting over source is
+    # the recurring mistake, so match the call form specifically.
+    call_sites = loader.count("[prompt_transform_for(")
+    assert call_sites == 2, (
+        f"expected 2 call sites building the prompt transform via the helper, found "
+        f"{call_sites}; both dataset construction paths must route through it"
     )
-    assert loader.count("require_memory_text=_memory_source_active(data_config)") == 2
+    assert loader.count("def prompt_transform_for(") == 1, "the helper must have one definition"
+    assert "include_memory_text=active" in loader and "require_memory_text=active" in loader
     cfg = code_only((root / "src/openpi/training/data_config.py").read_text())
     assert "require_memory=self.subtask_source == _MEMORY_SUBTASK_SOURCE" in cfg
+    # ...and the field it reads must exist, which a string match alone cannot tell.
+    # This exact combination shipped broken: the string was present, the field was
+    # not, and the call raised AttributeError the first time anything invoked it.
+    from openpi.training.data_config import ModelTransformFactory
+
+    assert any(
+        f.name == "subtask_source" for f in dataclasses.fields(ModelTransformFactory)
+    ), "data_config reads self.subtask_source but ModelTransformFactory has no such field"
     tf_raw = (root / "src/openpi/transforms.py").read_text()
     tf = code_only(tf_raw)
     assert "previous_memory=previous_memory_text" in tf

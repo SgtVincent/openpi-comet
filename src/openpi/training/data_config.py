@@ -189,6 +189,12 @@ class ModelTransformFactory(GroupFactory):
 
     model_delta_action_mask: Sequence[int] | None = None
 
+    #: Mirrors ``DataConfig.subtask_source``. Needed because the PI05_SUBTASK
+    #: branch has to fail closed on memory runs, and this factory does not
+    #: otherwise see the data config. Defaults to the non-memory value so every
+    #: existing caller keeps its behaviour byte for byte.
+    subtask_source: str = "orchestrator"
+
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         meta_input_transforms = []
         meta_output_transforms = []
@@ -419,6 +425,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # Without this the PI05_SUBTASK branch cannot tell a memory run from a
+            # skill run, and its fail-closed switch would be keyed on nothing.
+            subtask_source=getattr(self.base_config, "subtask_source", "orchestrator"),
         )(model_config)
 
         return dataclasses.replace(
@@ -498,6 +507,9 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # Without this the PI05_SUBTASK branch cannot tell a memory run from a
+            # skill run, and its fail-closed switch would be keyed on nothing.
+            subtask_source=getattr(self.base_config, "subtask_source", "orchestrator"),
         )(model_config)
 
         return dataclasses.replace(
@@ -577,6 +589,9 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # Without this the PI05_SUBTASK branch cannot tell a memory run from a
+            # skill run, and its fail-closed switch would be keyed on nothing.
+            subtask_source=getattr(self.base_config, "subtask_source", "orchestrator"),
         )(model_config)
 
         return dataclasses.replace(
