@@ -558,13 +558,22 @@ class SubtaskTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
     def tokenize_subtask(
-        self, subtask_text: str
+        self, subtask_text: str, *, strict_length: bool = False
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Tokenize the subtask text for CE loss supervision.
 
         The subtask tokens form a causal sequence: the model predicts each next token.
 
         Returns (tokens, mask, ar_mask, loss_mask).
+
+        ``strict_length`` raises instead of truncating.  It defaults to False
+        because live ``annotations_skill`` runs share this method and their
+        targets are short phrases that never approach the limit -- flipping the
+        default would change behaviour for experiments already in flight.  The
+        MoMA-VLA training path does not rely on that default: memory text is
+        routed through :meth:`tokenize_memory`, which raises unconditionally.
+        Pass ``strict_length=True`` when measuring the admission gate, so that an
+        over-length target is reported rather than silently clipped.
         """
         cleaned = subtask_text.strip().replace("_", " ").replace("\n", " ")
         # Prepend BOS so the first real subtask token is supervised by next-token CE.
@@ -584,6 +593,14 @@ class SubtaskTokenizer:
             loss_mask = loss_mask + [False] * padding_len
         else:
             if subtask_len > self._subtask_max_len:
+                if strict_length:
+                    # Right-truncation drops EOS first, then the trailing text.
+                    raise ValueError(
+                        f"Subtask token length ({subtask_len}) exceeds subtask_max_len "
+                        f"({self._subtask_max_len}) by {subtask_len - self._subtask_max_len}. "
+                        f"Truncating would drop EOS and the trailing fields. "
+                        f"{self._longest_field_report(subtask_text)}"
+                    )
                 logging.warning(
                     f"Subtask token length ({subtask_len}) exceeds max ({self._subtask_max_len}), truncating."
                 )
@@ -633,6 +650,26 @@ class SubtaskTokenizer:
             cache[scheme] = _mem.MemoryTextCodec(tokenizer=self._tokenizer, scheme=scheme)
         return cache[scheme]
 
+    def _longest_field_report(self, text: str) -> str:
+        """Name the longest field so the error says WHICH field to shorten.
+
+        "Over budget by 6" does not tell you where to look; the Memory field and
+        the four plan fields have very different owners and fixes.
+        """
+        try:
+            parts = [p for p in str(text).split("\n") if p.strip()]
+            if not parts:
+                return ""
+            sized = sorted(
+                ((len(self._tokenizer.encode(p)), p) for p in parts), reverse=True
+            )
+            n, worst = sized[0]
+            label = worst.split(":", 1)[0] if ":" in worst else "<unlabelled>"
+            per_field = ", ".join(f"{p.split(':', 1)[0]}={k}" for k, p in sized)
+            return f"Longest field is {label!r} at {n} tokens (per-field: {per_field})."
+        except Exception:  # never let diagnostics mask the real error
+            return ""
+
     def tokenize_memory(
         self, memory_text: str, *, validate: bool = True, scheme=None
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -667,19 +704,47 @@ class SubtaskTokenizer:
             loss_mask = loss_mask + [False] * padding_len
         else:
             if memory_len > self._subtask_max_len:
-                # Loud, not silent: truncation drops the LAST fields, i.e.
-                # `Next skill` / `Next primitive`.  That looks like "the model is
-                # bad at predicting next-skill" rather than like a truncation bug,
-                # so it has to be reported at the point it happens.
-                logging.warning(
-                    f"Memory token length ({memory_len}) exceeds subtask_max_len ({self._subtask_max_len}), "
-                    "truncating. This drops the trailing memory fields (Next skill / Next primitive) and "
-                    "corrupts the CE target; raise subtask_max_len or shorten the Memory field."
+                # Raise, not warn.  Truncation is right-to-left over
+                # `[BOS] + body + [EOS]`, so it drops EOS FIRST and then eats
+                # back through `Next primitive:` / `Next skill:`.  Losing EOS
+                # means the model is never taught to stop; losing the trailing
+                # fields looks like "the model is bad at predicting next-skill".
+                # Both render as a mediocre metric rather than as a defect, and
+                # design doc 3.4.5 requires this to be a hard error.
+                #
+                # Headroom is thin enough that this is not hypothetical: the
+                # measured max over all 261,353 rows is 101 of 128, i.e. 27
+                # tokens, and the phrase-template backfill in progress lengthens
+                # the Memory field.
+                raise ValueError(
+                    f"Memory token length ({memory_len}) exceeds subtask_max_len "
+                    f"({self._subtask_max_len}) by {memory_len - self._subtask_max_len}. "
+                    f"Truncating would drop EOS and the trailing fields, corrupting the CE "
+                    f"target while still reporting a loss. {self._longest_field_report(memory_text)} "
+                    f"Shorten the Memory text or raise subtask_max_len."
                 )
             tokens = tokens[: self._subtask_max_len]
             mask = mask[: self._subtask_max_len]
             ar_mask = ar_mask[: self._subtask_max_len]
             loss_mask = loss_mask[: self._subtask_max_len]
+
+        # EOS must land inside the supervised region (design doc 3.4.4).
+        #
+        # Honest note on coverage: given the raise above, this post-condition is
+        # unreachable by construction -- `memory_len > max` raises, and
+        # `memory_len == max` keeps EOS at index max-1 where loss_mask is True.
+        # A mutation that deletes only this block therefore CANNOT be killed by
+        # any test, and it is not claimed as covered.  It is kept as the second
+        # layer for exactly one regression: softening the raise back to a warning
+        # re-arms it, which is why the raise-to-warning mutation still fails
+        # loudly instead of silently shipping an unterminated model.
+        eos_positions = [i for i, t in enumerate(tokens) if t == self._tokenizer.eos_id()]
+        if not eos_positions or not loss_mask[eos_positions[-1]]:
+            raise ValueError(
+                f"EOS is not inside the valid loss mask (memory_len={memory_len}, "
+                f"subtask_max_len={self._subtask_max_len}); the model would never be "
+                "supervised to terminate."
+            )
 
         return (
             np.asarray(tokens, dtype=np.int32),
