@@ -630,7 +630,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         episode = self.meta.episodes.get(ep_idx) or {}
         return index.sampling_range(episode_length=episode.get("length"))
 
-    def _get_memory_texts(self, item: dict) -> tuple[str, str, dict] | None:
+    def _resolve_memory_training_fields(self, ep_idx: int, frame_index: int) -> tuple[str, str, dict] | None:
         """``(memory_text, previous_memory_text, provenance)``, or None if the frame is
         outside the annotated range.
 
@@ -642,8 +642,6 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         range is a different thing entirely and raises, because intervals tile
         their range exactly (0 gaps / 0 overlaps over 251,353 adjacent pairs).
         """
-        ep_idx = item["episode_index"].item()
-        frame_index = round(item["timestamp"].item() * self.fps)
         lo, hi = self._memory_sampling_range(ep_idx)
         if not (lo <= frame_index < hi):
             return None
@@ -685,6 +683,11 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 "memory_frame_lag": int(decision.frame_lag),
             }
         return row.planner_target_text, previous_memory_text, provenance
+
+    def _get_memory_texts(self, item: dict) -> tuple[str, str, dict] | None:
+        ep_idx = int(item["episode_index"].item())
+        frame_index = int(round(item["timestamp"].item() * self.fps))
+        return self._resolve_memory_training_fields(ep_idx, frame_index)
 
     # ------------------------------------------------------------------
     # Shared item assembly (training and viewer MUST go through this)
@@ -808,6 +811,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         episode_length = int((self.meta.episodes.get(episode_index) or {}).get("length", -1))
         lo, hi = self._memory_sampling_range(episode_index)
         row = index.lookup(frame_idx)
+        resolved = self._resolve_memory_training_fields(int(episode_index), int(frame_idx))
+        if resolved is None:
+            raise IndexError(
+                f"episode {episode_index} frame {frame_idx} is outside the Memory-annotated range [{lo}, {hi})"
+            )
+        _, _, training_provenance = resolved
         chunk = getattr(self, "_chunk_size_used", None)
         if chunk is None:
             raise RuntimeError(
@@ -819,6 +828,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         ce = min(cs + chunk, episode_length) if episode_length > 0 else cs + chunk
         stats = self.memory_chunk_stats() or {}
         return {
+            **training_provenance,
             "episode_index": int(episode_index),
             "frame_idx": int(frame_idx),
             "episode_length": episode_length,
