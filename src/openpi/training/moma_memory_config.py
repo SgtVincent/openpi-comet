@@ -187,7 +187,7 @@ def _short_config(mix_c: "TrainConfig", *, name: str, weights) -> "TrainConfig":
         exp_name=name,
         data=[short_factory],
         num_train_steps=200,
-        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=1e-4, warmup_steps=1000, decay_steps=200),
+        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=1e-4, warmup_steps=20, decay_steps=200),
     )
 
 

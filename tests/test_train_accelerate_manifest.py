@@ -234,6 +234,28 @@ def test_memory_telemetry_is_detached_before_model_forward():
     assert clean.state is obs.state
 
 
+def test_memory_telemetry_skip_does_not_pollute_next_commit():
+    import torch
+
+    mod = _get_module()
+    pending = {}
+    mod._merge_memory_telemetry(pending, {"memory_k5_count": 2.0, "memory_telemetry_samples": 2.0})
+    mod._discard_pending_memory_telemetry(pending)
+    assert pending == {}
+    mod._merge_memory_telemetry(pending, {"memory_k1_count": 1.0, "memory_telemetry_samples": 1.0})
+
+    class Accelerator:
+        device = torch.device("cpu")
+        @staticmethod
+        def reduce(value, reduction):
+            assert reduction == "sum"
+            return value
+
+    committed = mod._commit_pending_memory_telemetry(pending, Accelerator())
+    assert committed == {"memory_k1_count": 1.0, "memory_telemetry_samples": 1.0}
+    assert pending == {}
+
+
 def test_non_memory_manifest_has_no_mix_c_spec():
     mod = _get_module()
     cfg = MockConfig()

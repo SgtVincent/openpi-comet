@@ -310,6 +310,16 @@ def _merge_memory_telemetry(total: dict[str, float], batch: dict[str, float]) ->
         total[key] = total.get(key, 0.0) + float(value)
 
 
+def _discard_pending_memory_telemetry(total: dict[str, float]) -> None:
+    total.clear()
+
+
+def _commit_pending_memory_telemetry(total: dict[str, float], accelerator) -> dict[str, float]:
+    committed = _reduce_memory_telemetry(total, accelerator)
+    total.clear()
+    return committed
+
+
 def _reduce_memory_telemetry(metrics: dict[str, float], accelerator) -> dict[str, float]:
     if not metrics:
         return {}
@@ -5487,7 +5497,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 consecutive_nonfinite_losses,
                                 max_consecutive_nonfinite_losses,
                             )
-                        pending_memory_metrics = {}
+                        _discard_pending_memory_telemetry(pending_memory_metrics)
                         continue
 
                     # The measured no-optimizer-offload policy requires the
@@ -5582,7 +5592,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 consecutive_nonfinite_losses,
                                 max_consecutive_nonfinite_losses,
                             )
-                        pending_memory_metrics = {}
+                        _discard_pending_memory_telemetry(pending_memory_metrics)
                         continue
 
                     # Expert backward accumulates expert gradients (and
@@ -5852,7 +5862,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 consecutive_nonfinite_losses,
                                 max_consecutive_nonfinite_losses,
                             )
-                        pending_memory_metrics = {}
+                        _discard_pending_memory_telemetry(pending_memory_metrics)
                         continue
 
                     consecutive_nonfinite_losses = 0
@@ -5938,6 +5948,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                     "Too many consecutive optimizer updates were skipped due to non-finite gradients. "
                                     f"Reached {consecutive_skipped_updates} skipped updates."
                                 )
+                            _discard_pending_memory_telemetry(pending_memory_metrics)
                             continue
 
                     if _debug_overflow_enabled(config) and not deepspeed_two_phase_update:
@@ -6018,7 +6029,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         optimizer.zero_grad(set_to_none=True)
 
                     if step_was_skipped:
-                        pending_memory_metrics = {}
+                        _discard_pending_memory_telemetry(pending_memory_metrics)
                         consecutive_skipped_updates += 1
                         total_ds_overflow_skipped_updates += 1
                         if is_main:
@@ -6044,8 +6055,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     consecutive_skipped_updates = 0
                     sample_progress.record_update(committed=True)
-                    committed_memory_metrics = _reduce_memory_telemetry(pending_memory_metrics, accelerator)
-                    pending_memory_metrics = {}
+                    committed_memory_metrics = _commit_pending_memory_telemetry(
+                        pending_memory_metrics, accelerator
+                    )
 
                     # stats/logging use optimizer-step granularity
                     if is_main:

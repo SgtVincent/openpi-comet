@@ -235,8 +235,11 @@ class TestMemoryTrainConfig:
         assert mix.data[0].base_config.memory_planner_stride_weights == mm.MIX_C_WEIGHTS
         assert k1.num_train_steps == mix.num_train_steps == 200
         assert k1.lr_schedule == mix.lr_schedule
-        assert k1.lr_schedule.warmup_steps == 1000
+        assert k1.lr_schedule.warmup_steps == 20
         assert k1.lr_schedule.decay_steps == 200
+        schedule = k1.lr_schedule.create()
+        assert float(schedule(0)) < float(schedule(20))
+        assert float(schedule(199)) < float(schedule(20))
         assert k1.model == mix.model
         assert k1.optimizer == mix.optimizer
         assert k1.pytorch_weight_path == mix.pytorch_weight_path
