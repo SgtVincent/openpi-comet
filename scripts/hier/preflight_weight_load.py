@@ -175,7 +175,16 @@ _PARTIAL_HASH_WINDOW = 64 * 1024 * 1024  # 64 MiB head + 64 MiB tail
 # TIED, not MISSING, so they never required an allowlist entry.
 #
 # Format: {config_name: {state_dict_key: "why this may be absent"}}
-REGISTERED_ALLOWLIST: dict[str, dict[str, str]] = {}
+# The formal MoMA checkpoint was measured against the actual training model:
+# 813 logical state_dict keys = 812 physical tensors + one tied alias, with
+# strict=True returning missing=[] and unexpected=[]. Therefore its exact
+# allowlist is intentionally empty. Keeping the config entry explicit makes that
+# measurement a reviewable contract: a future missing key cannot be mistaken for
+# "no policy was registered" and silently broadened.
+REGISTERED_ALLOWLIST: dict[str, dict[str, str]] = {
+    "pi05_moma_memory_b1k-k5": {},
+    "pi05_moma_memory_b1k-k5_smoke": {},
+}
 
 
 def allowlist_for(config_name: str) -> tuple[str, ...]:

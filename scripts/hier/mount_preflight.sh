@@ -102,8 +102,9 @@
 #                                    Deliberately NOT on any NAS: the
 #                                    measuring apparatus must not live on the
 #                                    thing being measured.
-#   MOUNT_ROOT_WORKTREE / _HANDOFF / _WT_STAGE1 / _DATASET
-#                                    override the four mount roots
+#   MOUNT_ROOT_WORKTREE / _HANDOFF / _DATASET
+#                                    override the three mount roots. WORKTREE
+#                                    must be the immutable launch clone.
 #
 # EXIT CODES (contract)
 #   0   ALL_OK  -- every local probe read >0 bytes AND (barrier on) every peer
@@ -212,7 +213,6 @@ fi
 # fail closed below if this knob is omitted.
 MOUNT_ROOT_WORKTREE="${MOUNT_ROOT_WORKTREE:-}"
 MOUNT_ROOT_HANDOFF="${MOUNT_ROOT_HANDOFF:-/mnt/bn/behavior-data-hl/chenjunting/repo/moma_handoff_20260907}"
-MOUNT_ROOT_WT_STAGE1="${MOUNT_ROOT_WT_STAGE1:-/mnt/bn/navigation-hl/mlx/users/chenjunting/h20_skillbridge/wt_stage1}"
 MOUNT_ROOT_DATASET="${MOUNT_ROOT_DATASET:-/mnt/bn/behavior-data-hl/chenjunting/data/2025-challenge-demos}"
 MOUNT_ROOT_MEMORY="${MOUNT_ROOT_DATASET}/derived/fixed_compact_memory_annotations"
 
@@ -243,14 +243,14 @@ fi
 PROBES=(
   # -- code worktree -------------------------------------------------------
   "WORKTREE|${MOUNT_ROOT_WORKTREE}/pyproject.toml|tracked, at the worktree root, ~3.2 KB, untouched by the in-flight MoMA work; cheapest proof that the root resolves to real content instead of an empty mount point"
-  "WORKTREE|${MOUNT_ROOT_WORKTREE}/.git|the 101-byte 'gitdir:' pointer that MAKES this a linked worktree; git loose objects have been zeroed on this host twice, and if this pointer is zeroed every git call in the launcher breaks with an unrelated-looking error"
-  "WORKTREE|${MOUNT_ROOT_WORKTREE}/scripts/run_pi05_ki_joint_query_single_task_radio_skillbridge_bf16_multinode_lq.sh|the exact file the keepalive wrapper runs as \${LAUNCHER}. An empty shell script EXITS 0: a zero-byte read here makes training silently never start while every rc says success. Strongest functional sentinel in the tree"
+  "WORKTREE|${MOUNT_ROOT_WORKTREE}/.git/HEAD|the immutable clone's HEAD reference. A normal clone has .git as a DIRECTORY, so probing the directory itself would falsely report FAIL_IS_DIR"
+  "WORKTREE|${MOUNT_ROOT_WORKTREE}/scripts/run_pi05_moma_memory_b1k_k5_bf16_multinode.sh|the exact MoMA-VLA launcher the wrapper runs. An empty shell script EXITS 0, so a zero-byte read here would make training silently never start"
+  "WORKTREE|${MOUNT_ROOT_WORKTREE}/scripts/hier/preflight_weight_load.py|the strict checkpoint gate that must PASS before the MoMA launcher is allowed to run"
+  "WORKTREE|${MOUNT_ROOT_WORKTREE}/scripts/hier/mount_preflight.sh|this per-rank mount gate itself; a frozen clone missing the audited gate must not launch"
   # -- handoff directory ---------------------------------------------------
   "HANDOFF|${MOUNT_ROOT_HANDOFF}/run_momavla_keepalive_on_failure.sh|the MoMA-VLA entrypoint wrapper the launch path executes out of the handoff dir; same 'empty script exits 0' hazard as above"
   "HANDOFF|${MOUNT_ROOT_HANDOFF}/moma_doc.md|stable spec document, so the handoff group does not depend only on executables; catches a mount that lost plain data but kept scripts"
-  # -- wt_stage1 (SEPARATE PHYSICAL MOUNT: navigation-hl / nfs4) -----------
-  "WT_STAGE1|${MOUNT_ROOT_WT_STAGE1}/scripts/train_accelerate.py|literally the trainer this job execs (~300 KB). This is the single most load-bearing file in the launch path; it lives on navigation-hl, a DIFFERENT physical mount from every other probe, so it is the one that can fail independently"
-  "WT_STAGE1|${MOUNT_ROOT_WT_STAGE1}/scripts/run_pi05_skillbridge_lq_keepalive_on_failure.sh|the entrypoint recorded for the live H20 job (audit/H20_RECON.md); proves the scripts/ subtree of the frozen clone, not just its root"
+  "WORKTREE|${MOUNT_ROOT_WORKTREE}/scripts/train_accelerate.py|the exact trainer invoked by the frozen MoMA launcher; validates launcher and trainer come from the same immutable tree"
   # -- dataset root --------------------------------------------------------
   "DATASET|${MOUNT_ROOT_DATASET}/meta/info.json|the LeRobot dataset descriptor the loader opens FIRST; an empty one surfaces as an obscure JSON error deep inside the data pipeline instead of 'the dataset mount is gone'"
   "DATASET|${MOUNT_ROOT_DATASET}/meta/tasks.jsonl|the task table, also loader-critical and small"
@@ -477,8 +477,10 @@ if [[ "${RANK}" == 'UNSET' && "${BARRIER_ENABLED}" == '1' ]]; then
   BARRIER_ENABLED=0
 fi
 if [[ "${BARRIER_ENABLED}" == '1' && -z "${NUM_RANKS}" ]]; then
-  log_err "WARN: ARNOLD_WORKER_NUM unset and MOUNT_PREFLIGHT_NUM_RANKS not given -> cannot require a full quorum, so the cross-rank barrier is DISABLED. This rank's OK says NOTHING about its peers."
-  BARRIER_ENABLED=0
+  log_err "FATAL: ARNOLD_WORKER_NUM unset and MOUNT_PREFLIGHT_NUM_RANKS not given; full quorum cannot be proved."
+  printf '[%s] VERDICT rank=%s host=%s result=NOT_MEASURED probes_ok=0/%d failed=EXPECTED_RANK_COUNT_UNSET exit=%d run_key=%s peers=-/- barrier=DISABLED\n' \
+    "${PF_TAG}" "${RANK}" "${HOST_NAME}" "${#PROBES[@]}" "${RC_NOT_MEASURED}" "${RUN_KEY}" >&2
+  exit "${RC_NOT_MEASURED}"
 fi
 
 # ---------------------------------------------------------------------------

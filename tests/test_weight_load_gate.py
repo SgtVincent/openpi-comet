@@ -496,8 +496,12 @@ def test_equivalence_real_vs_stream(intact_ckpt: Path, tmp_path: Path):
 # the registered allowlist is registered, per-key, and not reachable from a flag
 # --------------------------------------------------------------------------- #
 def test_registered_allowlist_is_empty_and_not_settable_from_cli():
-    """No key is currently allowlisted, and no CLI flag can add one."""
-    assert gate.REGISTERED_ALLOWLIST == {}, gate.REGISTERED_ALLOWLIST
+    """MoMA's measured policy is exact-empty, and no CLI flag can broaden it."""
+    assert gate.REGISTERED_ALLOWLIST == {
+        "pi05_moma_memory_b1k-k5": {},
+        "pi05_moma_memory_b1k-k5_smoke": {},
+    }, gate.REGISTERED_ALLOWLIST
+    assert gate.allowlist_for("pi05_moma_memory_b1k-k5") == ()
     assert gate.allowlist_for("anything") == ()
     parser = gate.build_parser()
     for argv in (

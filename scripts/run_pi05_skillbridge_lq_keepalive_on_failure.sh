@@ -60,7 +60,7 @@
 #                            entirely (used by the no-GPU smoke test)
 #   WEIGHT_PREFLIGHT_ENABLE  default 1. Runs strict checkpoint validation before
 #                            TRAIN_COMMAND/LAUNCHER and refuses launch on failure
-#   WEIGHT_PREFLIGHT_CONFIG  registered TrainConfig name (required when enabled)
+#   WEIGHT_PREFLIGHT_CONFIG  defaults to CONFIG_NAME and must equal it exactly
 #   WEIGHT_PREFLIGHT_PYTHON  Python used by the gate (defaults to OCCUPIER_PYTHON)
 #   WEIGHT_PREFLIGHT_SH      gate path (default <REPO_ROOT>/scripts/hier/preflight_weight_load.py)
 #   WEIGHT_PREFLIGHT_LOAD_MODE  default stream; bounded checkpoint reads
@@ -157,7 +157,11 @@ OCCUPIER_STUB_SCRIPT="${OCCUPY_RUNTIME_DIR}/gpu_occupy_stub.sh"
 # ---------------------------------------------------------------------------
 # Behaviour knobs
 # ---------------------------------------------------------------------------
-LAUNCHER="${LAUNCHER:-${REPO_ROOT}/scripts/run_pi05_ki_joint_query_single_task_radio_skillbridge_bf16_multinode_lq.sh}"
+# This wrapper is now the MoMA-VLA launch owner. The old Skill Bridge default
+# was valid for a different experiment and silently selected a different config,
+# dataset source and output tree. Keep override support for tests, but the real
+# default must be the launcher that names the registered Memory config.
+LAUNCHER="${LAUNCHER:-${REPO_ROOT}/scripts/run_pi05_moma_memory_b1k_k5_bf16_multinode.sh}"
 KEEPALIVE_DISABLE="${KEEPALIVE_DISABLE:-0}"
 KEEPALIVE_ON_SUCCESS="${KEEPALIVE_ON_SUCCESS:-0}"
 EXPECTED_GPUS_PER_NODE="${EXPECTED_GPUS_PER_NODE:-8}"
@@ -590,6 +594,7 @@ if [[ "${MOUNT_PREFLIGHT_ENABLE:-1}" == "1" ]]; then
     log_err "FATAL: mount preflight FAILED rc=${MOUNT_PREFLIGHT_RC} -- training will NOT be launched"
     write_status "mount_preflight_failed" "${MOUNT_PREFLIGHT_RC}" "mount preflight rc=${MOUNT_PREFLIGHT_RC}; see the [mount-preflight] VERDICT line"
     TRAIN_COMMAND="printf '%s\\n' '[mount-preflight] ABORT: preflight rc=${MOUNT_PREFLIGHT_RC} on node_rank=${NODE_RANK} host=${HOST_NAME}; training not launched' >&2; exit ${MOUNT_PREFLIGHT_RC}"
+    PREFLIGHT_BLOCKED_BY_MOUNT=1
   fi
 fi
 # <<< END mount preflight hook <<<
@@ -601,14 +606,30 @@ fi
 # overwritten from the checkpoint, and sampled values to match the file opened.
 # On failure we reuse STEP 1..4's existing status/keepalive machinery, but replace
 # the training command with an explicit refusal so no training-side effect occurs.
-if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" ]]; then
-  WEIGHT_PREFLIGHT_CONFIG="${WEIGHT_PREFLIGHT_CONFIG:-}"
+if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" && "${PREFLIGHT_BLOCKED_BY_MOUNT:-0}" != "1" ]]; then
+  # One owner for the config name: the launcher exports CONFIG_NAME and the gate
+  # consumes the same value. A separate default here can validate one model and
+  # then start another when an operator overrides the launcher config.
+  if [[ -z "${CONFIG_NAME:-}" ]]; then
+    CONFIG_NAME="pi05_moma_memory_b1k-k5"
+    export CONFIG_NAME
+  fi
+  WEIGHT_PREFLIGHT_CONFIG="${WEIGHT_PREFLIGHT_CONFIG:-${CONFIG_NAME}}"
+  # The launcher also consumes CONFIG_NAME. Export after the equality check's
+  # source value is established so its actual command line and the gate cannot
+  # diverge through shell-local vs environment scope.
+  export CONFIG_NAME
   WEIGHT_PREFLIGHT_SH="${WEIGHT_PREFLIGHT_SH:-${REPO_ROOT}/scripts/hier/preflight_weight_load.py}"
   WEIGHT_PREFLIGHT_PYTHON="${WEIGHT_PREFLIGHT_PYTHON:-${OCCUPIER_PYTHON}}"
   WEIGHT_PREFLIGHT_LOAD_MODE="${WEIGHT_PREFLIGHT_LOAD_MODE:-stream}"
   WEIGHT_PREFLIGHT_HASH_MODE="${WEIGHT_PREFLIGHT_HASH_MODE:-partial}"
   WEIGHT_PREFLIGHT_RC=0
-  if [[ -z "${WEIGHT_PREFLIGHT_CONFIG}" ]]; then
+  WEIGHT_PREFLIGHT_PASS_COUNT=0
+  WEIGHT_PREFLIGHT_LOG="${OCCUPY_RUNTIME_DIR}/weight_preflight_${NODE_TAG}.log"
+  if [[ "${WEIGHT_PREFLIGHT_CONFIG}" != "${CONFIG_NAME}" ]]; then
+    log_err "FATAL: gate config ${WEIGHT_PREFLIGHT_CONFIG} != training config ${CONFIG_NAME}"
+    WEIGHT_PREFLIGHT_RC=2
+  elif [[ -z "${WEIGHT_PREFLIGHT_CONFIG}" ]]; then
     log_err "FATAL: WEIGHT_PREFLIGHT_CONFIG is required when WEIGHT_PREFLIGHT_ENABLE=1"
     WEIGHT_PREFLIGHT_RC=2
   elif [[ ! -x "${WEIGHT_PREFLIGHT_PYTHON}" ]]; then
@@ -626,10 +647,19 @@ if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" ]]; then
         --hash-mode "${WEIGHT_PREFLIGHT_HASH_MODE}" \
         --verify-sample 8 \
         --require-openpi-under "${REPO_ROOT}/src" \
-        2>&1 | tee -a "${WRAPPER_LOG}"
-    WEIGHT_PREFLIGHT_RC="${PIPESTATUS[0]}"  # gate rc, never tee's rc
+        > "${WEIGHT_PREFLIGHT_LOG}" 2>&1
+    WEIGHT_PREFLIGHT_RC=$?
+    # Preserve the full gate output in the durable wrapper log after capturing
+    # the Python rc. PASS is accepted only when the process returned 0 AND wrote
+    # exactly one anchored PASS verdict; rc=0 with no/multiple verdict is void.
+    tee -a "${WRAPPER_LOG}" < "${WEIGHT_PREFLIGHT_LOG}"
+    WEIGHT_PREFLIGHT_PASS_COUNT="$(awk '$1=="WEIGHT_LOAD_GATE_VERDICT" && $2=="PASS" {n++} END{print n+0}' "${WEIGHT_PREFLIGHT_LOG}")"
+    if [[ "${WEIGHT_PREFLIGHT_RC}" -eq 0 && "${WEIGHT_PREFLIGHT_PASS_COUNT}" -ne 1 ]]; then
+      log_err "FATAL: weight gate rc=0 but anchored PASS verdict count=${WEIGHT_PREFLIGHT_PASS_COUNT}; expected exactly 1"
+      WEIGHT_PREFLIGHT_RC=2
+    fi
   fi
-  record_event "weight preflight config=${WEIGHT_PREFLIGHT_CONFIG:-<unset>} rc=${WEIGHT_PREFLIGHT_RC}"
+  record_event "weight preflight config=${WEIGHT_PREFLIGHT_CONFIG:-<unset>} rc=${WEIGHT_PREFLIGHT_RC} pass_count=${WEIGHT_PREFLIGHT_PASS_COUNT}"
   if [[ "${WEIGHT_PREFLIGHT_RC}" -ne 0 ]]; then
     log_err "FATAL: strict weight preflight FAILED rc=${WEIGHT_PREFLIGHT_RC} -- training will NOT be launched"
     write_status "weight_preflight_failed" "${WEIGHT_PREFLIGHT_RC}" "config=${WEIGHT_PREFLIGHT_CONFIG:-<unset>}; see WEIGHT_LOAD_GATE_VERDICT"
