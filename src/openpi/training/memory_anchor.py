@@ -50,6 +50,11 @@ CONTROL_MODE_CONSUMPTION = {
     "receeding_temporal": 5,  # blends up to 3 chunks
 }
 
+MIXED_STRIDE_SPEC_VERSION = 1
+MIXED_STRIDE_ALGORITHM = "blake2b_u64_weighted_cdf"
+MIXED_STRIDE_DIGEST = "blake2b-64-big-endian"
+MIXED_STRIDE_KEY_FIELDS = ("seed", "episode_index", "episode_local_chunk_index")
+
 
 class AnchorScheduleError(ValueError):
     """Raised rather than silently producing a shifted anchor schedule."""
@@ -284,13 +289,30 @@ class MixedStrideSelector:
             frame_idx - anchor_frame,
         )
 
-    def describe(self) -> dict:
+    def describe(self, *, frames_per_chunk: int) -> dict:
+        _require_positive_int(frames_per_chunk, "frames_per_chunk")
         return {
-            "mode": "per_action_chunk_stable_blake2b",
-            "seed": self.seed,
+            "schema_version": MIXED_STRIDE_SPEC_VERSION,
+            "algorithm": MIXED_STRIDE_ALGORITHM,
+            "digest": MIXED_STRIDE_DIGEST,
+            "key_fields": list(MIXED_STRIDE_KEY_FIELDS),
             "weights": [[int(k), float(w)] for k, w in self.weights],
-            "key_fields": ["seed", "episode_index", "episode_local_chunk_index"],
+            "seed": self.seed,
+            "frames_per_chunk": frames_per_chunk,
         }
+
+
+def mixed_stride_spec(
+    weights: tuple[tuple[int, float], ...] | None,
+    seed: int | None,
+    frames_per_chunk: int | None,
+) -> dict | None:
+    """Canonical manifest/fingerprint schema owned by the selector."""
+    if weights is None:
+        return None
+    if seed is None or frames_per_chunk is None:
+        raise AnchorScheduleError("mixed stride spec requires seed and frames_per_chunk")
+    return MixedStrideSelector(tuple(weights), seed).describe(frames_per_chunk=frames_per_chunk)
 
 
 def validate_planner_stride_spec(

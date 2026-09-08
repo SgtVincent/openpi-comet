@@ -16,6 +16,7 @@ from openpi.training.memory_anchor import (
     AnchorScheduleError,
     MixedStrideSelector,
     check_chunk_consumption_assumptions,
+    mixed_stride_spec,
 )
 
 
@@ -223,6 +224,30 @@ def test_mixed_stride_is_stable_per_episode_local_action_chunk():
         d1.chunk_lag,
     )
     assert (d0.frame_lag, d1.frame_lag) == (32, 63)
+
+
+def test_mixed_stride_golden_vectors_cover_k5_and_k10():
+    selector = MixedStrideSelector(((1, 0.4), (2, 0.3), (5, 0.2), (10, 0.1)), seed=42)
+    assert selector.select(episode_index=0, chunk_index=12) == 5
+    assert selector.select(episode_index=0, chunk_index=3) == 10
+    assert selector.decision_for(
+        episode_index=0, frame_idx=384, origin=0, frames_per_chunk=32
+    ).anchor_frame == 320
+    assert selector.decision_for(
+        episode_index=0, frame_idx=96, origin=0, frames_per_chunk=32
+    ).anchor_frame == 0
+
+
+def test_mixed_stride_spec_is_complete_and_canonical():
+    assert mixed_stride_spec(((1, 0.4), (10, 0.6)), 42, 32) == {
+        "schema_version": 1,
+        "algorithm": "blake2b_u64_weighted_cdf",
+        "digest": "blake2b-64-big-endian",
+        "key_fields": ["seed", "episode_index", "episode_local_chunk_index"],
+        "weights": [[1, 0.4], [10, 0.6]],
+        "seed": 42,
+        "frames_per_chunk": 32,
+    }
 
 
 def test_mixed_stride_uses_episode_local_origin_and_separates_initial():
