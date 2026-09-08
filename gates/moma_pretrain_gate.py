@@ -1257,12 +1257,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.mode == "formal":
             # 正式模式：所有跨实现/跨版本对照的来源都必须显式给出。
             # 「可选参数缺了就当通过」是 fail-open —— gate 的语义必须是「没查到就不能说通过」。
-            required += [("--chunk-stats-json", args.chunk_stats_json),
+            required += [("--anchor-stride", args.anchor_stride),
+                         ("--anchor-offset", args.anchor_offset),
+                         ("--chunk-stats-json", args.chunk_stats_json),
                          ("--config-scope-expect", args.config_scope_expect),
                          ("--distribution-baselines", args.distribution_baselines),
                          ("--expect-tokenizer-md5", args.expect_tokenizer_md5),
                          ("--expect-vocab-size", args.expect_vocab_size)]
         missing = [n for n, v in required if v is None]
+        # 取值域按训练侧 `dataset.py:_read_streaming_anchor_env` 的同一套约束校验，
+        # 免得 gate 用一个训练侧根本不接受的组合算出「通过」。
+        if args.anchor_stride is not None and args.anchor_stride < 1:
+            p.error(f"--anchor-stride 必须 >= 1，得到 {args.anchor_stride}")
+        if args.anchor_offset is not None:
+            if args.anchor_stride is None:
+                p.error("--anchor-offset 必须与 --anchor-stride 一起给")
+            if not 0 <= args.anchor_offset < args.anchor_stride:
+                p.error(f"--anchor-offset 必须满足 0 <= offset < stride；"
+                        f"得到 offset={args.anchor_offset}, stride={args.anchor_stride}")
         if args.mode == "formal" and not str(args.frames_meta_root).strip():
             # 空串是「显式放弃」，那在 formal 模式下不成立：放弃之后 EPISODE_JOIN_1TO1 /
             # FRAME_COVERAGE / chunk 四条等十项都失去依据，报告会看起来更干净而不是更差。
@@ -1855,11 +1867,28 @@ def main(argv: list[str] | None = None) -> int:
     uncovered_total = unc_head + unc_tail
     if episode_lengths is None:
         requested = bool(args.frames_meta_root.strip())
-        ledger.add("EPISODE_JOIN_1TO1", hard=requested, passed=(not requested),
+        # NOT-MEASURED 一律 passed=False：显式 opt-out 记 WARN、请求了读不到记 hard。
+        # 写成 passed=True 会让人读输出里显示 [PASS] —— 那是「整条消失」的另一种形态。
+        ledger.add("EPISODE_JOIN_1TO1", hard=requested, passed=False,
                    detail=(f"{frames_meta_status}。annotation 不含帧数据，不联表就无法判定 frame 覆盖"
                            + ("（已请求但读不到 ⇒ NOT-MEASURED，按 hard 记）" if requested
                               else "（调用方显式跳过）")),
                    measured="NOT-MEASURED", threshold="meta/episodes.jsonl 可读")
+        # 其余 8 条本来整条消失 ⇒ 报告会因为「少查了东西」而看起来更干净。
+        # 逐条登记成 NOT-MEASURED，让缺口在报告里留下痕迹。
+        for _k, _why in (
+            ("FRAME_COVERAGE_VS_VIDEO", "需要 meta/episodes.jsonl 的 length 才能判帧覆盖"),
+            ("CHUNK_STATS_AGREE_WITH_TRAINING_SIDE", "chunk 计数依赖 episode 长度"),
+            ("DEAD_CHUNK_COUNT_MANUAL_OVERRIDE", "同上"),
+            ("SHARDING_AFTER_DEAD_CHUNK_EXCLUSION", "live chunk 数依赖 episode 长度"),
+            ("CLAMPED_RANGE_HITS_100PCT", "夹取范围与 anchor 依赖 episode 长度"),
+            ("NO_ANNOTATED_FRAME_DROPPED", "同上"),
+            ("NO_DEAD_CHUNKS", "同上"),
+            ("ANNOTATION_WITHIN_VIDEO", "越界判定需要视频长度"),
+        ):
+            ledger.add(_k, hard=requested, passed=False,
+                       detail=f"NOT-MEASURED：{_why}（{frames_meta_status}）",
+                       measured="NOT-MEASURED", threshold="需要 --frames-meta-root")
     else:
         ann_missing = join_missing
         ledger.add("EPISODE_JOIN_1TO1", hard=True,
@@ -1972,7 +2001,11 @@ def main(argv: list[str] | None = None) -> int:
                            and no_anchor_chunks == 0),
                    detail=("剔除 dead chunk、anchor 夹到 [max(cs,cov_s), min(ce,live_e)) 之后，"
                            "**stride 对齐的真实 anchor** 的 frame → interval 命中率必须 100%；"
-                           "任一未命中即 hard error"
+                           "任一未命中即 hard error。"
+                           "⚠️ `chunks_without_aligned_anchor` 比训练语义**更严格**："
+                           "训练侧 `_select_aligned_streaming_chunk` 只在某 worker 的**全部** chunk "
+                           "都找不到对齐 anchor 时才 raise，单个 chunk 没有只会被跳过；"
+                           "gate 对单个也报。stride=1 时该计数恒为 0，两者无差异"
                            "（文档 3.4.5「未命中区间 = hard error」在剔除之后的形式）"),
                    measured={"probes": clamped_probes, "misses": clamped_misses,
                              "anchor_stride": opts["anchor_stride"], "anchor_offset": opts["anchor_offset"],
