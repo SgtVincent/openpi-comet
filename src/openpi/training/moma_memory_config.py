@@ -54,12 +54,17 @@ _PI05_BASE_CKPT = "/mnt/bn/behavior-data-hl/chenjunting/repo/openpi-comet/checkp
 #: Decided budgets.  See module docstring for the measurements behind them.
 MEMORY_SUBTASK_MAX_LEN = 192
 MEMORY_PROMPT_MAX_LEN = 320
+MIX_C_WEIGHTS: tuple[tuple[int, float], ...] = ((1, 0.4), (2, 0.3), (5, 0.2), (10, 0.1))
+MIX_C_SEED = 42
 
 
 def make_memory_data_config(
     *,
     episodes_index: list[int] | None = None,
     data_root: str = MEMORY_DATA_ROOT,
+    planner_stride_weights: tuple[tuple[int, float], ...] | None = None,
+    planner_stride_seed: int | None = None,
+    frames_per_chunk: int | None = None,
 ) -> LeRobotB1KDataConfig:
     """Data config that routes the dataset through the Memory source.
 
@@ -81,6 +86,9 @@ def make_memory_data_config(
             behavior_dataset_root=data_root,
             fine_grained_level=0,
             subtask_source=MEMORY_SUBTASK_SOURCE,
+            memory_planner_stride_weights=planner_stride_weights,
+            memory_planner_stride_seed=planner_stride_seed,
+            memory_frames_per_chunk=frames_per_chunk,
             # Deliberately no subtask_template_path / object_name_mapping: the
             # Memory text is generated offline, so those assets are never read.
             # Passing them would make them look configured while being ignored.
@@ -93,6 +101,7 @@ def make_memory_train_config(
     name: str,
     planner_stride: int = 5,
     planner_stride_weights: tuple[tuple[int, float], ...] | None = None,
+    planner_stride_seed: int | None = None,
     num_train_steps: int = 30_000,
     peak_lr: float = 1e-4,
     episodes_index: list[int] | None = None,
@@ -102,11 +111,9 @@ def make_memory_train_config(
 ) -> "TrainConfig":
     """Build a MoMA-VLA memory TrainConfig.
 
-    `planner_stride_weights` exists so that the mixed-K sampling arm (K drawn
-    per sample from a weighted set) does not require reshaping this signature
-    later.  It is validated but NOT yet implemented: passing it raises rather
-    than quietly training single-K, because a silently ignored sweep parameter
-    produces a run that looks like the mixed arm and is not.
+    When ``planner_stride_weights`` is set, the real dataset selects one K per
+    episode-local action chunk using ``planner_stride_seed``. Both values are
+    carried by the DataConfig into the run manifest.
     """
     model = pi05_subtask_config.Pi05SubtaskConfig(
         subtask_max_len=MEMORY_SUBTASK_MAX_LEN,
@@ -122,6 +129,8 @@ def make_memory_train_config(
     from openpi.training.memory_anchor import validate_planner_stride_spec
 
     validate_planner_stride_spec(planner_stride, planner_stride_weights)
+    if planner_stride_weights is not None and planner_stride_seed is None:
+        raise ValueError("planner_stride_seed is required when planner_stride_weights is set")
 
     # Imported here, not at module scope: train_config imports this module at its
     # own bottom to register these configs, so a module-level import would be a
@@ -140,7 +149,13 @@ def make_memory_train_config(
         # base PI0Pytorch constructor.
         pytorch_model_name="subtask",
         model=model,
-        data=make_memory_data_config(episodes_index=episodes_index, data_root=data_root),
+        data=make_memory_data_config(
+            episodes_index=episodes_index,
+            data_root=data_root,
+            planner_stride_weights=planner_stride_weights,
+            planner_stride_seed=planner_stride_seed,
+            frames_per_chunk=model.action_horizon if planner_stride_weights is not None else None,
+        ),
         pytorch_weight_path=_PI05_BASE_CKPT,
         num_train_steps=num_train_steps,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -172,5 +187,11 @@ def memory_configs() -> "tuple[TrainConfig, ...]":
         make_memory_train_config(
             name="pi05_moma_memory_b1k-k5",
             planner_stride=5,
+        ),
+        make_memory_train_config(
+            name="pi05_moma_memory_b1k-mix-c",
+            planner_stride=5,
+            planner_stride_weights=MIX_C_WEIGHTS,
+            planner_stride_seed=MIX_C_SEED,
         ),
     )

@@ -185,7 +185,7 @@ class TestMemoryTrainConfig:
             ({"planner_stride": 0}, ValueError),
             ({"planner_stride": 5, "planner_stride_weights": ((1, 0.5), (1, 0.5))}, ValueError),
             ({"planner_stride": 5, "planner_stride_weights": ((1, 0.0),)}, ValueError),
-            ({"planner_stride": 5, "planner_stride_weights": ((1, 0.4), (5, 0.6))}, NotImplementedError),
+            ({"planner_stride": 5, "planner_stride_weights": ((1, 0.4), (5, 0.6))}, ValueError),
         ],
     )
     def test_stride_guards_reject(self, kwargs, exc):
@@ -193,6 +193,20 @@ class TestMemoryTrainConfig:
 
         with pytest.raises(exc):
             mm.make_memory_train_config(name="probe", **kwargs)
+
+    def test_mix_c_config_records_one_authoritative_spec(self):
+        import openpi.training.moma_memory_config as mm
+
+        cfg = mm.make_memory_train_config(
+            name="probe-mix-c",
+            planner_stride_weights=mm.MIX_C_WEIGHTS,
+            planner_stride_seed=mm.MIX_C_SEED,
+        )
+        factory = cfg.data[0] if isinstance(cfg.data, (list, tuple)) else cfg.data
+        base = factory.base_config
+        assert base.memory_planner_stride_weights == mm.MIX_C_WEIGHTS
+        assert base.memory_planner_stride_seed == mm.MIX_C_SEED
+        assert base.memory_frames_per_chunk == cfg.model.action_horizon == 32
 
     @pytest.mark.parametrize("k", [1, 2, 5, 10])
     def test_valid_strides_are_accepted(self, k):

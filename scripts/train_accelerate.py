@@ -2980,6 +2980,14 @@ def _build_data_fingerprint(config, data_config) -> dict:
         modalities = getattr(data_config, "modalities", None)
         subtask_source = getattr(data_config, "subtask_source", None)
         prompt_from_task = getattr(data_config, "prompt_from_task", False)
+        memory_mix_c = {
+            "weights": [
+                [int(k), float(w)]
+                for k, w in (getattr(data_config, "memory_planner_stride_weights", None) or ())
+            ],
+            "seed": getattr(data_config, "memory_planner_stride_seed", None),
+            "frames_per_chunk": getattr(data_config, "memory_frames_per_chunk", None),
+        }
 
         fingerprint = {
             "repo_id": str(repo_id) if repo_id else "",
@@ -3001,6 +3009,8 @@ def _build_data_fingerprint(config, data_config) -> dict:
         if subtask_source is not None:
             fingerprint["subtask_source"] = subtask_source
         fingerprint["prompt_from_task"] = prompt_from_task
+        if subtask_source == "annotations_memory":
+            fingerprint["memory_mix_c"] = memory_mix_c
 
         # Build SHA256 of canonical sorted data selection
         canonical = {
@@ -3013,6 +3023,8 @@ def _build_data_fingerprint(config, data_config) -> dict:
             "tasks": sorted(tasks) if tasks is not None else [],
             "episodes_index": [int(i) for i in episodes_index] if episodes_index is not None else [],
         }
+        if subtask_source == "annotations_memory":
+            canonical["memory_mix_c"] = memory_mix_c
         canonical_json = json.dumps(canonical, sort_keys=True)
         fingerprint["sha256"] = hashlib.sha256(canonical_json.encode()).hexdigest()
         fingerprint["sha256_canonical_preview"] = canonical_json[:200] + "..."
@@ -3084,6 +3096,11 @@ def _compute_data_manifest(
     manifest["train_fine_grained_level"] = getattr(data_config, "fine_grained_level", 0)
     manifest["train_subtask_source"] = getattr(data_config, "subtask_source", None)
     manifest["train_prompt_from_task"] = getattr(data_config, "prompt_from_task", False)
+    manifest["memory_mix_c"] = (
+        _build_data_fingerprint(config, data_config).get("memory_mix_c")
+        if manifest["train_subtask_source"] == "annotations_memory"
+        else None
+    )
 
     # -- Validation data info --
     manifest["has_val_data"] = val_loader is not None

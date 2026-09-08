@@ -28,6 +28,9 @@ because it is held in place only by every entry point remembering to set
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
+import math
 from typing import Iterable
 
 #: Frames consumed per policy call. Measured as 32 on both the training and the
@@ -210,6 +213,86 @@ class AnchorSchedule:
             ),
         }
 
+@dataclasses.dataclass(frozen=True)
+class MixedAnchorDecision:
+    anchor_kind: str
+    selected_stride: int
+    target_chunk_index: int
+    anchor_chunk_index: int
+    anchor_frame: int
+    chunk_lag: int
+    frame_lag: int
+
+
+@dataclasses.dataclass(frozen=True)
+class MixedStrideSelector:
+    """Stable per-action-chunk MIX-C selection.
+
+    The key is episode-local ``chunk_index`` rather than frame or call order, so
+    every frame in one action chunk selects the same K across workers, retries,
+    and Python hash seeds.
+    """
+
+    weights: tuple[tuple[int, float], ...]
+    seed: int
+
+    def __post_init__(self) -> None:
+        validate_planner_stride_spec(1, self.weights)
+        _require_non_negative_int(self.seed, "mixed_stride_seed")
+
+    def select(self, *, episode_index: int, chunk_index: int) -> int:
+        _require_non_negative_int(episode_index, "episode_index")
+        _require_non_negative_int(chunk_index, "chunk_index")
+        payload = json.dumps(
+            [self.seed, episode_index, chunk_index], separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        draw = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big") / 2**64
+        total = math.fsum(float(weight) for _, weight in self.weights)
+        threshold = draw * total
+        cumulative = 0.0
+        for stride, weight in self.weights:
+            cumulative += float(weight)
+            if threshold < cumulative:
+                return int(stride)
+        return int(self.weights[-1][0])
+
+    def decision_for(
+        self,
+        *,
+        episode_index: int,
+        frame_idx: int,
+        origin: int,
+        frames_per_chunk: int,
+    ) -> MixedAnchorDecision:
+        schedule = AnchorSchedule(stride=1, frames_per_chunk=frames_per_chunk, origin=origin)
+        target_chunk = schedule.chunk_index(frame_idx)
+        if target_chunk == 0:
+            return MixedAnchorDecision("initial", 0, 0, -1, origin, 0, 0)
+        stride = self.select(episode_index=episode_index, chunk_index=target_chunk)
+        # Option 1b pairs consecutive periodic planner ticks: target tick n is
+        # conditioned on the committed Memory from the previous tick. This makes
+        # K=1 one action chunk stale rather than a current-frame shortcut.
+        anchor_chunk = ((target_chunk - 1) // stride) * stride
+        anchor_frame = origin + anchor_chunk * frames_per_chunk
+        return MixedAnchorDecision(
+            "periodic",
+            stride,
+            target_chunk,
+            anchor_chunk,
+            anchor_frame,
+            target_chunk - anchor_chunk,
+            frame_idx - anchor_frame,
+        )
+
+    def describe(self) -> dict:
+        return {
+            "mode": "per_action_chunk_stable_blake2b",
+            "seed": self.seed,
+            "weights": [[int(k), float(w)] for k, w in self.weights],
+            "key_fields": ["seed", "episode_index", "episode_local_chunk_index"],
+        }
+
+
 def validate_planner_stride_spec(
     planner_stride: int,
     planner_stride_weights: "tuple[tuple[int, float], ...] | None" = None,
@@ -224,10 +307,9 @@ def validate_planner_stride_spec(
     * ``<= 0``: ``-1 % 5 == 4``, so a negative stride yields a plausible-looking
       anchor schedule rather than a crash.
 
-    ``planner_stride_weights`` is the slot for the mixed-K arm (one K drawn per
-    sample).  It is validated here but not implemented: it raises instead of
-    being ignored, since a silently dropped sweep parameter yields a run that is
-    labelled mixed-K and is really single-K.
+    ``planner_stride_weights`` configures the mixed-K arm. Selection itself is
+    owned by :class:`MixedStrideSelector`; this function validates the shared
+    config without silently normalising or dropping entries.
     """
     if isinstance(planner_stride, bool):
         raise TypeError(
@@ -266,8 +348,5 @@ def validate_planner_stride_spec(
         total += float(w)
     if total <= 0:
         raise ValueError("planner_stride_weights sum to 0, which selects nothing")
-    raise NotImplementedError(
-        "planner_stride_weights (mixed-K sampling) is validated but not implemented yet. "
-        "It is rejected rather than ignored: ignoring it would train a single-K run "
-        f"(K={planner_stride}) while labelling it mixed-K. Spec: {planner_stride_weights!r}"
-    )
+    if not math.isfinite(total):
+        raise ValueError(f"planner_stride_weights sum must be finite, got {total}")

@@ -156,6 +156,7 @@ class MemoryRow:
     start: int
     end: int
     previous_memory_text: str
+    current_memory_text: str
     planner_target_text: str
     transition_type: str
 
@@ -219,13 +220,28 @@ class MemoryIntervalIndex:
                 )
             if validate_rows:
                 check_row_consistency(raw)
+            target_text = planner_target_text(raw)
+            # The compact summary is the first canonical Memory field of the
+            # current target. Parse it through the existing owner rather than
+            # treating the five-line target as a summary or reaching around the
+            # text protocol with an independently assembled string.
+            from openpi.models.memory_text import parse_memory_text
+
+            current_memory = parse_memory_text(target_text, strict=True)["memory"]
+            raw_current_memory = str(raw.get("fixed_compact_memory", ""))
+            if current_memory != raw_current_memory:
+                raise MemoryAnnotationError(
+                    f"episode {episode_id} interval {position}: parsed Memory field "
+                    "does not equal fixed_compact_memory"
+                )
             rows.append(
                 MemoryRow(
                     memory_idx=memory_idx,
                     start=start,
                     end=end,
                     previous_memory_text=str(previous_memory),
-                    planner_target_text=planner_target_text(raw),
+                    current_memory_text=current_memory,
+                    planner_target_text=target_text,
                     transition_type=str(raw.get("transition_type", "unknown")),
                 )
             )
