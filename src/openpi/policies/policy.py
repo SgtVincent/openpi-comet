@@ -154,7 +154,10 @@ class Policy(BasePolicy):
         generated_text = None
         if planner_tick:
             planner_observation = make_observation(previous_memory_text)
-            generated_tokens = self._model.predict_subtask_tokens(planner_observation)
+            max_tokens = max(1, int(self._model.config.subtask_max_len) - 1)  # reserve BOS slot
+            generated_tokens = self._model.predict_subtask_tokens(
+                planner_observation, max_tokens=max_tokens
+            )
             texts = self._model.decode_subtask_tokens(generated_tokens)
             generated_text = texts[0] if texts else None
             action_tokens = generated_tokens

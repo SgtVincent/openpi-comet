@@ -39,8 +39,9 @@ class _Model:
     def eval(self):
         return self
 
-    def predict_subtask_tokens(self, observation):
+    def predict_subtask_tokens(self, observation, *, max_tokens=64):
         self.predict_calls += 1
+        self.last_max_tokens = max_tokens
         self.planner_prompt_tokens.append(observation.tokenized_prompt.detach().clone())
         # The marker proves latest state/prompt observation reached the Planner.
         marker = int(observation.tokenized_prompt[0, 0].item())
@@ -96,6 +97,7 @@ def test_planner_returns_raw_ids_and_action_uses_same_current_ids(monkeypatch):
         previous_memory_text="previous", chunk_index=0,
     )
     assert model.predict_calls == 1
+    assert model.last_max_tokens == 7  # test config subtask_max_len=8, one slot reserved for BOS
     assert np.array_equal(out["held_memory_tokens"], np.asarray([107, 1], np.int32))
     assert out["held_memory_text"] == "Memory: 107"
     assert model.planner_prompt_tokens[-1][0, 1].item() == 1  # previous text present for Planner
@@ -221,3 +223,15 @@ def test_policy_config_consumes_annotations_memory_activation(monkeypatch, tmp_p
     assert captured["held_memory_enabled"] is True
     assert captured["memory_post_transforms"] is not None
     assert len(captured["memory_post_transforms"]) == 1  # Normalize is still applied online
+
+
+
+@pytest.mark.parametrize(("budget", "expected"), [(1, 1), (2, 1), (192, 191)])
+def test_planner_generation_budget_reserves_bos(monkeypatch, budget, expected):
+    policy, model = _policy(monkeypatch)
+    model.config.subtask_max_len = budget
+    policy.infer_memory_chunk(
+        _obs(), planner_tick=True, held_memory_tokens=None,
+        previous_memory_text="p", chunk_index=0,
+    )
+    assert model.last_max_tokens == expected
