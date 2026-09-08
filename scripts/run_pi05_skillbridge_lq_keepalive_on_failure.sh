@@ -711,7 +711,7 @@ if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" && "${PREFLIGHT_BLOCKED_BY_MOUNT:-0
         --config "${WEIGHT_PREFLIGHT_CONFIG}" \
         --weight-dir "${BASE_PI05_CKPT:?BASE_PI05_CKPT must be set to the launch checkpoint}" \
         --load-mode "${WEIGHT_PREFLIGHT_LOAD_MODE}" \
-        --hash-mode "$([[ "${PREFLIGHT_TEST_MODE}" == "1" ]] && printf '%s' "${WEIGHT_PREFLIGHT_HASH_MODE}" || printf full)" \
+        --hash-mode "$([[ "${PREFLIGHT_TEST_MODE}" == "1" ]] && printf '%s' "${WEIGHT_PREFLIGHT_HASH_MODE}" || printf sha256)" \
         --expect-size "${PRODUCTION_WEIGHT_SIZE}" \
         --expect-hash "${PRODUCTION_WEIGHT_SHA256}" \
         --verify-sample 8 \

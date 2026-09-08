@@ -188,6 +188,21 @@ def test_positive_control_hash_is_a_real_md5(intact_ckpt: Path):
     assert digest != hashlib.md5(path.read_bytes() + b"x").hexdigest()
 
 
+def test_sha256_hash_is_full_and_detects_one_byte_change(intact_ckpt: Path, tmp_path: Path):
+    path = intact_ckpt / "model.safetensors"
+    algo, digest, covered = gate.hash_file(str(path), "sha256")
+    assert algo == "sha256"
+    assert covered == path.stat().st_size
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    changed = tmp_path / "changed.safetensors"
+    payload = bytearray(path.read_bytes())
+    payload[-1] ^= 1
+    changed.write_bytes(payload)
+    assert changed.stat().st_size == path.stat().st_size  # equal-size mutation
+    assert gate.hash_file(str(changed), "sha256")[1] != digest
+
+
 def test_partial_hash_label_states_its_coverage(intact_ckpt: Path):
     """A partial hash must never be called an md5 and must declare what it covers."""
     path = intact_ckpt / "model.safetensors"

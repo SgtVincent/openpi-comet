@@ -301,7 +301,8 @@ def resolve_weight_source(configured: str | None, *, override_dir: str | None = 
 def hash_file(path: str, mode: str) -> tuple[str, str, int]:
     """Return ``(algo_label, hexdigest, bytes_covered)``.
 
-    ``mode="full"``  -> real md5 over the whole file; label ``md5``.
+    ``mode="full"``  -> real md5 over the whole file; label ``md5`` (legacy).
+    ``mode="sha256"`` -> real SHA-256 over the whole file; label ``sha256``.
     ``mode="partial"`` -> md5 over the first 64 MiB, the last 64 MiB and the
         decimal file size. This is **not** an md5 of the file; the label spells out
         exactly which byte ranges went in, e.g.
@@ -314,6 +315,17 @@ def hash_file(path: str, mode: str) -> tuple[str, str, int]:
     if mode == "none":
         return "none", "-", 0
     size = os.path.getsize(path)
+    if mode == "sha256":
+        digest = hashlib.sha256()
+        covered = 0
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                covered += len(chunk)
+        return "sha256", digest.hexdigest(), covered
     digest = hashlib.md5()
     covered = 0
     if mode == "full":
@@ -1068,7 +1080,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the directory holding model.safetensors (for controls/what-if).",
     )
     parser.add_argument("--load-mode", choices=("real", "stream", "header"), default="real")
-    parser.add_argument("--hash-mode", choices=("full", "partial", "none"), default="full")
+    parser.add_argument("--hash-mode", choices=("sha256", "full", "partial", "none"), default="sha256")
     parser.add_argument(
         "--verify-sample",
         type=int,
