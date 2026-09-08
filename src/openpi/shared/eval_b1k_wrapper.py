@@ -90,7 +90,10 @@ class B1KPolicyWrapper:
         self._held_memory_text: str | None = None
         self._last_env_step: int | None = None
         self._last_step_action = None
+        self._committed_chunk_index: int | None = None
+        self._committed_chunk_actions: np.ndarray | None = None
         self.last_memory_telemetry: dict[str, object] | None = None
+        self._session_closed = False
 
         self.fine_grained_level = fine_grained_level
         self.last_generated_subtask = None
@@ -159,9 +162,34 @@ class B1KPolicyWrapper:
         self._held_memory_text = None
         self._last_env_step = None
         self._last_step_action = None
+        self._committed_chunk_index = None
+        self._committed_chunk_actions = None
         self.last_memory_telemetry = None
 
+    def close_session(self) -> None:
+        """Idempotently release this connection's model and rollout state.
+
+        Disconnect cleanup must not call ``rotate_session``: that would create a
+        new live id while closing the old connection.  Missing model hooks are a
+        supported legacy shape; wrapper-owned state is still cleared.
+        """
+        if self._session_closed:
+            return
+        model = getattr(self.policy, "_model", None)
+        clearer = getattr(model, "clear_session", None) if model is not None else None
+        if callable(clearer):
+            clearer(self._session_id)
+        self.action_queue = deque(maxlen=self.action_horizon)
+        self.cached_actions_remaining = 0
+        self.last_action_chunk = None
+        self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
+        self._reset_held_memory()
+        self.last_generated_subtask = None
+        self.last_prompt_debug = None
+        self._session_closed = True
+
     def reset(self):
+        self._session_closed = False
         self.action_queue = deque(maxlen=self.action_horizon)
         self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         self.step_counter = 0
@@ -178,6 +206,7 @@ class B1KPolicyWrapper:
 
     def rotate_session(self, *, clear_old: bool = True) -> None:
         """Start a fresh model runtime session without resetting task / plan state."""
+        self._session_closed = False
         old_session_id = self._session_id
         model = getattr(self.policy, "_model", None)
         if clear_old and model is not None:
@@ -194,10 +223,10 @@ class B1KPolicyWrapper:
         self.last_policy_inferred = False
         self.last_generated_subtask = None
         self.last_prompt_debug = None
-        # rotate_session is a skill/runtime rotation inside one episode.  Keep
-        # absolute env clock and held Memory; only discard the action queue and
-        # model session-local KV/subtask state.
-        self._last_step_action = None
+        # rotate_session is a skill/runtime rotation inside one episode. Keep
+        # the absolute clock, held Memory and last committed action so an
+        # in-flight same-step retry remains idempotent. Only model session-local
+        # KV/subtask state and queued future actions are discarded.
         self._maybe_set_active_session()
         self._maybe_reset_streaming_state()
         logger.info("Rotated policy session from %s to %s", old_session_id, self._session_id)
@@ -214,6 +243,7 @@ class B1KPolicyWrapper:
         session = copy.copy(self)
         session._session_generation = 0
         session._session_id = id(session)
+        session._session_closed = False
         session.action_queue = deque(maxlen=self.action_horizon)
         session.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         session.step_counter = 0
@@ -479,11 +509,18 @@ class B1KPolicyWrapper:
                 return torch.as_tensor(self._last_step_action.copy(), dtype=torch.float32)
 
         chunk_index, offset = divmod(env_step, 32)
-        # Server requests are sparse, but a new action chunk must begin at its
-        # absolute boundary. Missing cached steps cannot be reconstructed from a
-        # later observation without changing the rollout.
-        if offset != 0:
-            raise ValueError(f"new HeldMemory chunk request must be aligned to 32 steps; got env_step={env_step}")
+        if self._committed_chunk_index == chunk_index:
+            if self._committed_chunk_actions is None:
+                raise RuntimeError(f"chunk {chunk_index} was committed without actions")
+            final_action = self._committed_chunk_actions[offset : offset + 1].copy()
+            self._last_env_step = env_step
+            self._last_step_action = final_action.copy()
+            self.cached_actions_remaining = max(0, 31 - offset)
+            self.last_memory_telemetry = {
+                **(self.last_memory_telemetry or {}), "env_step": env_step,
+                "chunk_index": chunk_index, "retry": False,
+            }
+            return torch.as_tensor(final_action, dtype=torch.float32)
 
         processed = self.process_obs(input_obs)
         nbatch = copy.deepcopy(processed)
@@ -499,8 +536,9 @@ class B1KPolicyWrapper:
         if "subtask_text" in input_obs:
             raise ValueError("fixed-K P1 refuses MoMA + explicit subtask_text until slot semantics are defined")
 
-        tick = self._memory_rollout.begin_chunk(chunk_index)
-        planner_tick = tick.is_planner_tick
+        # Pure schedule query: begin_chunk mutates `_seen_chunks`, so it cannot be
+        # called until after the whole inference result is validated.
+        planner_tick = self._memory_rollout.is_planner_tick(chunk_index)
         previous_text = self._held_memory_text if self._held_memory_text is not None else INITIAL_PREVIOUS_MEMORY
         action = self.policy.infer_memory_chunk(
             batch,
@@ -509,22 +547,30 @@ class B1KPolicyWrapper:
             previous_memory_text=previous_text,
             chunk_index=chunk_index,
         )
+        new_tokens = action.get("held_memory_tokens") if planner_tick else None
+        new_text = action.get("held_memory_text") if planner_tick else None
+        if planner_tick and (new_tokens is None or not new_text):
+            raise RuntimeError(f"planner chunk {chunk_index} returned no usable Memory")
+        if not planner_tick and self._held_memory_tokens is None:
+            raise RuntimeError(f"fast chunk {chunk_index} has no held Memory")
+        if "actions" not in action:
+            raise ValueError("HeldMemory inference returned no actions")
+        actions = np.asarray(action["actions"], dtype=np.float32)
+        if actions.shape != (32, 23) or not np.isfinite(actions).all():
+            raise ValueError(f"HeldMemory requires finite actions shaped (32, 23), got {actions.shape}")
+
+        # Atomic commit begins only after every model output has been validated.
+        self._memory_rollout.begin_chunk(chunk_index)
         if planner_tick:
-            new_tokens = action.get("held_memory_tokens")
-            new_text = action.get("held_memory_text")
-            if new_tokens is None or not new_text:
-                raise RuntimeError(f"planner chunk {chunk_index} returned no usable Memory")
             self._memory_rollout.commit_planner_output(new_tokens, text=str(new_text))
             self._held_memory_tokens = np.asarray(new_tokens, dtype=np.int32).copy()
             self._held_memory_text = str(new_text)
-        elif self._held_memory_tokens is None:
-            raise RuntimeError(f"fast chunk {chunk_index} has no held Memory")
-
-        actions = np.asarray(action["actions"][:32], dtype=np.float32)
-        if len(actions) != 32:
-            raise ValueError(f"HeldMemory requires 32 actions, model returned {len(actions)}")
+        self._committed_chunk_index = chunk_index
+        self._committed_chunk_actions = actions.copy()
         self.last_action_chunk = actions.copy()
         self.action_queue = deque([a for a in actions])
+        for _ in range(offset):
+            self.action_queue.popleft()
         final_action = self.action_queue.popleft()[None]
         self.cached_actions_remaining = len(self.action_queue)
         self.last_action = action
