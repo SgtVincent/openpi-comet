@@ -244,12 +244,21 @@ def test_real_mix_c_sample_and_memory_provenance_share_one_decision():
         "memory_chunk_lag",
         "memory_frame_lag",
     )
-    for frame in (0, 320):
+    expected = {
+        0: (0, "initial", 0, 0),
+        256: (5, "periodic", 160, 3),
+        384: (10, "periodic", 320, 2),
+    }
+    for frame, (stride, kind, anchor_frame, chunk_lag) in expected.items():
         sample = dataset.sample_for_frame(episode, frame, decode_observations=False)
         provenance = dataset.memory_provenance(episode, frame)
         assert {field: sample[field] for field in fields} == {
             field: provenance[field] for field in fields
         }
+        assert sample["memory_selected_stride"] == stride
+        assert sample["memory_anchor_kind"] == kind
+        assert sample["memory_anchor_frame"] == anchor_frame
+        assert sample["memory_chunk_lag"] == chunk_lag
 
 
 class TestFactoryCreateEndToEnd:
