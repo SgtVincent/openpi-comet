@@ -297,6 +297,51 @@ def test_real_mix_c_sample_and_memory_provenance_share_one_decision():
         assert sample["memory_anchor_frame"] == anchor_frame
         assert sample["memory_chunk_lag"] == chunk_lag
 
+        # Drive the exact post-Dataset production transform sequence without
+        # decoding video pixels. The three image placeholders already have the
+        # real shape/dtype expected by B1kInputs; all text/provenance comes from
+        # the real Dataset row above.
+        item = _item()
+        item["action"] = item.pop("actions")
+        item["task"] = item["prompt"]
+        item["observation.images.rgb.head"] = item.pop("observation/egocentric_camera")
+        item["observation.images.rgb.left_wrist"] = item.pop("observation/wrist_image_left")
+        item["observation.images.rgb.right_wrist"] = item.pop("observation/wrist_image_right")
+        item["observation.state"] = item.pop("observation/state")
+        for key in ("memory_text", "previous_memory_text", *MEMORY_TELEMETRY_KEYS):
+            item[key] = sample[key]
+        repack = data_config.repack_transforms.inputs[0](item)
+        transformed = data_config.data_transforms.inputs[0](repack)
+        tokenized = data_config.model_transforms.inputs[-2](transformed)
+        from openpi.training.data_loader import _collate_fn
+        import torch
+
+        batch = _collate_fn([tokenized])
+        batch = {key: torch.as_tensor(value) if isinstance(value, np.ndarray) else value for key, value in batch.items()}
+        observation = _model.Observation.from_dict(batch)
+        assert int(observation.memory_selected_stride) == stride
+        assert int(observation.memory_chunk_lag) == chunk_lag
+
+        import importlib.util
+        script = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "train_accelerate.py"
+        spec = importlib.util.spec_from_file_location("mixc_e2e_train_accelerate", script)
+        trainer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(trainer)
+        metrics, model_observation = trainer._memory_telemetry_from_observation(observation)
+        assert metrics[f"memory_k{stride}_count"] == 1
+        expected_model_observation = observation.without_memory_telemetry()
+        assert torch.equal(model_observation.state, expected_model_observation.state)
+        assert model_observation.images.keys() == expected_model_observation.images.keys()
+        for image_key in model_observation.images:
+            assert np.array_equal(
+                np.asarray(model_observation.images[image_key]),
+                np.asarray(expected_model_observation.images[image_key]),
+            )
+        assert model_observation.memory_selected_stride is None
+        assert model_observation.memory_anchor_kind is None
+        assert model_observation.memory_chunk_lag is None
+        assert model_observation.memory_frame_lag is None
+
 
 class TestFactoryCreateEndToEnd:
     """The gap the direct-helper tests leave open.
