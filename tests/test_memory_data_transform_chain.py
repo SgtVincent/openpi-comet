@@ -216,6 +216,42 @@ class TestMemoryTrainConfig:
         assert mm.make_memory_train_config(name="probe", planner_stride=k).model.planner_stride == k
 
 
+def test_real_mix_c_sample_and_memory_provenance_share_one_decision():
+    import dataclasses
+    import pathlib
+
+    import pytest
+
+    pytest.importorskip("behavior.learning.datas.dataset")
+    from openpi.training import data_loader
+    from openpi.training.train_config import get_config
+
+    cfg = get_config("pi05_moma_memory_b1k-mix-c")
+    factory = cfg.data[0] if isinstance(cfg.data, (list, tuple)) else cfg.data
+    factory = dataclasses.replace(
+        factory,
+        base_config=dataclasses.replace(factory.base_config, episodes_index=[0]),
+    )
+    data_config = factory.create(pathlib.Path(cfg.assets_base_dir), cfg.model)
+    dataset = data_loader.create_torch_dataset(data_config, cfg.model.action_horizon, cfg.model)._dataset
+    episode = int(dataset.episodes[0])
+    fields = (
+        "memory_selected_stride",
+        "memory_anchor_kind",
+        "memory_anchor_frame",
+        "memory_anchor_interval_idx",
+        "memory_target_interval_idx",
+        "memory_chunk_lag",
+        "memory_frame_lag",
+    )
+    for frame in (0, 320):
+        sample = dataset.sample_for_frame(episode, frame, decode_observations=False)
+        provenance = dataset.memory_provenance(episode, frame)
+        assert {field: sample[field] for field in fields} == {
+            field: provenance[field] for field in fields
+        }
+
+
 class TestFactoryCreateEndToEnd:
     """The gap the direct-helper tests leave open.
 
