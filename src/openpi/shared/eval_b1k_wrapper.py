@@ -13,6 +13,9 @@ from openpi_client.image_tools import resize_with_pad
 import torch
 import torch.nn.functional as F
 
+from openpi.models.memory_text import INITIAL_PREVIOUS_MEMORY
+from openpi.policies.memory_rollout import HeldMemoryRollout
+
 logger = logging.getLogger("policy")
 logger.setLevel(20)  # info
 
@@ -42,6 +45,8 @@ class B1KPolicyWrapper:
         action_horizon: int = 5,  # temporal ensemble mode | receeding temporal mode
         temporal_ensemble_max: int = 3,  # receeding temporal mode
         fine_grained_level: int = 0,
+        held_memory_enabled: bool = False,
+        planner_stride: int = 5,
     ) -> None:
         self.policy = policy
         self.task_name = task_name
@@ -70,6 +75,22 @@ class B1KPolicyWrapper:
         self.last_policy_inferred = False
         self.cached_actions_remaining = 0
         self.last_action_chunk = None
+
+        self.held_memory_enabled = bool(held_memory_enabled)
+        self.planner_stride = int(planner_stride)
+        if self.held_memory_enabled:
+            if self.control_mode != "receeding_horizon":
+                raise ValueError("HeldMemory requires control_mode='receeding_horizon'")
+            if self.max_len != 32:
+                raise ValueError(f"HeldMemory requires 32 actions per chunk, got max_len={self.max_len}")
+            if not hasattr(self.policy, "infer_memory_chunk"):
+                raise ValueError("HeldMemory requires a policy with infer_memory_chunk()")
+        self._memory_rollout = HeldMemoryRollout(stride=self.planner_stride)
+        self._held_memory_tokens = None
+        self._held_memory_text: str | None = None
+        self._last_env_step: int | None = None
+        self._last_step_action = None
+        self.last_memory_telemetry: dict[str, object] | None = None
 
         self.fine_grained_level = fine_grained_level
         self.last_generated_subtask = None
@@ -127,7 +148,18 @@ class B1KPolicyWrapper:
             "prompt_override_used": self.prompt_override is not None,
             "control_mode": self.control_mode,
             "fine_grained_level": self.fine_grained_level,
+            "held_memory_enabled": self.held_memory_enabled,
+            "planner_stride": self.planner_stride if self.held_memory_enabled else None,
+            "action_chunk_steps": 32 if self.held_memory_enabled else None,
         }
+
+    def _reset_held_memory(self) -> None:
+        self._memory_rollout = HeldMemoryRollout(stride=self.planner_stride)
+        self._held_memory_tokens = None
+        self._held_memory_text = None
+        self._last_env_step = None
+        self._last_step_action = None
+        self.last_memory_telemetry = None
 
     def reset(self):
         self.action_queue = deque(maxlen=self.action_horizon)
@@ -136,6 +168,7 @@ class B1KPolicyWrapper:
         self.last_policy_inferred = False
         self.cached_actions_remaining = 0
         self.last_action_chunk = None
+        self._reset_held_memory()
         self._maybe_set_active_session()
         self._maybe_reset_streaming_state()
         self.last_generated_subtask = None
@@ -161,6 +194,10 @@ class B1KPolicyWrapper:
         self.last_policy_inferred = False
         self.last_generated_subtask = None
         self.last_prompt_debug = None
+        # rotate_session is a skill/runtime rotation inside one episode.  Keep
+        # absolute env clock and held Memory; only discard the action queue and
+        # model session-local KV/subtask state.
+        self._last_step_action = None
         self._maybe_set_active_session()
         self._maybe_reset_streaming_state()
         logger.info("Rotated policy session from %s to %s", old_session_id, self._session_id)
@@ -183,6 +220,7 @@ class B1KPolicyWrapper:
         session.last_policy_inferred = False
         session.cached_actions_remaining = 0
         session.last_action_chunk = None
+        session._reset_held_memory()
         session.last_generated_subtask = None
         session.last_prompt_debug = None
 
@@ -230,6 +268,8 @@ class B1KPolicyWrapper:
             "observation": img_obs,  # Shape: (1, 3, H, W, C)
             "proprio": prop_state,
         }
+        if "env_step" in obs:
+            processed_obs["env_step"] = obs["env_step"]
 
         if "robot_r1::robot_r1:zed_link:Camera:0::depth_linear" in obs:
             depth_obs = torch.as_tensor(
@@ -417,7 +457,97 @@ class B1KPolicyWrapper:
 
         return torch.as_tensor(final_action, dtype=torch.float32)
 
+    @staticmethod
+    def _absolute_env_step(raw_obs: dict) -> int:
+        value = raw_obs.get("env_step")
+        if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)) or int(value) < 0:
+            raise ValueError(
+                "HeldMemory requires caller-provided absolute env_step (non-negative int); "
+                "wrapper counters and inference counts are forbidden fallbacks."
+            )
+        return int(value)
+
+    def _act_held_memory(self, input_obs: dict):
+        env_step = self._absolute_env_step(input_obs)
+        if self._last_env_step is not None:
+            if env_step < self._last_env_step:
+                raise ValueError(f"env_step moved backwards: {env_step} < {self._last_env_step}")
+            if env_step == self._last_env_step:
+                if self._last_step_action is None:
+                    raise RuntimeError("same-step retry has no committed action")
+                self.last_memory_telemetry = {**(self.last_memory_telemetry or {}), "retry": True}
+                return torch.as_tensor(self._last_step_action.copy(), dtype=torch.float32)
+
+        chunk_index, offset = divmod(env_step, 32)
+        # Server requests are sparse, but a new action chunk must begin at its
+        # absolute boundary. Missing cached steps cannot be reconstructed from a
+        # later observation without changing the rollout.
+        if offset != 0:
+            raise ValueError(f"new HeldMemory chunk request must be aligned to 32 steps; got env_step={env_step}")
+
+        processed = self.process_obs(input_obs)
+        nbatch = copy.deepcopy(processed)
+        if nbatch["observation"].shape[-1] != 3:
+            nbatch["observation"] = np.transpose(nbatch["observation"], (0, 1, 3, 4, 2))
+        batch = {
+            "observation/egocentric_camera": nbatch["observation"][0, 0],
+            "observation/wrist_image_left": nbatch["observation"][0, 1],
+            "observation/wrist_image_right": nbatch["observation"][0, 2],
+            "observation/state": nbatch["proprio"][0],
+            "prompt": self.task_prompt,
+        }
+        if "subtask_text" in input_obs:
+            raise ValueError("fixed-K P1 refuses MoMA + explicit subtask_text until slot semantics are defined")
+
+        tick = self._memory_rollout.begin_chunk(chunk_index)
+        planner_tick = tick.is_planner_tick
+        previous_text = self._held_memory_text if self._held_memory_text is not None else INITIAL_PREVIOUS_MEMORY
+        action = self.policy.infer_memory_chunk(
+            batch,
+            planner_tick=planner_tick,
+            held_memory_tokens=self._held_memory_tokens,
+            previous_memory_text=previous_text,
+            chunk_index=chunk_index,
+        )
+        if planner_tick:
+            new_tokens = action.get("held_memory_tokens")
+            new_text = action.get("held_memory_text")
+            if new_tokens is None or not new_text:
+                raise RuntimeError(f"planner chunk {chunk_index} returned no usable Memory")
+            self._memory_rollout.commit_planner_output(new_tokens, text=str(new_text))
+            self._held_memory_tokens = np.asarray(new_tokens, dtype=np.int32).copy()
+            self._held_memory_text = str(new_text)
+        elif self._held_memory_tokens is None:
+            raise RuntimeError(f"fast chunk {chunk_index} has no held Memory")
+
+        actions = np.asarray(action["actions"][:32], dtype=np.float32)
+        if len(actions) != 32:
+            raise ValueError(f"HeldMemory requires 32 actions, model returned {len(actions)}")
+        self.last_action_chunk = actions.copy()
+        self.action_queue = deque([a for a in actions])
+        final_action = self.action_queue.popleft()[None]
+        self.cached_actions_remaining = len(self.action_queue)
+        self.last_action = action
+        self.last_policy_inferred = True
+        self._last_env_step = env_step
+        self._last_step_action = final_action.copy()
+        stats = self._memory_rollout.stats()
+        self.last_memory_telemetry = {
+            "env_step": env_step,
+            "chunk_index": chunk_index,
+            "planner_tick": planner_tick,
+            "planner_calls": stats["planner_calls"],
+            "planner_fallbacks": stats["planner_fallbacks"],
+            "planner_stride": stats["planner_stride"],
+            "memory_generation": stats["memory_generation"],
+            "retry": False,
+        }
+        self.last_generated_subtask = self._held_memory_text
+        return torch.as_tensor(final_action, dtype=torch.float32)
+
     def act(self, input_obs):
+        if self.held_memory_enabled:
+            return self._act_held_memory(input_obs)
         # TODO reformat data into the correct format for the model
         # TODO: communicate with justin that we are using numpy to pass the data. Also we are passing in uint8 for images
         """

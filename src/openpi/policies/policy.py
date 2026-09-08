@@ -16,6 +16,7 @@ from typing_extensions import override
 from openpi import transforms as _transforms
 from openpi.models import memory_cache as _memory_cache
 from openpi.models import model as _model
+from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -34,6 +35,8 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        held_memory_enabled: bool = False,
+        memory_post_transforms: Sequence[_transforms.DataTransformFn] = (),
     ):
         """Initialize the Policy.
 
@@ -55,6 +58,8 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._held_memory_enabled = bool(held_memory_enabled)
+        self._memory_post_transform = _transforms.compose(memory_post_transforms)
         # MoMA-VLA held state (design section 2.2 / 4.4). Cache token IDs only;
         # persisting a prefix KV would also persist stale image and state.
         self._memory_cache = _memory_cache.MemoryTokenCache()
@@ -88,6 +93,98 @@ class Policy(BasePolicy):
         """Drop held memory at an explicit episode boundary."""
         self._memory_cache.invalidate(reason)
         self._cached_subtask_prompt = None
+
+
+    def infer_memory_chunk(
+        self,
+        obs: dict,
+        *,
+        planner_tick: bool,
+        held_memory_tokens: Any | None,
+        previous_memory_text: str | None,
+        chunk_index: int,
+        noise: np.ndarray | None = None,
+    ) -> dict:
+        """Run one stateless MoMA action chunk on the caller-owned held memory.
+
+        The wrapper owns time and memory.  This method owns only model execution:
+        every call starts again from the supplied raw observation, so image/state
+        and prefix KV are rebuilt for this chunk.  Raw generated token ids (without
+        BOS) are returned to the wrapper; no KV/cache object crosses the boundary.
+        """
+        if not self._is_pytorch_model or not hasattr(self._model, "predict_subtask_tokens"):
+            raise RuntimeError("HeldMemory inference requires the PyTorch PI05_SUBTASK model")
+        if "subtask_text" in obs:
+            raise ValueError(
+                "MoMA HeldMemory and explicit subtask_text share the action conditioning slot; "
+                "this fixed-K P1 path refuses the ambiguous combination."
+            )
+        if not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0:
+            raise ValueError(f"chunk_index must be a non-negative int, got {chunk_index!r}")
+
+        # Build the latest-observation base once.  Runtime memory fields are
+        # injected after B1kInputs/Normalize and before tokenization; the strict
+        # offline Memory transform is intentionally bypassed here because there
+        # is no teacher-forced current-memory target online.
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._memory_post_transform(self._input_transform(inputs))
+        if "state" not in inputs or "prompt" not in inputs:
+            raise ValueError("runtime Memory inference requires transformed state and prompt")
+
+        tokenizer = getattr(self, "_held_memory_tokenizer", None)
+        if tokenizer is None:
+            tokenizer = _tokenizer.SubtaskTokenizer(
+                prompt_max_len=int(self._model.config.max_token_len),
+                subtask_max_len=int(self._model.config.subtask_max_len),
+            )
+            self._held_memory_tokenizer = tokenizer
+        prompt = inputs.pop("prompt")
+        prompt_tokens, prompt_mask = tokenizer.tokenize_prompt(
+            str(prompt), np.asarray(inputs["state"]), previous_memory=previous_memory_text
+        )
+        inputs = {**inputs, "tokenized_prompt": prompt_tokens, "tokenized_prompt_mask": prompt_mask}
+        device_inputs = jax.tree.map(
+            lambda x: torch.from_numpy(np.asarray(x)).to(self._pytorch_device)[None, ...], inputs
+        )
+        observation = _model.Observation.from_dict(device_inputs)
+
+        generated_tokens = None
+        generated_text = None
+        if planner_tick:
+            generated_tokens = self._model.predict_subtask_tokens(observation)
+            texts = self._model.decode_subtask_tokens(generated_tokens)
+            generated_text = texts[0] if texts else None
+            action_tokens = generated_tokens
+        else:
+            if held_memory_tokens is None:
+                raise ValueError(f"chunk {chunk_index} is a fast tick but held_memory_tokens is empty")
+            action_tokens = torch.as_tensor(held_memory_tokens, dtype=torch.int32, device=self._pytorch_device)
+            if action_tokens.ndim == 1:
+                action_tokens = action_tokens[None, ...]
+
+        conditioned = self._model.build_hierarchical_observation(observation, action_tokens)
+        mask = conditioned.subtask_mask
+        if mask is None or not bool(torch.any(mask).item()):
+            raise RuntimeError("held Memory tokens did not enter the action sequence (subtask mask is all false)")
+
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise_t = torch.as_tensor(noise, device=self._pytorch_device)
+            if noise_t.ndim == 2:
+                noise_t = noise_t[None, ...]
+            sample_kwargs["noise"] = noise_t
+        actions = self._sample_actions(self._pytorch_device, conditioned, **sample_kwargs)
+        raw_tokens = None if generated_tokens is None else np.asarray(generated_tokens[0].detach().cpu())
+        outputs = self._output_transform(
+            {"state": np.asarray(inputs["state"]), "actions": np.asarray(actions[0].detach().cpu())}
+        )
+        # Output transforms intentionally own only robot actions and may rebuild
+        # the dict (B1kOutputs does). Runtime Memory is protocol metadata, so
+        # attach it afterwards or it silently disappears before the wrapper can
+        # commit a Planner result.
+        outputs["held_memory_tokens"] = raw_tokens
+        outputs["held_memory_text"] = generated_text
+        return outputs
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -178,6 +275,18 @@ class PolicyRecorder(_base_policy.BasePolicy):
     def reset(self) -> None:
         """Forward episode reset so held Memory cannot leak across episodes."""
         self._policy.reset()
+
+    def infer_memory_chunk(self, obs: dict, **kwargs) -> dict:
+        """Forward the stateless Memory chunk API without owning rollout state."""
+        return self._policy.infer_memory_chunk(obs, **kwargs)
+
+    @property
+    def held_memory_enabled(self) -> bool:
+        return bool(getattr(self._policy, "_held_memory_enabled", False))
+
+    @property
+    def model_config(self):
+        return getattr(getattr(self._policy, "_model", None), "config", None)
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
