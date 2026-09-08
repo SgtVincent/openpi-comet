@@ -2,10 +2,9 @@
 set -euo pipefail
 
 # ============================================================
-# MoMA-VLA HeldMemory-K fixed-compact-Memory BF16 training
-# for Merlin/Arnold on LQ (cloudnative-lq) cluster.
+# MoMA-VLA HeldMemory-K fixed-compact-Memory BF16 training for Merlin H20.
 #
-# Topology: 4 nodes × 8 A100-SXM4-40GB = 32 GPUs
+# Topology: 4 nodes × 8 H20 = 32 GPUs
 # Config  : pi05_moma_memory_b1k-k5
 # Data    : B1K fixed compact Memory (10,000 episodes)
 # Budget  : registered config pi05_moma_memory_b1k-k5
@@ -20,12 +19,28 @@ fi
 cd "${REPO_ROOT}"
 
 export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 export PYTHONNOUSERSITE=1
 unset PYTHONHOME
 
-# ---- LQ cluster paths ----
-CONDA_ROOT="${CONDA_ROOT:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/miniconda3}"
+# ---- H20 runtime overlay: order is load-bearing ----------------------------
+# extra_bashrc applies the production numpy/wandb/OCCUPIER_PYTHON overlay only
+# when H20_ARM is already non-empty. Source it after exporting the arm, then
+# assert the resolved numpy rather than merely trusting PYTHONPATH text.
+export H20_ARM="${H20_ARM:-MOMA}"
+export OPENPI_H20_ARM="${OPENPI_H20_ARM:-MOMA}"
+export OPENPI_H20_MODE="${OPENPI_H20_MODE:-formal}"
+EXTRA_BASHRC="${EXTRA_BASHRC:-/mnt/bn/behavior-data-hl/chenjunting/repo/extra_bashrc.sh}"
+[[ -s "${EXTRA_BASHRC}" ]] || { echo "ERROR: H20 extra_bashrc missing/empty: ${EXTRA_BASHRC}" >&2; exit 1; }
+# extra_bashrc is primarily an interactive shell fragment and reads
+# PROMPT_COMMAND unguarded. Define it for this non-interactive, set-u launcher;
+# the H20 overlay block above that line remains the load-bearing part.
+: "${PROMPT_COMMAND:=}"
+# shellcheck disable=SC1090
+source "${EXTRA_BASHRC}"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+# ---- H20 conda environment ----
+CONDA_ROOT="${CONDA_ROOT:-/mnt/bn/behavior-data-hl/chenjunting/miniconda3}"
 CONDA_ENV="${CONDA_ENV:-openpi-comet-nas}"
 CONDA_SH="${CONDA_ROOT}/etc/profile.d/conda.sh"
 if [[ ! -f "${CONDA_SH}" ]]; then
@@ -36,6 +51,18 @@ fi
 source "${CONDA_SH}"
 conda activate "${CONDA_ENV}"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+python - <<'PY'
+import os
+import numpy
+expected = "/mnt/bn/navigation-hl/mlx/users/chenjunting/h20_fastce/pyoverlay"
+print(f"NUMPY_VERSION={numpy.__version__}")
+print(f"NUMPY_FILE={numpy.__file__}")
+if numpy.__version__ != "2.3.5":
+    raise SystemExit(f"ERROR: H20 runtime requires numpy 2.3.5, got {numpy.__version__}")
+if not os.path.realpath(numpy.__file__).startswith(os.path.realpath(expected) + os.sep):
+    raise SystemExit(f"ERROR: numpy did not resolve from H20 overlay {expected}: {numpy.__file__}")
+print("H20_NUMPY_OVERLAY_OK")
+PY
 
 CONFIG_NAME="${CONFIG_NAME:-pi05_moma_memory_b1k-k5}"
 if [[ "${CONFIG_NAME}" != "pi05_moma_memory_b1k-k5" && "${CONFIG_NAME}" != "pi05_moma_memory_b1k-k5_smoke" ]]; then
@@ -187,8 +214,8 @@ PY
 
 # Offline tokenizer bootstrap.
 # NOTE: the tokenizer cache is NOT part of the Git checkout (untracked).
-# Default to the canonical LQ NAS path; allow env override for custom setups.
-REPO_OPENPI_CACHE="${REPO_OPENPI_CACHE:-/mnt/bn/saiwenresearch/mlx/users/chenjunting/repo/openpi-comet/.cache/openpi}"
+# Default to the canonical H20-visible NAS path; allow env override for custom setups.
+REPO_OPENPI_CACHE="${REPO_OPENPI_CACHE:-/mnt/bn/behavior-data-hl/chenjunting/repo/openpi-comet/.cache/openpi}"
 TOKENIZER_REL="big_vision/paligemma_tokenizer.model"
 TOKENIZER_SOURCE="${REPO_OPENPI_CACHE}/${TOKENIZER_REL}"
 TOKENIZER_LOCAL="${OPENPI_DATA_HOME}/${TOKENIZER_REL}"
@@ -235,7 +262,7 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-180
 export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
 
 # ============================================================
-# Topology: strict 4×8 = 32 GPUs for formal LQ trial
+# Topology: strict 4×8 = 32 GPUs for formal H20 trial
 # ============================================================
 NUM_NODES="${NUM_NODES:-${NNODES:-${ARNOLD_WORKER_NUM:-}}}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-${NPROC_PER_NODE:-${ARNOLD_WORKER_GPU:-}}}"
@@ -246,27 +273,27 @@ MASTER_PORT="${MASTER_PORT%%,*}"
 
 # Formal script: fail fast if critical Arnold vars are missing
 if [[ -z "${NUM_NODES}" ]]; then
-  echo "ERROR: NUM_NODES / ARNOLD_WORKER_NUM is required for formal LQ launch." >&2
+  echo "ERROR: NUM_NODES / ARNOLD_WORKER_NUM is required for formal H20 launch." >&2
   echo "       (use ARNOLD_WORKER_NUM or set NUM_NODES explicitly)" >&2
   exit 2
 fi
 if [[ -z "${GPUS_PER_NODE}" ]]; then
-  echo "ERROR: GPUS_PER_NODE / ARNOLD_WORKER_GPU is required for formal LQ launch." >&2
+  echo "ERROR: GPUS_PER_NODE / ARNOLD_WORKER_GPU is required for formal H20 launch." >&2
   echo "       (use ARNOLD_WORKER_GPU or set GPUS_PER_NODE explicitly)" >&2
   exit 2
 fi
 if [[ -z "${NODE_RANK}" ]]; then
-  echo "ERROR: NODE_RANK / ARNOLD_ID is required for formal LQ launch." >&2
+  echo "ERROR: NODE_RANK / ARNOLD_ID is required for formal H20 launch." >&2
   echo "       (use ARNOLD_ID or set NODE_RANK explicitly)" >&2
   exit 2
 fi
 if [[ -z "${MASTER_ADDR}" ]]; then
-  echo "ERROR: MASTER_ADDR / ARNOLD_WORKER_0_HOST is required for formal LQ multi-node launch." >&2
+  echo "ERROR: MASTER_ADDR / ARNOLD_WORKER_0_HOST is required for formal H20 multi-node launch." >&2
   echo "       (use ARNOLD_WORKER_0_HOST or set MASTER_ADDR explicitly)" >&2
   exit 2
 fi
 if [[ -z "${MASTER_PORT}" ]]; then
-  echo "ERROR: MASTER_PORT / ARNOLD_WORKER_0_PORT is required for formal LQ multi-node launch." >&2
+  echo "ERROR: MASTER_PORT / ARNOLD_WORKER_0_PORT is required for formal H20 multi-node launch." >&2
   echo "       (use ARNOLD_WORKER_0_PORT or set MASTER_PORT explicitly)" >&2
   exit 2
 fi
@@ -285,15 +312,15 @@ TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
 # Strict 4×8 = 32 GPU constraint for this formal trial script
 if [[ "${NUM_NODES}" != "4" ]]; then
-  echo "ERROR: this LQ formal script requires NUM_NODES=4, got ${NUM_NODES}." >&2
+  echo "ERROR: this H20 formal script requires NUM_NODES=4, got ${NUM_NODES}." >&2
   exit 2
 fi
 if [[ "${GPUS_PER_NODE}" != "8" ]]; then
-  echo "ERROR: this LQ formal script requires GPUS_PER_NODE=8, got ${GPUS_PER_NODE}." >&2
+  echo "ERROR: this H20 formal script requires GPUS_PER_NODE=8, got ${GPUS_PER_NODE}." >&2
   exit 2
 fi
 if [[ "${TOTAL_GPUS}" != "32" ]]; then
-  echo "ERROR: this LQ formal script requires TOTAL_GPUS=32, got ${TOTAL_GPUS}." >&2
+  echo "ERROR: this H20 formal script requires TOTAL_GPUS=32, got ${TOTAL_GPUS}." >&2
   exit 2
 fi
 
@@ -307,7 +334,10 @@ VAL_LOG_INTERVAL="${VAL_LOG_INTERVAL:-100}"
 VAL_NUM_BATCHES="${VAL_NUM_BATCHES:-20}"
 KEEP_PERIOD="${KEEP_PERIOD:-5000}"
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-1}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+# Full-10k per-worker RSS scaling on the target H20 is still unmeasured. Use the
+# smallest multiprocessing setting that exercises a real worker; raise only
+# after the 1/2/4/8 memory campaign has measured an upper bound.
+NUM_WORKERS="${NUM_WORKERS:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 PYTORCH_TRAINING_PRECISION="${PYTORCH_TRAINING_PRECISION:-bfloat16}"
 if [[ "${PYTORCH_TRAINING_PRECISION}" != "bfloat16" ]]; then
@@ -476,6 +506,7 @@ echo "PRECISION=${PYTORCH_TRAINING_PRECISION} / Accelerate bf16"
 echo "BUDGET=min(${NUM_TRAIN_STEPS} steps, ${NUM_TRAIN_EPOCHS} epoch)"
 echo "INTERVALS=validation ${VAL_LOG_INTERVAL}, save ${SAVE_INTERVAL}"
 echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
+echo "NUM_WORKERS=${NUM_WORKERS} (conservative default pending H20 1/2/4/8 RSS measurement)"
 echo "LOCAL_CACHE_ROOT=${LOCAL_CACHE_ROOT}"
 echo "PERSISTENT_OUTPUT_ROOT=${PERSISTENT_OUTPUT_ROOT}"
 echo "CONSOLE_LOG=${CONSOLE_LOG}"

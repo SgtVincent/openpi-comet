@@ -586,9 +586,25 @@ trap 'on_signal INT' INT
 # mount vanished -- the only place the evidence exists.
 if [[ "${MOUNT_PREFLIGHT_ENABLE:-1}" == "1" ]]; then
   MOUNT_PREFLIGHT_SH="${MOUNT_PREFLIGHT_SH:-${REPO_ROOT}/scripts/hier/mount_preflight.sh}"
-  log "STEP 0/4: per-rank mount preflight: ${MOUNT_PREFLIGHT_SH}"
-  bash "${MOUNT_PREFLIGHT_SH}" 2>&1 | tee -a "${WRAPPER_LOG}"
-  MOUNT_PREFLIGHT_RC="${PIPESTATUS[0]}"  # NOT $? -- after a pipeline that is tee's rc
+  if [[ -z "${MOUNT_PREFLIGHT_RUN_KEY:-}" ]]; then
+    ATTEMPT_KEY_SH="${ATTEMPT_KEY_SH:-${REPO_ROOT}/scripts/hier/attempt_key_handshake.sh}"
+    MOUNT_PREFLIGHT_RUN_KEY="$(bash "${ATTEMPT_KEY_SH}")"
+    ATTEMPT_KEY_RC=$?
+    if [[ "${ATTEMPT_KEY_RC}" -ne 0 || -z "${MOUNT_PREFLIGHT_RUN_KEY}" ]]; then
+      log_err "FATAL: could not establish a shared per-attempt mount key rc=${ATTEMPT_KEY_RC}"
+      MOUNT_PREFLIGHT_RC=16
+      TRAIN_COMMAND="printf '%s\\n' '[mount-preflight] ABORT: attempt key handshake failed; training not launched' >&2; exit 16"
+      PREFLIGHT_BLOCKED_BY_MOUNT=1
+    else
+      export MOUNT_PREFLIGHT_RUN_KEY
+      log "MOUNT_PREFLIGHT_RUN_KEY=${MOUNT_PREFLIGHT_RUN_KEY} (shared handshake)"
+    fi
+  fi
+  if [[ "${PREFLIGHT_BLOCKED_BY_MOUNT:-0}" != "1" ]]; then
+    log "STEP 0/4: per-rank mount preflight: ${MOUNT_PREFLIGHT_SH}"
+    bash "${MOUNT_PREFLIGHT_SH}" 2>&1 | tee -a "${WRAPPER_LOG}"
+    MOUNT_PREFLIGHT_RC="${PIPESTATUS[0]}"  # NOT $? -- after a pipeline that is tee's rc
+  fi
   record_event "mount preflight rc=${MOUNT_PREFLIGHT_RC}"
   if [[ "${MOUNT_PREFLIGHT_RC}" -ne 0 ]]; then
     log_err "FATAL: mount preflight FAILED rc=${MOUNT_PREFLIGHT_RC} -- training will NOT be launched"
