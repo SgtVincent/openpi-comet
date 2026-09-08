@@ -101,6 +101,13 @@ def main(args: Args) -> None:
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
+    held_memory_enabled = bool(
+        getattr(policy, "held_memory_enabled", getattr(policy, "_held_memory_enabled", False))
+    )
+    if held_memory_enabled and (args.control_mode != "receeding_horizon" or args.max_len != 32):
+        raise ValueError("MoMA HeldMemory serving requires receeding_horizon with max_len=32")
+    model_config = getattr(policy, "model_config", getattr(getattr(policy, "_model", None), "config", None))
+    planner_stride = int(model_config.planner_stride) if held_memory_enabled else 5
     policy = B1KPolicyWrapper(
         policy,
         task_name=args.task_name,
@@ -110,6 +117,8 @@ def main(args: Args) -> None:
         action_horizon=args.action_horizon,
         temporal_ensemble_max=args.temporal_ensemble_max,
         fine_grained_level=args.fine_grained_level,
+        held_memory_enabled=held_memory_enabled,
+        planner_stride=planner_stride,
     )
     policy_metadata = {
         **base_policy_metadata,

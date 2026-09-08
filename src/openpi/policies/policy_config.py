@@ -8,6 +8,7 @@ import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
+from openpi.training.memory_annotation import MEMORY_SUBTASK_SOURCE
 import openpi.transforms as transforms
 
 if TYPE_CHECKING:
@@ -98,15 +99,34 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    policy = _policy.Policy(
-        model,
-        transforms=[
+    held_memory_enabled = data_config.subtask_source == MEMORY_SUBTASK_SOURCE
+    if held_memory_enabled:
+        # Online rollout has no teacher-forced current Memory target.  Keep the
+        # observation transforms (repack/B1kInputs/Normalize), then let the
+        # stateless Policy API render previous text and inject held raw ids.
+        policy_input_transforms = [
+            *repack_transforms.inputs,
+            transforms.InjectDefaultPrompt(default_prompt),
+        ]
+        memory_post_transforms = [
+            *data_config.data_transforms.inputs,
+            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        ]
+    else:
+        policy_input_transforms = [
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
-        ],
+        ]
+        memory_post_transforms = []
+
+    policy = _policy.Policy(
+        model,
+        transforms=policy_input_transforms,
+        held_memory_enabled=held_memory_enabled,
+        memory_post_transforms=memory_post_transforms,
         output_transforms=[
             *data_config.model_transforms.outputs,
             transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),

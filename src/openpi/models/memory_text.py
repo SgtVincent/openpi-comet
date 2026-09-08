@@ -91,6 +91,11 @@ PREVIOUS_MEMORY_CUE: Final[str] = "Previous memory:"
 #: checks, never encoded as part of the CE target (design section 3.4.3).
 ACTION_QUERY_MARKER: Final[str] = "Action Query:"
 
+#: Canonical previous-memory text at the start of an episode.  Offline data and
+#: online rollout must use the same string; otherwise chunk 0 is trained with a
+#: Previous-memory cue and served with the legacy Subtask cue.
+INITIAL_PREVIOUS_MEMORY: Final[str] = "No task steps have been completed; prepare to begin the task."
+
 # Longest-first, so "Next skill:" can never be matched as "Skill:" and
 # "Next primitive:" never as "Primitive:".
 _LABEL_RE: Final[re.Pattern[str]] = re.compile(
