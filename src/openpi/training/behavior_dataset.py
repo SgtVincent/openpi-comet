@@ -27,6 +27,16 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         args["subtask_template_path"] = data_config.subtask_template_path
         args["subtask_object_name_mapping_path"] = data_config.subtask_object_name_mapping_path
         args["subtask_joiner"] = data_config.subtask_joiner
+        if data_config.subtask_source == "annotations_memory":
+            args["memory_planner_stride_weights"] = getattr(
+                data_config, "memory_planner_stride_weights", None
+            )
+            args["memory_planner_stride_seed"] = getattr(
+                data_config, "memory_planner_stride_seed", None
+            )
+            args["memory_frames_per_chunk"] = getattr(
+                data_config, "memory_frames_per_chunk", None
+            )
 
     # Skill bridge config (default = None / disabled)
     if getattr(data_config, "skill_bridge", None) is not None:

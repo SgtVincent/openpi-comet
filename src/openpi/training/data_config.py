@@ -145,6 +145,11 @@ class DataConfig:
     subtask_object_name_mapping_path: str | None = None
     subtask_joiner: str = " then "
 
+    # MoMA-VLA MIX-C. None preserves every non-Memory and fixed-K dataset path.
+    memory_planner_stride_weights: tuple[tuple[int, float], ...] | None = None
+    memory_planner_stride_seed: int | None = None
+    memory_frames_per_chunk: int | None = None
+
     # Skill bridge baseline config (default-off, zero behavioral change)
     skill_bridge: "SkillBridgeConfig" = dataclasses.field(
         default_factory=lambda: SkillBridgeConfig()

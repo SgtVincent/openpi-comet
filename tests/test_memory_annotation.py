@@ -37,6 +37,16 @@ def _row(idx, start, end, *, mem="m", prev="p", prim="pick up the radio",
     return r
 
 
+def test_current_memory_is_parsed_from_canonical_target_and_chains_to_next_previous():
+    rows = [
+        _row(0, 0, 10, mem="COMMITTED-0", prev="INITIAL"),
+        _row(1, 10, 20, mem="COMMITTED-1", prev="COMMITTED-0"),
+    ]
+    idx = ma.MemoryIntervalIndex(rows)
+    assert idx.lookup(0).current_memory_text == "COMMITTED-0"
+    assert idx.lookup(10).previous_memory_text == idx.lookup(0).current_memory_text
+
+
 def _episode(rows, *, schema=ma.SCHEMA_VERSION, convention=ma.INTERVAL_CONVENTION):
     return {
         "memory_schema_version": schema,
