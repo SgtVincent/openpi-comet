@@ -26,6 +26,7 @@ Example:
     python examples/convert_jax_model_to_pytorch.py --checkpoint_dir /home/$USER/.cache/openpi/openpi-assets/checkpoints/pi05_droid --output_path /home/$USER/.cache/openpi/openpi-assets/checkpoints/pi05_droid_pytorch
 """
 
+import dataclasses
 import json
 import os
 import pathlib
@@ -268,7 +269,7 @@ def slice_paligemma_state_dict(state_dict, config):
     return final_state_dict, expert_dict
 
 
-def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi05):
+def slice_gemma_state_dict(state_dict, config, *, num_expert, pi05: bool):
     """Convert Gemma JAX parameters to PyTorch format."""
     # Add missing attributes to config if they don't exist
     if not hasattr(config, "vocab_size"):
@@ -290,7 +291,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     llm_mlp_linear = state_dict.pop(f"llm/layers/mlp_{num_expert}/linear{suffix}")
 
     # Check if we have Dense layers (for pi05/adaptive normalization) or scale layers (for regular pi0)
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization
         llm_input_layernorm_bias = state_dict.pop(f"llm/layers/pre_attention_norm_{num_expert}/Dense_0/bias{suffix}")
         llm_post_attention_layernorm_bias = state_dict.pop(f"llm/layers/pre_ffw_norm_{num_expert}/Dense_0/bias{suffix}")
@@ -345,7 +346,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             i
         ].transpose()
 
-        if "pi05" in checkpoint_dir:
+        if pi05:
             # Pi05 with adaptive normalization - use Dense layer parameters directly
             state_dict[f"paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.bias"] = (
                 llm_input_layernorm_bias[i]
@@ -369,7 +370,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             )
 
     # Handle final norm layer
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization - use Dense layer parameters directly
         final_norm_bias = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/bias{suffix}")
         final_norm_kernel = state_dict.pop(f"llm/final_norm_{num_expert}/Dense_0/kernel{suffix}")
@@ -419,6 +420,28 @@ def load_jax_model_and_print_keys(checkpoint_dir: str):
     print(utils.array_tree_to_info(metadata))
 
 
+_PI05_EXPECTED_MISSING = {
+    "paligemma_with_expert.gemma_expert.lm_head.weight",
+    "paligemma_with_expert.paligemma.lm_head.weight",
+}
+
+
+def _assert_float_dtype(state_dict: dict[str, torch.Tensor], expected: torch.dtype, *, stage: str) -> None:
+    wrong = {key: str(value.dtype) for key, value in state_dict.items() if value.is_floating_point() and value.dtype != expected}
+    if wrong:
+        raise ValueError(f"{stage} contains floating tensors outside {expected}: {wrong}")
+
+
+def _validate_source_keys(load_result, *, pi05: bool) -> None:
+    missing, unexpected = set(load_result.missing_keys), set(load_result.unexpected_keys)
+    expected_missing = _PI05_EXPECTED_MISSING if pi05 else set()
+    if missing != expected_missing or unexpected:
+        raise ValueError(
+            f"source load key mismatch: missing={sorted(missing)} expected={sorted(expected_missing)} "
+            f"unexpected={sorted(unexpected)}"
+        )
+
+
 def convert_pi0_checkpoint(
     checkpoint_dir: str, precision: str, output_path: str, model_config: openpi.models.pi0_config.Pi0Config
 ):
@@ -432,6 +455,12 @@ def convert_pi0_checkpoint(
         model_config: Model config
     """
     print(f"Converting PI0 checkpoint from {checkpoint_dir} to {output_path}")
+    if precision not in {"float32", "bfloat16"}:
+        raise ValueError(f"Invalid precision: {precision}")
+    torch_dtype = torch.float32 if precision == "float32" else torch.bfloat16
+    # Model parameters must have the target dtype before load_state_dict. Casting
+    # afterwards only widens already-rounded values and cannot recover f32.
+    model_config = dataclasses.replace(model_config, dtype=precision)
     print(f"Model config: {model_config}")
 
     # Break down orbax ckpts by restoring via JAX to respect dtype
@@ -507,7 +536,7 @@ def convert_pi0_checkpoint(
 
     # Process Gemma weights from expert_params
     gemma_params = slice_gemma_state_dict(
-        expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
+        expert_params, action_expert_config, num_expert=1, pi05=model_config.pi05
     )
 
     # Instantiate model
@@ -516,15 +545,11 @@ def convert_pi0_checkpoint(
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
-    # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
-
-    if precision == "float32":
-        pi0_model = pi0_model.to(torch.float32)
-    elif precision == "bfloat16":
-        pi0_model = pi0_model.to(torch.bfloat16)
-    else:
-        raise ValueError(f"Invalid precision: {precision}")
+    _assert_float_dtype(all_params, torch.float32, stage="mapped Orbax tensors")
+    load_result = pi0_model.load_state_dict(all_params, strict=False)
+    _validate_source_keys(load_result, pi05=bool(model_config.pi05))
+    pi0_model = pi0_model.to(torch_dtype)
+    _assert_float_dtype(pi0_model.state_dict(), torch_dtype, stage="pre-save model")
 
     # Save the converted model using safetensors
     os.makedirs(output_path, exist_ok=True)
@@ -573,7 +598,10 @@ def main(
         precision: Precision for model conversion
         inspect_only: Only inspect parameter keys, don't convert
     """
-    model_config = _config.get_config(config_name).model
+    config = _config.get_config(config_name)
+    if config.name != config_name:
+        raise ValueError(f"Config {config_name!r} is not registered; resolved fallback {config.name!r}")
+    model_config = config.model
     if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
         raise ValueError(f"Config {config_name} is not a Pi0Config")
     if inspect_only:
