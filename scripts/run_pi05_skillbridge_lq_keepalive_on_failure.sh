@@ -163,6 +163,14 @@ OCCUPIER_STUB_SCRIPT="${OCCUPY_RUNTIME_DIR}/gpu_occupy_stub.sh"
 # PREFLIGHT_TEST_MODE=1 explicitly.
 readonly PRODUCTION_LAUNCHER="${REPO_ROOT}/scripts/run_pi05_moma_memory_b1k_k5_bf16_multinode.sh"
 PREFLIGHT_TEST_MODE="${PREFLIGHT_TEST_MODE:-0}"
+# Arnold is production by definition. Test-mode canaries are local, CPU-only and
+# keepalive-disabled; never let an Arnold environment turn off production locks.
+if [[ "${PREFLIGHT_TEST_MODE}" == "1" ]]; then
+  if [[ -n "${ARNOLD_ID:-}${ARNOLD_TRIAL_ID:-}${ARNOLD_JOB_ID:-}" || "${KEEPALIVE_DISABLE:-0}" != "1" || "${OCCUPIER_DRY_RUN:-0}" != "1" ]]; then
+    printf 'FATAL: PREFLIGHT_TEST_MODE requires non-Arnold + KEEPALIVE_DISABLE=1 + OCCUPIER_DRY_RUN=1\n' >&2
+    exit 2
+  fi
+fi
 if [[ "${PREFLIGHT_TEST_MODE}" != "1" ]]; then
   [[ -z "${TRAIN_COMMAND:-}" ]] || { printf 'FATAL: TRAIN_COMMAND is test-only; set PREFLIGHT_TEST_MODE=1 for a canary\n' >&2; exit 2; }
   [[ -z "${LAUNCHER:-}" || "${LAUNCHER}" == "${PRODUCTION_LAUNCHER}" ]] \
@@ -171,7 +179,11 @@ if [[ "${PREFLIGHT_TEST_MODE}" != "1" ]]; then
 else
   LAUNCHER="${LAUNCHER:-${PRODUCTION_LAUNCHER}}"
 fi
-export MOUNT_ROOT_WORKTREE="${MOUNT_ROOT_WORKTREE:-${REPO_ROOT}}"
+if [[ "${PREFLIGHT_TEST_MODE}" != "1" && -n "${MOUNT_ROOT_WORKTREE:-}" && "$(realpath -m -- "${MOUNT_ROOT_WORKTREE}")" != "$(realpath -m -- "${REPO_ROOT}")" ]]; then
+  printf 'FATAL: production MOUNT_ROOT_WORKTREE must equal REPO_ROOT: %s != %s\n' "${MOUNT_ROOT_WORKTREE}" "${REPO_ROOT}" >&2
+  exit 2
+fi
+export MOUNT_ROOT_WORKTREE="${REPO_ROOT}"
 readonly PRODUCTION_BASE_PI05_CKPT="/mnt/bn/behavior-data-hl/chenjunting/repo/openpi-comet/checkpoints/pi05_base_pytorch"
 if [[ "${PREFLIGHT_TEST_MODE}" != "1" && -n "${BASE_PI05_CKPT:-}" && "$(realpath -m -- "${BASE_PI05_CKPT}")" != "$(realpath -m -- "${PRODUCTION_BASE_PI05_CKPT}")" ]]; then
   printf 'FATAL: production BASE_PI05_CKPT override is forbidden: %s\n' "${BASE_PI05_CKPT}" >&2
@@ -179,12 +191,24 @@ if [[ "${PREFLIGHT_TEST_MODE}" != "1" && -n "${BASE_PI05_CKPT:-}" && "$(realpath
 fi
 BASE_PI05_CKPT="${BASE_PI05_CKPT:-${PRODUCTION_BASE_PI05_CKPT}}"
 export BASE_PI05_CKPT
+readonly PRODUCTION_WEIGHT_SIZE=7233650408
+readonly PRODUCTION_WEIGHT_SHA256=62cffa633517d0ad8672933c04ae2d8b4758630feab98de88efc692f9a4a0fad
+readonly PRODUCTION_WEIGHT_PREFLIGHT_PYTHON="/mnt/bn/behavior-data-hl/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python"
 readonly PRODUCTION_WEIGHT_PREFLIGHT_SH="${REPO_ROOT}/scripts/hier/preflight_weight_load.py"
 if [[ "${PREFLIGHT_TEST_MODE}" != "1" && -n "${WEIGHT_PREFLIGHT_SH:-}" && "${WEIGHT_PREFLIGHT_SH}" != "${PRODUCTION_WEIGHT_PREFLIGHT_SH}" ]]; then
   printf 'FATAL: production WEIGHT_PREFLIGHT_SH override is forbidden: %s\n' "${WEIGHT_PREFLIGHT_SH}" >&2
   exit 2
 fi
 WEIGHT_PREFLIGHT_SH="${WEIGHT_PREFLIGHT_SH:-${PRODUCTION_WEIGHT_PREFLIGHT_SH}}"
+if [[ "${PREFLIGHT_TEST_MODE}" != "1" && -n "${WEIGHT_PREFLIGHT_PYTHON:-}" && "$(realpath -m -- "${WEIGHT_PREFLIGHT_PYTHON}")" != "$(realpath -m -- "${PRODUCTION_WEIGHT_PREFLIGHT_PYTHON}")" ]]; then
+  printf 'FATAL: production WEIGHT_PREFLIGHT_PYTHON override is forbidden: %s\n' "${WEIGHT_PREFLIGHT_PYTHON}" >&2
+  exit 2
+fi
+WEIGHT_PREFLIGHT_PYTHON="${WEIGHT_PREFLIGHT_PYTHON:-${PRODUCTION_WEIGHT_PREFLIGHT_PYTHON}}"
+if [[ "${PREFLIGHT_TEST_MODE}" != "1" ]]; then
+  [[ "${MOUNT_PREFLIGHT_ENABLE:-1}" == "1" ]] || { printf 'FATAL: production requires MOUNT_PREFLIGHT_ENABLE=1\n' >&2; exit 2; }
+  [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" ]] || { printf 'FATAL: production requires WEIGHT_PREFLIGHT_ENABLE=1\n' >&2; exit 2; }
+fi
 KEEPALIVE_DISABLE="${KEEPALIVE_DISABLE:-0}"
 KEEPALIVE_ON_SUCCESS="${KEEPALIVE_ON_SUCCESS:-0}"
 EXPECTED_GPUS_PER_NODE="${EXPECTED_GPUS_PER_NODE:-8}"
@@ -658,7 +682,8 @@ if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" && "${PREFLIGHT_BLOCKED_BY_MOUNT:-0
   # source value is established so its actual command line and the gate cannot
   # diverge through shell-local vs environment scope.
   export CONFIG_NAME
-  WEIGHT_PREFLIGHT_PYTHON="${WEIGHT_PREFLIGHT_PYTHON:-${OCCUPIER_PYTHON}}"
+  # Already locked (or explicitly test-overridden) before any side effect.
+  WEIGHT_PREFLIGHT_PYTHON="${WEIGHT_PREFLIGHT_PYTHON}"
   WEIGHT_PREFLIGHT_LOAD_MODE="${WEIGHT_PREFLIGHT_LOAD_MODE:-stream}"
   WEIGHT_PREFLIGHT_HASH_MODE="${WEIGHT_PREFLIGHT_HASH_MODE:-partial}"
   : "${WEIGHT_PREFLIGHT_RC:=0}"
@@ -686,7 +711,9 @@ if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" && "${PREFLIGHT_BLOCKED_BY_MOUNT:-0
         --config "${WEIGHT_PREFLIGHT_CONFIG}" \
         --weight-dir "${BASE_PI05_CKPT:?BASE_PI05_CKPT must be set to the launch checkpoint}" \
         --load-mode "${WEIGHT_PREFLIGHT_LOAD_MODE}" \
-        --hash-mode "${WEIGHT_PREFLIGHT_HASH_MODE}" \
+        --hash-mode "$([[ "${PREFLIGHT_TEST_MODE}" == "1" ]] && printf '%s' "${WEIGHT_PREFLIGHT_HASH_MODE}" || printf full)" \
+        --expect-size "${PRODUCTION_WEIGHT_SIZE}" \
+        --expect-hash "${PRODUCTION_WEIGHT_SHA256}" \
         --verify-sample 8 \
         --require-openpi-under "${REPO_ROOT}/src" \
         > "${WEIGHT_PREFLIGHT_LOG}" 2>&1
