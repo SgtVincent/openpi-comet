@@ -56,8 +56,9 @@
 # -----------------
 #   LAUNCHER                 underlying training script (default: the LQ BF16
 #                            skill-bridge multinode launcher)
-#   TRAIN_COMMAND            full shell command string; overrides LAUNCHER
-#                            entirely (used by the no-GPU smoke test)
+#   TRAIN_COMMAND            test-only command override; production rejects it
+#   PREFLIGHT_TEST_MODE=1    enables LAUNCHER / WEIGHT_PREFLIGHT_SH /
+#                            TRAIN_COMMAND overrides for bounded canaries only
 #   WEIGHT_PREFLIGHT_ENABLE  default 1. Runs strict checkpoint validation before
 #                            TRAIN_COMMAND/LAUNCHER and refuses launch on failure
 #   WEIGHT_PREFLIGHT_CONFIG  defaults to CONFIG_NAME and must equal it exactly
@@ -157,11 +158,33 @@ OCCUPIER_STUB_SCRIPT="${OCCUPY_RUNTIME_DIR}/gpu_occupy_stub.sh"
 # ---------------------------------------------------------------------------
 # Behaviour knobs
 # ---------------------------------------------------------------------------
-# This wrapper is now the MoMA-VLA launch owner. The old Skill Bridge default
-# was valid for a different experiment and silently selected a different config,
-# dataset source and output tree. Keep override support for tests, but the real
-# default must be the launcher that names the registered Memory config.
-LAUNCHER="${LAUNCHER:-${REPO_ROOT}/scripts/run_pi05_moma_memory_b1k_k5_bf16_multinode.sh}"
+# This wrapper is now the MoMA-VLA launch owner. Production has one launcher and
+# rejects arbitrary command/script substitution. Bounded canaries must opt into
+# PREFLIGHT_TEST_MODE=1 explicitly.
+readonly PRODUCTION_LAUNCHER="${REPO_ROOT}/scripts/run_pi05_moma_memory_b1k_k5_bf16_multinode.sh"
+PREFLIGHT_TEST_MODE="${PREFLIGHT_TEST_MODE:-0}"
+if [[ "${PREFLIGHT_TEST_MODE}" != "1" ]]; then
+  [[ -z "${TRAIN_COMMAND:-}" ]] || { printf 'FATAL: TRAIN_COMMAND is test-only; set PREFLIGHT_TEST_MODE=1 for a canary\n' >&2; exit 2; }
+  [[ -z "${LAUNCHER:-}" || "${LAUNCHER}" == "${PRODUCTION_LAUNCHER}" ]] \
+    || { printf 'FATAL: production LAUNCHER override is forbidden: %s\n' "${LAUNCHER}" >&2; exit 2; }
+  LAUNCHER="${PRODUCTION_LAUNCHER}"
+else
+  LAUNCHER="${LAUNCHER:-${PRODUCTION_LAUNCHER}}"
+fi
+export MOUNT_ROOT_WORKTREE="${MOUNT_ROOT_WORKTREE:-${REPO_ROOT}}"
+readonly PRODUCTION_BASE_PI05_CKPT="/mnt/bn/behavior-data-hl/chenjunting/repo/openpi-comet/checkpoints/pi05_base_pytorch"
+if [[ "${PREFLIGHT_TEST_MODE}" != "1" && -n "${BASE_PI05_CKPT:-}" && "$(realpath -m -- "${BASE_PI05_CKPT}")" != "$(realpath -m -- "${PRODUCTION_BASE_PI05_CKPT}")" ]]; then
+  printf 'FATAL: production BASE_PI05_CKPT override is forbidden: %s\n' "${BASE_PI05_CKPT}" >&2
+  exit 2
+fi
+BASE_PI05_CKPT="${BASE_PI05_CKPT:-${PRODUCTION_BASE_PI05_CKPT}}"
+export BASE_PI05_CKPT
+readonly PRODUCTION_WEIGHT_PREFLIGHT_SH="${REPO_ROOT}/scripts/hier/preflight_weight_load.py"
+if [[ "${PREFLIGHT_TEST_MODE}" != "1" && -n "${WEIGHT_PREFLIGHT_SH:-}" && "${WEIGHT_PREFLIGHT_SH}" != "${PRODUCTION_WEIGHT_PREFLIGHT_SH}" ]]; then
+  printf 'FATAL: production WEIGHT_PREFLIGHT_SH override is forbidden: %s\n' "${WEIGHT_PREFLIGHT_SH}" >&2
+  exit 2
+fi
+WEIGHT_PREFLIGHT_SH="${WEIGHT_PREFLIGHT_SH:-${PRODUCTION_WEIGHT_PREFLIGHT_SH}}"
 KEEPALIVE_DISABLE="${KEEPALIVE_DISABLE:-0}"
 KEEPALIVE_ON_SUCCESS="${KEEPALIVE_ON_SUCCESS:-0}"
 EXPECTED_GPUS_PER_NODE="${EXPECTED_GPUS_PER_NODE:-8}"
@@ -635,11 +658,10 @@ if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" && "${PREFLIGHT_BLOCKED_BY_MOUNT:-0
   # source value is established so its actual command line and the gate cannot
   # diverge through shell-local vs environment scope.
   export CONFIG_NAME
-  WEIGHT_PREFLIGHT_SH="${WEIGHT_PREFLIGHT_SH:-${REPO_ROOT}/scripts/hier/preflight_weight_load.py}"
   WEIGHT_PREFLIGHT_PYTHON="${WEIGHT_PREFLIGHT_PYTHON:-${OCCUPIER_PYTHON}}"
   WEIGHT_PREFLIGHT_LOAD_MODE="${WEIGHT_PREFLIGHT_LOAD_MODE:-stream}"
   WEIGHT_PREFLIGHT_HASH_MODE="${WEIGHT_PREFLIGHT_HASH_MODE:-partial}"
-  WEIGHT_PREFLIGHT_RC=0
+  : "${WEIGHT_PREFLIGHT_RC:=0}"
   WEIGHT_PREFLIGHT_PASS_COUNT=0
   WEIGHT_PREFLIGHT_LOG="${OCCUPY_RUNTIME_DIR}/weight_preflight_${NODE_TAG}.log"
   if [[ "${WEIGHT_PREFLIGHT_CONFIG}" != "${CONFIG_NAME}" ]]; then
@@ -654,11 +676,15 @@ if [[ "${WEIGHT_PREFLIGHT_ENABLE:-1}" == "1" && "${PREFLIGHT_BLOCKED_BY_MOUNT:-0
   elif [[ ! -s "${WEIGHT_PREFLIGHT_SH}" ]]; then
     log_err "FATAL: weight preflight script is missing or empty: ${WEIGHT_PREFLIGHT_SH}"
     WEIGHT_PREFLIGHT_RC=2
+  elif [[ "$(realpath -m -- "${BASE_PI05_CKPT:-/missing}")" != "$(realpath -m -- "${PRODUCTION_BASE_PI05_CKPT:-${BASE_PI05_CKPT:-/missing}}")" ]]; then
+    log_err "FATAL: checkpoint override does not match production checkpoint: ${BASE_PI05_CKPT:-<unset>}"
+    WEIGHT_PREFLIGHT_RC=2
   else
-    log "STEP 0.5/4: strict weight preflight config=${WEIGHT_PREFLIGHT_CONFIG}"
+    log "STEP 0.5/4: strict weight preflight config=${WEIGHT_PREFLIGHT_CONFIG} checkpoint=$(realpath -m -- "${BASE_PI05_CKPT}")"
     PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
       "${WEIGHT_PREFLIGHT_PYTHON}" "${WEIGHT_PREFLIGHT_SH}" \
         --config "${WEIGHT_PREFLIGHT_CONFIG}" \
+        --weight-dir "${BASE_PI05_CKPT:?BASE_PI05_CKPT must be set to the launch checkpoint}" \
         --load-mode "${WEIGHT_PREFLIGHT_LOAD_MODE}" \
         --hash-mode "${WEIGHT_PREFLIGHT_HASH_MODE}" \
         --verify-sample 8 \

@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "分布观察项的**版本化登记基线**。按数据版本登记，不是一个跟着当前数据走的常量。",
+    "",
+    "为什么不直接把阈值改成当前实测值：那样每次数据一变就把阈值改成新值，gate 就永远",
+    "PASS，它检不出任何漂移 —— 变成跟着数据走的橡皮图章。登记基线的语义是「这个数据版本",
+    "经过验收，它的分布应当是这些值」，所以同一版本内再涨就会报警。",
+    "",
+    "键是该数据版本 manifest.json 的 md5（最精确的版本标识；目录名会被原地改动骗过）。",
+    "未登记的版本一律 fail-closed 记 NOT-MEASURED，**不自动学习**。"
+  ],
+  "by_manifest_md5": {
+    "8c772547325b99086b07e3ec195a73f1": {
+      "label": "v1 (fixed_compact_memory_annotations, 2026-09-07 05:29)",
+      "status": "superseded",
+      "fixed_compact_memory_p99_max": 32,
+      "fixed_compact_memory_max_max": 49,
+      "note": "原始交接数据。保留作历史对照，不再是验收目标。"
+    },
+    "1448cd306ce6bf5e0715dafcc2cef17a": {
+      "label": "v2 first run (补 phrase 模板后，metadata 尚未 clamp)",
+      "status": "superseded",
+      "fixed_compact_memory_p99_max": 32,
+      "fixed_compact_memory_max_max": 56,
+      "note": "此版本有 coverage_end_mismatch=83 的 hard failure，仅作中间对照。"
+    },
+    "50726ae508ef5c48e0d48d2679b6cd64": {
+      "label": "v2 metadata-clamped (已验收)",
+      "status": "accepted",
+      "fixed_compact_memory_p99_max": 32,
+      "fixed_compact_memory_max_max": 56,
+      "note": [
+        "max 从 v1 的 49 涨到 56，增量来自**已批准的** phrase 模板补齐",
+        "（source_unresolved_phrase_templates 29300 -> 221，composed 29079）。",
+        "同批次生产口径 planner_target max=153，对 subtask_max_len=192 仍有 39 余量，",
+        "所以这个增长不构成预算风险。",
+        "⚠️ 在本基线下，未来若 max 涨到 57 仍会报警 —— 那正是它该有的行为。"
+      ]
+    }
+  }
+}
