@@ -161,10 +161,16 @@ def test_reset_and_spawn_clear_but_rotate_preserves_episode_memory():
 def test_arbitrary_non_decreasing_steps_use_absolute_chunk_and_only_backwards_refused():
     w, p = _wrapper()
     w.act({"env_step": 0})
+    assert w.last_policy_inferred is True
     a33 = w.act({"env_step": 33})
-    # Same absolute chunk, different step: no second model/planner call, action
-    # offset 1 from chunk 1.
+    assert w.last_policy_inferred is True  # new absolute chunk
+    assert w.last_action_chunk is not None
+    # Same absolute chunk, different step: no second model/planner call and no
+    # fresh action plan / action_chunk is advertised to the websocket client.
     a34 = w.act({"env_step": 34})
+    assert w.last_policy_inferred is False
+    assert w.last_action_chunk is None
+    assert w.last_memory_telemetry["cached_action"] is True
     assert [c["chunk"] for c in p.calls] == [0, 1]
     assert p.planner_calls == 1
     assert a33[0, 0].item() == 101

@@ -513,12 +513,14 @@ class B1KPolicyWrapper:
             if self._committed_chunk_actions is None:
                 raise RuntimeError(f"chunk {chunk_index} was committed without actions")
             final_action = self._committed_chunk_actions[offset : offset + 1].copy()
+            self.last_policy_inferred = False
+            self.last_action_chunk = None
             self._last_env_step = env_step
             self._last_step_action = final_action.copy()
             self.cached_actions_remaining = max(0, 31 - offset)
             self.last_memory_telemetry = {
                 **(self.last_memory_telemetry or {}), "env_step": env_step,
-                "chunk_index": chunk_index, "retry": False,
+                "chunk_index": chunk_index, "retry": False, "cached_action": True,
             }
             return torch.as_tensor(final_action, dtype=torch.float32)
 
@@ -587,6 +589,7 @@ class B1KPolicyWrapper:
             "planner_stride": stats["planner_stride"],
             "memory_generation": stats["memory_generation"],
             "retry": False,
+            "cached_action": False,
         }
         self.last_generated_subtask = self._held_memory_text
         return torch.as_tensor(final_action, dtype=torch.float32)
