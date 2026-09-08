@@ -29,6 +29,8 @@ class _Model:
         self.config = types.SimpleNamespace(max_token_len=8, subtask_max_len=8)
         self.predict_calls = 0
         self.build_calls = []
+        self.build_prompt_tokens = []
+        self.planner_prompt_tokens = []
         self.sample_calls = []
 
     def to(self, _device):
@@ -39,6 +41,7 @@ class _Model:
 
     def predict_subtask_tokens(self, observation):
         self.predict_calls += 1
+        self.planner_prompt_tokens.append(observation.tokenized_prompt.detach().clone())
         # The marker proves latest state/prompt observation reached the Planner.
         marker = int(observation.tokenized_prompt[0, 0].item())
         return torch.tensor([[100 + marker, 1]], dtype=torch.int32)
@@ -48,6 +51,7 @@ class _Model:
 
     def build_hierarchical_observation(self, observation, tokens):
         self.build_calls.append(tokens.detach().clone())
+        self.build_prompt_tokens.append(observation.tokenized_prompt.detach().clone())
         observation.subtask_tokens = tokens
         observation.subtask_mask = torch.ones_like(tokens, dtype=torch.bool)
         return observation
@@ -94,6 +98,8 @@ def test_planner_returns_raw_ids_and_action_uses_same_current_ids(monkeypatch):
     assert model.predict_calls == 1
     assert np.array_equal(out["held_memory_tokens"], np.asarray([107, 1], np.int32))
     assert out["held_memory_text"] == "Memory: 107"
+    assert model.planner_prompt_tokens[-1][0, 1].item() == 1  # previous text present for Planner
+    assert model.build_prompt_tokens[-1][0, 1].item() == 0  # current-only action prompt
     assert torch.equal(model.build_calls[-1], torch.tensor([[107, 1]], dtype=torch.int32))
     assert torch.equal(model.sample_calls[-1], torch.tensor([[107, 1]], dtype=torch.int32))
     assert np.all(out["actions"] == 107)
@@ -108,6 +114,7 @@ def test_fast_tick_never_calls_planner_and_injects_held_ids(monkeypatch):
     )
     assert model.predict_calls == 0
     assert out["held_memory_tokens"] is None
+    assert model.build_prompt_tokens[-1][0, 1].item() == 0
     assert torch.equal(model.build_calls[-1], torch.tensor([[55, 1]], dtype=torch.int32))
     assert np.all(out["actions"] == 55)
 
@@ -180,3 +187,37 @@ def test_real_build_hierarchical_observation_and_action_conditioning_forward():
     out = model.sample_actions("cpu", conditioned, num_steps=1)
     assert out.shape == (1, 4, 8)
     assert torch.equal(seen["tokens"], conditioned.subtask_tokens)
+
+
+
+def test_policy_config_consumes_annotations_memory_activation(monkeypatch, tmp_path):
+    """Delete the production activation branch and this test must fail."""
+    import openpi.policies.policy_config as pc
+    import openpi.transforms as transforms
+    from openpi.training.memory_annotation import MEMORY_SUBTASK_SOURCE
+
+    weight = tmp_path / "model.safetensors"
+    weight.write_bytes(b"x")
+    cfg = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            load_pytorch=lambda _train, _weight: types.SimpleNamespace(
+                paligemma_with_expert=types.SimpleNamespace(to_bfloat16_for_selected_params=lambda _x: None)
+            )
+        ),
+        data=types.SimpleNamespace(
+            create=lambda _assets, _model: types.SimpleNamespace(
+                subtask_source=MEMORY_SUBTASK_SOURCE,
+                data_transforms=transforms.Group(), model_transforms=transforms.Group(),
+                use_quantile_norm=False, asset_id="asset",
+            )
+        ),
+        assets_dirs=tmp_path,
+        policy_metadata={},
+    )
+    captured = {}
+    monkeypatch.setattr(pc._checkpoints, "load_norm_stats", lambda *_args: {})
+    monkeypatch.setattr(pc._policy, "Policy", lambda model, **kw: captured.update(kw) or kw)
+    pc.create_trained_policy(cfg, tmp_path, policy_backend="torch", pytorch_device="cpu")
+    assert captured["held_memory_enabled"] is True
+    assert captured["memory_post_transforms"] is not None
+    assert len(captured["memory_post_transforms"]) == 1  # Normalize is still applied online

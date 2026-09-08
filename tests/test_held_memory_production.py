@@ -10,14 +10,17 @@ from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper
 
 
 class _Model:
+    def __init__(self):
+        self.cleared_sessions = []
+
     def set_active_session(self, _session_id):
         pass
 
     def reset_streaming_state(self, _session_id):
         pass
 
-    def clear_session(self, _session_id):
-        pass
+    def clear_session(self, session_id):
+        self.cleared_sessions.append(session_id)
 
 
 class _MemoryPolicy:
@@ -135,9 +138,14 @@ def test_reset_and_spawn_clear_but_rotate_preserves_episode_memory():
     tokens = w._held_memory_tokens.copy()
     calls = w._memory_rollout.planner_calls
 
+    first = w._last_step_action.copy()
+    calls_before_rotate = len(p.calls)
     w.rotate_session()
     assert np.array_equal(w._held_memory_tokens, tokens)
     assert w._memory_rollout.planner_calls == calls
+    retry = w.act({"env_step": 0})
+    assert np.array_equal(retry, first)
+    assert len(p.calls) == calls_before_rotate
 
     spawned = w.spawn_session()
     assert spawned._held_memory_tokens is None
@@ -150,14 +158,47 @@ def test_reset_and_spawn_clear_but_rotate_preserves_episode_memory():
     assert w._memory_rollout.planner_calls == 0
 
 
-def test_backward_step_and_unaligned_new_chunk_are_refused():
-    w, _ = _wrapper()
+def test_arbitrary_non_decreasing_steps_use_absolute_chunk_and_only_backwards_refused():
+    w, p = _wrapper()
     w.act({"env_step": 0})
-    w.act({"env_step": 32})
+    a33 = w.act({"env_step": 33})
+    # Same absolute chunk, different step: no second model/planner call, action
+    # offset 1 from chunk 1.
+    a34 = w.act({"env_step": 34})
+    assert [c["chunk"] for c in p.calls] == [0, 1]
+    assert p.planner_calls == 1
+    assert a33[0, 0].item() == 101
+    assert a34[0, 0].item() == 102
+    w.act({"env_step": 159})  # chunk 4 offset 31
+    w.act({"env_step": 160})  # chunk 5 planner
+    w.act({"env_step": 320})  # jump to chunk 10 planner
+    assert [c["chunk"] for c in p.calls if c["planner_tick"]] == [0, 5, 10]
     with pytest.raises(ValueError, match="backwards"):
-        w.act({"env_step": 0})
-    with pytest.raises(ValueError, match="aligned"):
-        w.act({"env_step": 33})
+        w.act({"env_step": 319})
+
+
+def test_planner_failure_is_transactional_and_retry_does_not_double_commit():
+    w, p = _wrapper()
+    original = p.infer_memory_chunk
+
+    def short(*args, **kwargs):
+        out = original(*args, **kwargs)
+        out["actions"] = out["actions"][:3]
+        return out
+
+    p.infer_memory_chunk = short
+    for _ in range(2):
+        with pytest.raises(ValueError, match="shaped"):
+            w.act({"env_step": 0})
+        assert w._memory_rollout.planner_calls == 0
+        assert w._memory_rollout.cache.generation == 0
+        assert w._memory_rollout.stats()["chunks_seen"] == 0
+        assert w._held_memory_tokens is None
+        assert w._last_env_step is None
+    p.infer_memory_chunk = original
+    w.act({"env_step": 0})
+    assert w._memory_rollout.planner_calls == 1
+    assert w._memory_rollout.cache.generation == 1
 
 
 def test_moma_plus_explicit_gt_subtask_is_rejected():
@@ -198,6 +239,39 @@ def test_legacy_wrapper_is_byte_equivalent_and_does_not_require_env_step(monkeyp
     assert np.array_equal(a0, expected[0:1])
     assert np.array_equal(a1, expected[1:2])
     assert np.array_equal(a2, expected[2:3])
+
+
+def test_close_session_is_idempotent_and_does_not_rotate():
+    w, _ = _wrapper()
+    w.act({"env_step": 0})
+    sid = w._session_id
+    w.close_session()
+    w.close_session()
+    assert w._session_id == sid
+    assert w.policy._model.cleared_sessions == [sid]
+    assert w._held_memory_tokens is None
+    assert w._last_env_step is None
+    assert not w.action_queue
+
+
+def test_close_session_without_model_hook_still_clears_wrapper_state():
+    w, _ = _wrapper()
+    w.act({"env_step": 0})
+    w.policy._model = object()
+    w.close_session()
+    assert w._held_memory_tokens is None
+    assert w._session_closed is True
+
+
+def test_closing_one_session_does_not_change_another():
+    root, _ = _wrapper()
+    a, b = root.spawn_session(), root.spawn_session()
+    a.act({"env_step": 0})
+    b.act({"env_step": 0})
+    before = b._held_memory_tokens.copy()
+    a.close_session()
+    assert np.array_equal(b._held_memory_tokens, before)
+    assert b._session_closed is False
 
 
 def test_two_sessions_are_isolated():

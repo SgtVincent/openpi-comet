@@ -151,19 +151,22 @@ class Policy(BasePolicy):
             )
             self._held_memory_tokenizer = tokenizer
         prompt = inputs.pop("prompt")
-        prompt_tokens, prompt_mask = tokenizer.tokenize_prompt(
-            str(prompt), np.asarray(inputs["state"]), previous_memory=previous_memory_text
-        )
-        inputs = {**inputs, "tokenized_prompt": prompt_tokens, "tokenized_prompt_mask": prompt_mask}
-        device_inputs = jax.tree.map(
-            lambda x: torch.from_numpy(np.asarray(x)).to(self._pytorch_device)[None, ...], inputs
-        )
-        observation = _model.Observation.from_dict(device_inputs)
+
+        def make_observation(previous_text: str | None):
+            prompt_tokens, prompt_mask = tokenizer.tokenize_prompt(
+                str(prompt), np.asarray(inputs["state"]), previous_memory=previous_text
+            )
+            payload = {**inputs, "tokenized_prompt": prompt_tokens, "tokenized_prompt_mask": prompt_mask}
+            device_payload = jax.tree.map(
+                lambda x: torch.from_numpy(np.asarray(x)).to(self._pytorch_device)[None, ...], payload
+            )
+            return _model.Observation.from_dict(device_payload)
 
         generated_tokens = None
         generated_text = None
         if planner_tick:
-            generated_tokens = self._model.predict_subtask_tokens(observation)
+            planner_observation = make_observation(previous_memory_text)
+            generated_tokens = self._model.predict_subtask_tokens(planner_observation)
             texts = self._model.decode_subtask_tokens(generated_tokens)
             generated_text = texts[0] if texts else None
             action_tokens = generated_tokens
@@ -174,7 +177,10 @@ class Policy(BasePolicy):
             if action_tokens.ndim == 1:
                 action_tokens = action_tokens[None, ...]
 
-        conditioned = self._model.build_hierarchical_observation(observation, action_tokens)
+        # Current-only action path: rebuild latest image/state/task without the
+        # previous-memory text. The current raw IDs are the sole action plan.
+        action_observation = make_observation(None)
+        conditioned = self._model.build_hierarchical_observation(action_observation, action_tokens)
         mask = conditioned.subtask_mask
         if mask is None or not bool(torch.any(mask).item()):
             raise RuntimeError("held Memory tokens did not enter the action sequence (subtask mask is all false)")
