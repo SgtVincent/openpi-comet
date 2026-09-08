@@ -371,6 +371,7 @@ def scan_episode(path_str: str) -> dict[str, Any]:
         "deep_checked": False,
         "deep_frames": 0,
         "leak_kinds": Counter(),
+        "handles_without_suffix": set(),
         "fallback_intervals": 0,
         "fallback_model_target": 0,
         "fallback_episode": 0,
@@ -397,6 +398,7 @@ def scan_episode(path_str: str) -> dict[str, Any]:
         "annotated_frames_lost_if_partial_dropped": 0,
         "clamped_probes": 0,
         "clamped_misses": 0,
+        "chunks_without_aligned_anchor": 0,
         "prod_lengths": [],
         "prompt_lengths_other_source": [],
         "path_deltas": Counter(),
@@ -439,13 +441,17 @@ def scan_episode(path_str: str) -> dict[str, Any]:
     if _OPTS.get("task_text_source") == "lerobot":
         task_instruction = lerobot_task
         if not task_instruction:
+            # 不回退到 annotation：回退会让「部分 episode 用错口径」变成一个只在
+            # note 里的软信息，而 prompt 预算照常出数。缺就是缺。
             note("missing_lerobot_task_text", f"{path_str}: episode_index={_ep_idx}")
-            task_instruction = ann_task
     else:
         task_instruction = ann_task
     if not ann_task:
         note("missing_task_name", path_str)
     handles = _collect_handles(episode)
+    # 无数字后缀的 handle 归一化后可能是普通英文（如 grated_cheese -> "grated cheese"），
+    # 对这类只按原串判。把它们报出来，免得这条豁免变成一个没人看见的洞。
+    out["handles_without_suffix"] = sorted(h for h in handles if not HANDLE_HAS_ID_SUFFIX.search(h))
     valid_duration = (episode.get("meta_data") or {}).get("valid_duration")
 
     starts: list[int] = []
@@ -749,7 +755,11 @@ def scan_episode(path_str: str) -> dict[str, Any]:
                 vs, ve = rows[j]["frame_duration"]
                 if not (vs <= f < ve):
                     out["video_range_misses"] += 1
-            # 剔除 dead chunk + anchor 夹取之后的采样范围：命中率必须 100%
+            # 剔除 dead chunk + anchor 夹取之后：探测的必须是**stride 对齐的真实 anchor**，
+            # 不是任意帧。任意帧只能证明「覆盖范围内任取一帧都命中」，证明不了
+            # 「训练实际会取的那些帧都命中」。
+            a_stride = _OPTS["anchor_stride"]
+            a_offset = _OPTS["anchor_offset"]
             chunk_starts = list(range(0, vlen, cs_size))
             picks = chunk_starts if len(chunk_starts) <= 24 else rng.sample(chunk_starts, 24)
             for cs in picks:
@@ -759,12 +769,25 @@ def scan_episode(path_str: str) -> dict[str, Any]:
                 lo, hi = max(cs, cov_s), min(ce, live_e)
                 if hi <= lo:
                     continue
-                for f in {lo, hi - 1, rng.randrange(lo, hi)}:
+                # 复刻 dataset.py:107-113 的对齐算法：episode-local 起点是 cs
+                first = lo + ((a_offset - lo) % a_stride)
+                if first >= hi:
+                    # 该 chunk 的夹取范围内没有任何对齐 anchor。训练侧
+                    # `_aligned_streaming_chunk_start` 会对它返回 None（不是 raise），
+                    # 由 `_select_aligned_streaming_chunk` 在**所有** chunk 都没有时才 raise。
+                    out["chunks_without_aligned_anchor"] += 1
+                    note("chunk_without_aligned_anchor",
+                         f"{path_str}: chunk=[{cs},{ce}) clamped=[{lo},{hi}) stride={a_stride} offset={a_offset}")
+                    continue
+                cand = list(range(first, hi, a_stride))
+                probe = cand if len(cand) <= 3 else [cand[0], cand[-1], rng.choice(cand)]
+                for f in probe:
                     out["clamped_probes"] += 1
                     j = bisect_right(starts, f) - 1
                     if j < 0 or not (rows[j]["frame_duration"][0] <= f < rows[j]["frame_duration"][1]):
                         out["clamped_misses"] += 1
-                        note("clamped_range_miss", f"{path_str}: frame={f} chunk=[{cs},{ce})")
+                        note("clamped_range_miss",
+                             f"{path_str}: anchor={f} chunk=[{cs},{ce}) stride={a_stride}")
         for frame_idx in probes:
             out["deep_frames"] += 1
             i = bisect_right(starts, frame_idx) - 1
@@ -787,6 +810,7 @@ def scan_episode(path_str: str) -> dict[str, Any]:
     out["violations"] = dict(out["violations"])
     out["transition_counts"] = dict(out["transition_counts"])
     out["leak_kinds"] = dict(out["leak_kinds"])
+    out["handles_without_suffix"] = list(out["handles_without_suffix"])
     return out
 
 
@@ -1069,6 +1093,10 @@ def run_self_test(args: argparse.Namespace) -> dict[str, Any]:
             "deep_paths": set(),
             "frames_per_episode": 0,
             "seed": args.seed,
+            "task_text_source": "annotation",
+            "episode_tasks": {},
+            "anchor_stride": 1,
+            "anchor_offset": 0,
         }
         _init_worker(opts)
         for name, expect_key, ep in cases:
@@ -1082,6 +1110,25 @@ def run_self_test(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 ok = viol.get(expect_key, 0) >= 1
                 results.append({"case": name, "expect": expect_key, "got": viol, "passed": ok})
+        # --- lerobot 口径的一对：有 task 文本 / 缺 task 文本 ---------------
+        # 生产走 prompt_from_task=True 取 meta/episodes.jsonl 的 tasks[0]。
+        # fixture 的 stem 解析不出 episode_index，所以键用 None。
+        ep_l = episode([dict(base_row)])
+        pl = tmp / "lerobot_task_present.json"
+        pl.write_text(json.dumps(ep_l, ensure_ascii=False), encoding="utf-8")
+        _init_worker({**opts, "task_text_source": "lerobot",
+                      "episode_tasks": {None: "Turn on the radio receiver in the living room."}})
+        res = scan_episode(str(pl))
+        results.append({"case": "lerobot_task_present",
+                        "expect": "no missing_lerobot_task_text", "got": res["violations"],
+                        "passed": res["violations"].get("missing_lerobot_task_text", 0) == 0})
+        _init_worker({**opts, "task_text_source": "lerobot", "episode_tasks": {}})
+        res = scan_episode(str(pl))
+        results.append({"case": "lerobot_task_missing_is_flagged",
+                        "expect": "missing_lerobot_task_text", "got": res["violations"],
+                        "passed": res["violations"].get("missing_lerobot_task_text", 0) >= 1})
+        _init_worker(opts)
+
     n_pass = sum(1 for r in results if r["passed"])
     return {"cases": results, "passed": n_pass, "total": len(results), "all_passed": n_pass == len(results)}
 
@@ -1140,6 +1187,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="必传：那次 run 实际生效的 DataLoader num_workers（不是配置默认值）")
     p.add_argument("--frames-meta-root", type=str, default=None,
                    help="视频语料 LeRobot root（需含 meta/episodes.jsonl）；传空串则显式跳过联表检查")
+    # anchor 采样步长：训练侧 `dataset.py:_read_streaming_anchor_env` 从
+    # OPENPI_B1K_ANCHOR_STRIDE / _OFFSET 读，缺省 1/0；TrainConfig 的
+    # `streaming_anchor_stride`(:147) / `epoch_anchor_offsets`(:175) 默认也是 1 / None。
+    # ⚠️ 这与 HeldMemory 的 `planner_stride=5` 是**不同层的步长**，不要混。
+    p.add_argument("--anchor-stride", type=int, default=None,
+                   help="必传：那次 run 生效的 anchor 步长。gate 按它生成**对齐的 anchor**再验命中，"
+                        "而不是拿任意帧冒充")
+    p.add_argument("--anchor-offset", type=int, default=None, help="必传：那次 run 生效的 anchor 偏移")
     p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                    help="dataset.py:1334 的 chunk 大小，决定分片单元数")
     p.add_argument("--max-uncovered-frames", type=int, default=0,
@@ -1208,6 +1263,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          ("--expect-tokenizer-md5", args.expect_tokenizer_md5),
                          ("--expect-vocab-size", args.expect_vocab_size)]
         missing = [n for n, v in required if v is None]
+        if args.mode == "formal" and not str(args.frames_meta_root).strip():
+            # 空串是「显式放弃」，那在 formal 模式下不成立：放弃之后 EPISODE_JOIN_1TO1 /
+            # FRAME_COVERAGE / chunk 四条等十项都失去依据，报告会看起来更干净而不是更差。
+            p.error("--mode formal 不接受空的 --frames-meta-root：放弃联表会让十项检查失去依据。"
+                    "确实要跳过请用 --mode diagnostic，那时它们会登记成 NOT-MEASURED。")
         if missing:
             p.error(
                 "以下参数必须显式传入，不提供默认值：" + " ".join(missing) + "。\n"
@@ -1243,6 +1303,10 @@ def main(argv: list[str] | None = None) -> int:
     # --- 文件枚举（先界定集合规模，再谈命中数）-----------------------------
     task_dirs = sorted(d for d in root.glob("task-*") if d.is_dir())
     filelist_audit: dict[str, Any] = {"used": False}
+    if args.file_list and not Path(args.file_list).exists():
+        print(f"CANNOT-ASSESS: --file-list {args.file_list} 不存在。"
+              "此前这里会静默回退到 glob —— 那等于把「清单丢了」渲染成「正常运行」。")
+        return 3
     if args.file_list and Path(args.file_list).exists():
         # 「文件存在」不是「文件完整」：被 kill 的写入会留下截断清单，而 exists() 照样为真
         # （实测踩过一次 6,416 行的截断）。所以用清单前要对账：数量、归属、可读性。
@@ -1336,6 +1400,8 @@ def main(argv: list[str] | None = None) -> int:
         "task_text_source": args.task_text_source,
         "episode_lengths": episode_lengths,
         "chunk_size": args.chunk_size,
+        "anchor_stride": args.anchor_stride if args.anchor_stride is not None else 1,
+        "anchor_offset": args.anchor_offset if args.anchor_offset is not None else 0,
         "prompt_max_len": args.prompt_max_len,
         "subtask_max_len": args.subtask_max_len,
         "action_dim": args.action_dim,
@@ -1357,6 +1423,7 @@ def main(argv: list[str] | None = None) -> int:
     overhang_by_tt: Counter = Counter()
     violations: Counter = Counter()
     leak_kinds: Counter = Counter()
+    handles_no_suffix: set = set()
     transitions: Counter = Counter()
     evidence: dict[str, list[str]] = {}
     readable = 0
@@ -1391,6 +1458,7 @@ def main(argv: list[str] | None = None) -> int:
     ann_lost_if_partial = 0
     clamped_probes = 0
     clamped_misses = 0
+    no_anchor_chunks = 0
 
     ctx = mp.get_context("fork")
     chunksize = max(1, n_files // (args.jobs * 8) or 1)
@@ -1414,6 +1482,7 @@ def main(argv: list[str] | None = None) -> int:
             overhang_by_tt.update(res.get("overhang_by_transition", {}))
             violations.update(res["violations"])
             leak_kinds.update(res["leak_kinds"])
+            handles_no_suffix.update(res.get("handles_without_suffix", []))
             transitions.update(res["transition_counts"])
             sentinel_text += res["sentinel_text_hits"]
             sentinel_re += res["sentinel_re_hits"]
@@ -1444,6 +1513,7 @@ def main(argv: list[str] | None = None) -> int:
             ann_lost_if_partial += res.get("annotated_frames_lost_if_partial_dropped", 0)
             clamped_probes += res.get("clamped_probes", 0)
             clamped_misses += res.get("clamped_misses", 0)
+            no_anchor_chunks += res.get("chunks_without_aligned_anchor", 0)
             total_video_frames += res.get("video_length") or 0
             for kind, msgs in res["evidence"].items():
                 b = evidence.setdefault(kind, [])
@@ -1678,6 +1748,14 @@ def main(argv: list[str] | None = None) -> int:
                threshold=0)
 
     pmt_other = describe(agg_prompt_other)
+    _miss_task = violations.get("missing_lerobot_task_text", 0)
+    ledger.add("TASK_TEXT_COMPLETE", hard=(args.task_text_source == "lerobot"),
+               passed=(_miss_task == 0),
+               detail=("生产口径下每个 episode 都必须能从 meta/episodes.jsonl 取到 tasks[0]。"
+                       "缺失时**不回退** annotation —— 回退会让「部分 episode 用了另一个口径」"
+                       "退化成 note 里的软信息，而 prompt 预算照常出数"),
+               measured={"missing_rows": _miss_task, "source": args.task_text_source},
+               threshold=0, evidence=evidence.get("missing_lerobot_task_text", []))
     ledger.add("PROMPT_TASK_TEXT_SOURCE", hard=False, passed=True,
                detail=("`Task:` 段的两个文本来源并排量。生产走 prompt_from_task=True ⇒ 取 LeRobot "
                        "meta/episodes.jsonl 的 tasks[0]；annotation 的 task_name 是另一个更短的串。"
@@ -1724,7 +1802,9 @@ def main(argv: list[str] | None = None) -> int:
     ledger.add("NO_ORACLE_LEAK", hard=True, passed=(violations.get("oracle_leak", 0) == 0),
                detail=("模型可见文本不得含帧计数器、annotation_index、segments、原始 object handle、"
                        "task ID、episode ID、frame index（doc 3.1 / 3.2）"),
-               measured={"total": violations.get("oracle_leak", 0), "by_kind": dict(leak_kinds)},
+               measured={"total": violations.get("oracle_leak", 0), "by_kind": dict(leak_kinds),
+                         "handles_without_id_suffix": sorted(handles_no_suffix)[:20],
+                         "handles_without_id_suffix_count": len(handles_no_suffix)},
                threshold=0, evidence=evidence.get("oracle_leak", []))
 
     # --- Memory 时序 / bridge ----------------------------------------------
@@ -1888,11 +1968,15 @@ def main(argv: list[str] | None = None) -> int:
                    threshold={"min_per_global_worker": 1})
 
         ledger.add("CLAMPED_RANGE_HITS_100PCT", hard=True,
-                   passed=(clamped_misses == 0 and clamped_empty == 0 and clamped_probes > 0),
+                   passed=(clamped_misses == 0 and clamped_empty == 0 and clamped_probes > 0
+                           and no_anchor_chunks == 0),
                    detail=("剔除 dead chunk、anchor 夹到 [max(cs,cov_s), min(ce,live_e)) 之后，"
-                           "frame → interval 命中率必须 100%；任一未命中即 hard error"
+                           "**stride 对齐的真实 anchor** 的 frame → interval 命中率必须 100%；"
+                           "任一未命中即 hard error"
                            "（文档 3.4.5「未命中区间 = hard error」在剔除之后的形式）"),
                    measured={"probes": clamped_probes, "misses": clamped_misses,
+                             "anchor_stride": opts["anchor_stride"], "anchor_offset": opts["anchor_offset"],
+                             "chunks_without_aligned_anchor": no_anchor_chunks,
                              "empty_clamped_ranges": clamped_empty,
                              "hit_rate_pct": round(100.0 * (clamped_probes - clamped_misses) / max(1, clamped_probes), 4)},
                    threshold={"misses": 0, "empty_clamped_ranges": 0},
@@ -1986,7 +2070,8 @@ def main(argv: list[str] | None = None) -> int:
     # 阈值来源：优先用**版本化登记基线**（按 manifest md5 索引），没有提供才退回命令行常量。
     # 直接把阈值改成当前实测值会让 gate 永远 PASS —— 那是跟着数据走的橡皮图章。
     reg_p99, reg_max = args.compact_p99_max, args.compact_max_max
-    reg_src = "命令行常量（未提供版本化登记基线）"
+    reg_src = "NOT-MEASURED：未提供版本化登记基线，退回命令行常量"
+    reg_missing = not args.distribution_baselines
     reg_entry: dict[str, Any] | None = None
     reg_unknown = False
     if args.distribution_baselines:
@@ -2020,7 +2105,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ledger.add("COMPACT_MEMORY_DISTRIBUTION",
                hard=reg_unknown,
-               passed=(not reg_unknown
+               passed=(not reg_unknown and not reg_missing
                        and cmp_.get("p99", 1 << 30) <= reg_p99
                        and cmp_.get("max", 1 << 30) <= reg_max),
                detail=("fixed compact Memory 字段的 token P99 / Max（观察漂移，不单独截断该字段）。"
@@ -2142,13 +2227,18 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(was, (int, float)) and isinstance(now, (int, float)):
                     delta = now - was
                 baseline_diff[name] = {"was": was, "now": now, "delta": delta}
-            changed = {k: v for k, v in baseline_diff.items() if v["delta"] not in (None, 0)}
+            not_comparable = {k: v for k, v in baseline_diff.items() if "NOT-COMPARABLE" in k}
+            changed = {k: v for k, v in baseline_diff.items()
+                       if v["delta"] not in (None, 0) and "NOT-COMPARABLE" not in k}
             ledger.add("BASELINE_DIFF", hard=False, passed=True,
                        detail=("与上一次报告的逐项差异。这里永远 PASS —— 它的作用是把变化摆出来，"
                                "而不是判定；真正的判定在各自的检查里"),
                        measured={"baseline_generated_at": base.get("generated_at"),
                                  "baseline_manifest_mtime": pick(base, "data_fingerprint", "manifest_mtime_iso"),
-                                 "changed": changed, "unchanged_keys": sorted(set(baseline_diff) - set(changed))},
+                                 "changed": changed,
+                                 "not_comparable": not_comparable,
+                                 "unchanged_keys": sorted(set(baseline_diff) - set(changed)
+                                                          - set(not_comparable))},
                        threshold="report-only")
             # 数据换没换：manifest 指纹必须变，否则量的还是旧数据
             base_manifest = pick(base, "data_fingerprint", "manifest_md5")
@@ -2195,6 +2285,8 @@ def main(argv: list[str] | None = None) -> int:
             "num_workers": args.num_workers,
             "frames_meta_root": str(args.frames_meta_root),
             "chunk_size": args.chunk_size,
+        "anchor_stride": args.anchor_stride if args.anchor_stride is not None else 1,
+        "anchor_offset": args.anchor_offset if args.anchor_offset is not None else 0,
             "max_uncovered_frames": args.max_uncovered_frames,
             "max_dead_chunks": args.max_dead_chunks,
             "dead_chunks_expected": args.dead_chunks_expected,
@@ -2239,6 +2331,8 @@ def main(argv: list[str] | None = None) -> int:
             "meta_episodes": len(episode_lengths) if episode_lengths is not None else None,
             "total_video_frames": total_video_frames,
             "chunk_size": args.chunk_size,
+        "anchor_stride": args.anchor_stride if args.anchor_stride is not None else 1,
+        "anchor_offset": args.anchor_offset if args.anchor_offset is not None else 0,
             "total_chunks": n_chunks_total,
             "uncovered_frames_head": unc_head,
             "uncovered_frames_tail": unc_tail,
