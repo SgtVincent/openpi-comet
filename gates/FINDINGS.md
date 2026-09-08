@@ -408,3 +408,78 @@ v2 条目里写明增量来源：max 从 49 涨到 56 来自**已批准的** phr
 fail-closed 那次跑在子集上，所以 `EPISODE_JOIN_1TO1` 也同时红了（子集必然如此）；
 要看的是 `COMPACT_MEMORY_DISTRIBUTION` 从软告警**升级成 hard failure** 且 threshold 显示
 `NOT-MEASURED` —— 它没有拿别的版本的值去卡，也没有把当前值学成阈值。
+
+
+---
+
+# 附：fail-open 审计与 P0 修复
+
+对 10 项 fail-open 清单逐条核对，**7 项是真 fail-open**，其中 1 项已实证产生过错误数字。
+
+## 🔴 最严重的一项：`Task:` 段用错了文本来源（已修）
+
+gate 原先用 annotation 的 `task_name`（`'turning on radio'`），而生产走
+`prompt_from_task=True`，取的是 LeRobot `meta/episodes.jsonl` 的 `tasks[0]`
+（`"Turn on the radio receiver that's on the table in the living room."`）。
+
+全量 261,353 行两个口径并排实测：
+
+| 口径 | min | p50 | p90 | p99 | **max** | 对 320 余量 |
+|-|-:|-:|-:|-:|-:|-:|
+| annotation `task_name`（**旧，低估**） | 116 | 126 | 130 | 136 | 161 | 159 |
+| **LeRobot `tasks[0]`（生产口径）** | 127 | 174 | 212 | 227 | **243** | **77（1.32×）** |
+
+逐行差值 min 5 / max 100。⇒ **对 320 仍是 0 条越界，「降到 320 可行」的结论不变，
+但安全边际是 1.32× 而不是 2.08×。** gate 现在默认 `--task-text-source lerobot`
+并把两个口径并排报出；`baseline_diff` 在口径不同时把 prompt 那行标成
+`NOT-COMPARABLE(baseline=...)`，不再相减。
+
+## P0 五项修复与各自的负控
+
+| 项 | 修法 | 负控实测 |
+|-|-|-|
+| task text | 默认生产口径，双口径并排 | 见上表 |
+| tokenizer 指纹 | `--expect-tokenizer-md5` / `--expect-vocab-size` hard 断言 | 喂错 md5 ⇒ hard fail |
+| superseded 基线 | `status != accepted` 直接拒绝 | 改成 superseded ⇒ hard fail |
+| 缺失不得渲染 PASS | `--mode formal`（默认）缺参 rc=2 拒绝；`diagnostic` 渲染 NOT-MEASURED 告警 | diagnostic 下三项全 WARN，无一 PASS |
+| filelist 对账 | 数量/归属/存在性三项，不符 rc=3 | 6,416 行截断清单 ⇒ CANNOT-ASSESS |
+
+## handle 泄漏判据的修正（误报，不是漏报）
+
+切到生产 task 文本后 `NO_ORACLE_LEAK` 报出 12,833 条，**全部来自 `grated_cheese`**：
+它归一化后是 `grated cheese`，一句普通英文，而生产 task 文本里正好有；**原串在文本里命中 0 次**。
+
+实测依据：全语料 432 个 handle 里**只有它 1 个不带数字后缀**。`radio 89` /
+`coffee table koagbh 0` 这类归一化形态自然语言不会写，`grated cheese` 会。
+
+⇒ 判据改为：**原串命中对所有 handle 生效；归一化命中只对带 `_\d+$` 后缀的 handle 生效。**
+配三条一组的对照（自检 20/20）：
+
+| case | 文本形态 | 预期 | 实测 |
+|-|-|-|-|
+| `plain_word_handle_not_flagged` | `grated cheese` | 不抓 | 零 violation |
+| `plain_word_handle_raw_form_still_flagged` | `grated_cheese` | 抓 | `oracle_leak` |
+| `oracle_leak_raw_handle` | `coffee_table_koagbh_0` | 抓 | `oracle_leak` |
+
+三条一起才说明改的是判据、不是把检查关小。
+
+## 🔴 anchor stride：**NOT-MEASURED，且是 production blocker**
+
+gate 全文 `anchor_stride` / `ANCHOR_STRIDE` / `streaming_anchor` 命中 **0** ——
+**完全不建模 anchor 采样步长**，只按 `range(0, L, chunk_size)` 算 chunk。
+
+后果：`CLAMPED_RANGE_HITS_100PCT` 探测的是**任意帧**（区间端点 + 随机帧），
+**不是 stride 对齐的真实 anchor**。所以那条「夹取后命中率 100%」证明的是
+「覆盖范围内任取一帧都命中」，**不是「训练实际会取的那些帧都命中」**。
+
+而 `dataset.py:_aligned_streaming_chunk_start` 在「某 chunk 内找不到 stride 对齐的 anchor」
+时会 raise。gate 对这种情形没有覆盖力。
+
+⇒ **这一项按 NOT-MEASURED 记，且标为 production blocker。** 刻意不用任意帧代替真实
+anchor 集合 —— 那会把一个未覆盖的风险伪装成已验证。实现前需与训练 owner 对齐
+stride 的生效值来源（`OPENPI_B1K_ANCHOR_STRIDE` / `_OFFSET` 的实际取值与覆盖方式）。
+
+## 不是 fail-open 的两项
+
+- `frames-meta-root`：传空串是**显式放弃**（记 NOT-MEASURED），请求了但读不到是 hard fail —— 区分了「我不查」和「我查不了」
+- `world_size` / `num_workers`：必传无默认值，不传 rc=2

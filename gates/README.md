@@ -73,6 +73,26 @@ PYTHONPATH=/tmp/b1k_tokenizer_py313 <py313> ruler_compare.py dump --tag sp022 --
 ... ruler_compare.py compare --a /tmp/a.jsonl --b /tmp/b.jsonl
 ```
 
+## 运行模式
+
+| 模式 | 行为 |
+|-|-|
+| `--mode formal`（默认） | 所有跨实现/跨版本对照的来源**必传**，缺一个就 rc=2 拒绝运行 |
+| `--mode diagnostic` | 允许缺，但缺的项渲染成 **NOT-MEASURED 告警**，**绝不渲染成 PASS** |
+
+formal 模式必传：`--world-size` `--num-workers` `--frames-meta-root` `--subtask-max-len`
+`--prompt-max-len` `--chunk-stats-json` `--config-scope-expect` `--distribution-baselines`
+`--expect-tokenizer-md5` `--expect-vocab-size`。
+
+⚠️ `--task-text-source` 默认 **`lerobot`**（生产口径）。用 `annotation` 会把 prompt 预算
+低估最多 100 个 token（max 161 vs 243）。
+
+## 已知未覆盖（NOT-MEASURED）
+
+**anchor stride**：gate 不建模采样步长，`CLAMPED_RANGE_HITS_100PCT` 用的是任意帧而非
+stride 对齐的真实 anchor ⇒ 该结论对训练实际会取的帧集合**没有覆盖力**。标为 production
+blocker，待与训练 owner 对齐后实现。
+
 ## 主要参数（阈值全部可调，这是三向验证的前提）
 
 | 参数 | 默认 | 说明 |

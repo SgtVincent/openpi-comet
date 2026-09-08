@@ -142,6 +142,12 @@ LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # 原始 object handle 形如 `radio_89` / `coffee_table_koagbh_0`：至少一个下划线，
 # 全小写数字。裸词（如 `robot`）不算 handle，否则会把普通英文判成泄漏。
 HANDLE_SHAPE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+# 归一化（下划线换空格）之后还能当判据的，只有**带数字后缀**的 handle：
+# `radio_89` -> "radio 89"、`coffee_table_koagbh_0` -> "coffee table koagbh 0"，自然语言不会这么写。
+# 而 `grated_cheese` -> "grated cheese" 是一句普通英文，生产 task 文本里就有
+# （实测全语料 432 个 handle 里只有它 1 个不带数字后缀，却造成 12,833 条误报）。
+# 所以：原串对所有 handle 判，归一化形态只对带数字后缀的判。
+HANDLE_HAS_ID_SUFFIX = re.compile(r"_\d+$")
 
 # 组合型 primitive 的 fallback 文案（判据由 worker 7630833c-749 提供并经本 gate
 # 全量复算：35,945 个区间命中、1,387 个 episode 受影响，与其读数逐字一致）。
@@ -392,6 +398,7 @@ def scan_episode(path_str: str) -> dict[str, Any]:
         "clamped_probes": 0,
         "clamped_misses": 0,
         "prod_lengths": [],
+        "prompt_lengths_other_source": [],
         "path_deltas": Counter(),
         "len_by_transition": {},
         "overhang_by_transition": Counter(),
@@ -421,8 +428,22 @@ def scan_episode(path_str: str) -> dict[str, Any]:
         note("empty_memory_annotation", path_str)
         return out
 
-    task_instruction = episode.get("task_name") or ""
-    if not task_instruction:
+    ann_task = episode.get("task_name") or ""
+    try:
+        _ep_idx = int(path.stem.split("_")[1])
+    except (IndexError, ValueError):
+        _ep_idx = None
+    lerobot_task = (_OPTS.get("episode_tasks") or {}).get(_ep_idx, "")
+    # 生产走 prompt_from_task=True，`Task:` 段填的是 LeRobot 的 tasks[0]，不是 annotation 的
+    # task_name。两者差很多（'turning on radio' vs 完整句子），用后者会低估 prompt 预算。
+    if _OPTS.get("task_text_source") == "lerobot":
+        task_instruction = lerobot_task
+        if not task_instruction:
+            note("missing_lerobot_task_text", f"{path_str}: episode_index={_ep_idx}")
+            task_instruction = ann_task
+    else:
+        task_instruction = ann_task
+    if not ann_task:
         note("missing_task_name", path_str)
     handles = _collect_handles(episode)
     valid_duration = (episode.get("meta_data") or {}).get("valid_duration")
@@ -509,7 +530,10 @@ def scan_episode(path_str: str) -> dict[str, Any]:
                 break
         normalized = text_slots.replace("_", " ")
         for h in handles:
-            if h in text_slots or h.replace("_", " ") in normalized:
+            hit = h in text_slots
+            if not hit and HANDLE_HAS_ID_SUFFIX.search(h):
+                hit = h.replace("_", " ") in normalized
+            if hit:
                 out["leak_kinds"]["raw_object_handle"] += 1
                 note("oracle_leak", f"{path_str}#{i}: raw_object_handle {h}")
                 break
@@ -605,6 +629,12 @@ def scan_episode(path_str: str) -> dict[str, Any]:
         # memory 文本。这里量的是未截断的真长度。
         prompt_len = len(sp.encode(prefix, add_bos=True))
         out["prompt_lengths"].append(prompt_len)
+        # 另一口径同时量一份：两个数并排报，读者不会以为数据变了
+        other_task = ann_task if _OPTS.get("task_text_source") == "lerobot" else lerobot_task
+        out["prompt_lengths_other_source"].append(
+            len(sp.encode(build_prefix_text(other_task, _STATE_STR,
+                                            row.get("previous_fixed_compact_memory") or ""),
+                          add_bos=True)))
         if prompt_len > prompt_max_len:
             note("prompt_over_max_len", f"{path_str}#{i}: {prompt_len}")
 
@@ -1003,12 +1033,28 @@ def run_self_test(args: argparse.Namespace) -> dict[str, Any]:
     r["current_memory"] = dict(r["current_memory"]); r["current_memory"]["primitive"] = r["current_primitive"]
     cases.append(("known_fallback_not_flagged_incomplete", "", episode([r])))
 
-    # 17) 目标文本含下划线：+4 换算的前提被打破
+    # 17) 负对照：无数字后缀的 handle（`grated_cheese`）归一化后是普通英文，
+    #     出现在文本里**不算泄漏** —— 这条防的是把检查改松之外的另一头：误报
+    r = dict(base_row); r["current_primitive"] = "take the grated cheese from the fridge"
+    r["current_memory"] = dict(r["current_memory"]); r["current_memory"]["primitive"] = r["current_primitive"]
+    ep = episode([r]); ep["skill_annotation"] = [{"object_id": [["grated_cheese"]],
+                                                  "manipulating_object_id": []}]
+    cases.append(("plain_word_handle_not_flagged", "", ep))
+
+    #     配套正对照：**原串** `grated_cheese`（带下划线）出现在文本里仍必须抓。
+    #     两条一起才说明改的是判据、不是把检查关小：自然语言形态放行、原串形态照抓。
+    r = dict(base_row); r["current_primitive"] = "take the grated_cheese from the fridge"
+    r["current_memory"] = dict(r["current_memory"]); r["current_memory"]["primitive"] = r["current_primitive"]
+    ep = episode([r]); ep["skill_annotation"] = [{"object_id": [["grated_cheese"]],
+                                                  "manipulating_object_id": []}]
+    cases.append(("plain_word_handle_raw_form_still_flagged", "oracle_leak", ep))
+
+    # 18) 目标文本含下划线：+4 换算的前提被打破
     r = dict(base_row); r["current_skill"] = "move to the coffee_table"
     r["current_memory"] = dict(r["current_memory"]); r["current_memory"]["skill"] = r["current_skill"]
     cases.append(("underscore_in_target_text", "underscore_in_target_text", episode([r])))
 
-    # 18) 空 memory_annotation
+    # 19) 空 memory_annotation
     ep = episode([dict(base_row)]); ep["memory_annotation"] = []
     cases.append(("empty_memory_annotation", "empty_memory_annotation", ep))
 
@@ -1063,6 +1109,18 @@ def _default_jobs() -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MoMA-VLA 训练准入 gate")
+    p.add_argument("--mode", choices=("formal", "diagnostic"), default="formal",
+                   help="formal（默认）：所有对照来源必传，缺一个就拒绝运行。"
+                        "diagnostic：允许缺，但缺的项一律渲染成 NOT-MEASURED 的告警，"
+                        "**绝不渲染成 PASS** —— 没查到不等于通过")
+    p.add_argument("--task-text-source", choices=("lerobot", "annotation"), default="lerobot",
+                   help="`Task:` 段的文本来源。生产走 prompt_from_task=True，取的是 LeRobot "
+                        "meta/episodes.jsonl 的 tasks[0]（默认）；annotation 的 task_name 是"
+                        "另一个更短的串，用它会把 prompt 预算低估（实测 max 161 vs 243）")
+    p.add_argument("--expect-tokenizer-md5", type=str, default=None,
+                   help="必须匹配的 SentencePiece 模型文件 md5。换了尺子而不报错，"
+                        "整套数字都会安静地变成另一把尺子量出来的")
+    p.add_argument("--expect-vocab-size", type=int, default=None)
     p.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     p.add_argument("--expect-tasks", type=int, default=DEFAULT_EXPECT_TASKS)
     p.add_argument("--expect-episodes-per-task", type=int, default=DEFAULT_EXPECT_EPISODES_PER_TASK)
@@ -1136,11 +1194,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--fail-on-soft", action="store_true")
     args = p.parse_args(argv)
     if not args.self_test:
-        missing = [n for n, v in (("--world-size", args.world_size),
-                                  ("--num-workers", args.num_workers),
-                                  ("--frames-meta-root", args.frames_meta_root),
-                                  ("--subtask-max-len", args.subtask_max_len),
-                                  ("--prompt-max-len", args.prompt_max_len)) if v is None]
+        required = [("--world-size", args.world_size),
+                    ("--num-workers", args.num_workers),
+                    ("--frames-meta-root", args.frames_meta_root),
+                    ("--subtask-max-len", args.subtask_max_len),
+                    ("--prompt-max-len", args.prompt_max_len)]
+        if args.mode == "formal":
+            # 正式模式：所有跨实现/跨版本对照的来源都必须显式给出。
+            # 「可选参数缺了就当通过」是 fail-open —— gate 的语义必须是「没查到就不能说通过」。
+            required += [("--chunk-stats-json", args.chunk_stats_json),
+                         ("--config-scope-expect", args.config_scope_expect),
+                         ("--distribution-baselines", args.distribution_baselines),
+                         ("--expect-tokenizer-md5", args.expect_tokenizer_md5),
+                         ("--expect-vocab-size", args.expect_vocab_size)]
+        missing = [n for n, v in required if v is None]
         if missing:
             p.error(
                 "以下参数必须显式传入，不提供默认值：" + " ".join(missing) + "。\n"
@@ -1151,7 +1218,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 "  --subtask-max-len / --prompt-max-len：这两个上限还在决策中"
                 "（128/160/192、512/320）。写死任何一个候选值，就等于让 gate 在一个假设的"
                 "上限上给出 PASS。\n"
-                "  --frames-meta-root 传空串 '' 表示显式放弃联表检查（记为 NOT-MEASURED）。"
+                "  --frames-meta-root 传空串 '' 表示显式放弃联表检查（记为 NOT-MEASURED）。\n"
+                "  只想快速看数、不做正式准入判定时用 --mode diagnostic：缺的项会渲染成 "
+                "NOT-MEASURED 告警，但**不会渲染成 PASS**。"
             )
     return args
 
@@ -1173,8 +1242,29 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- 文件枚举（先界定集合规模，再谈命中数）-----------------------------
     task_dirs = sorted(d for d in root.glob("task-*") if d.is_dir())
+    filelist_audit: dict[str, Any] = {"used": False}
     if args.file_list and Path(args.file_list).exists():
+        # 「文件存在」不是「文件完整」：被 kill 的写入会留下截断清单，而 exists() 照样为真
+        # （实测踩过一次 6,416 行的截断）。所以用清单前要对账：数量、归属、可读性。
         files = [Path(x) for x in Path(args.file_list).read_text().split() if x.strip()]
+        truth = 0
+        for td in task_dirs:
+            with os.scandir(td) as it:
+                truth += sum(1 for e in it
+                             if e.is_file() and e.name.startswith("episode_")
+                             and e.name.endswith(".json"))
+        rootr = str(Path(root).resolve())
+        outside = [str(f) for f in files if not str(Path(f).resolve()).startswith(rootr + os.sep)]
+        gone = [str(f) for f in files[:: max(1, len(files) // 200)] if not Path(f).exists()]
+        filelist_audit = {"used": True, "path": str(args.file_list),
+                          "listed": len(files), "on_disk": truth,
+                          "count_matches": len(files) == truth,
+                          "outside_data_root": len(outside), "outside_examples": outside[:5],
+                          "sampled_missing": len(gone), "missing_examples": gone[:5]}
+        if not filelist_audit["count_matches"] or outside or gone:
+            print("CANNOT-ASSESS: --file-list 对账失败 "
+                  f"{json.dumps(filelist_audit, ensure_ascii=False)}", flush=True)
+            return 3
     else:
         files = sorted(root.glob("task-*/episode_*.json"))
     if args.file_stride > 1:
@@ -1211,25 +1301,39 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- 视频帧语料联表（annotation 是 derived 层，本身不含帧/state）--------
     episode_lengths: dict[int, int] | None = None
+    episode_tasks: dict[int, str] = {}
     frames_meta_status = "not-requested (显式跳过联表检查)"
     frames_meta_path = None
     if args.frames_meta_root.strip():
         frames_meta_path = Path(args.frames_meta_root) / "meta" / "episodes.jsonl"
         if frames_meta_path.exists():
             episode_lengths = {}
+            episode_tasks = {}
             with frames_meta_path.open(encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
                         continue
                     rec = json.loads(line)
-                    episode_lengths[int(rec["episode_index"])] = int(rec["length"])
-            frames_meta_status = f"loaded {len(episode_lengths)} episodes"
+                    idx = int(rec["episode_index"])
+                    episode_lengths[idx] = int(rec["length"])
+                    tl = rec.get("tasks") or []
+                    episode_tasks[idx] = tl[0] if tl else ""
+            frames_meta_status = (f"loaded {len(episode_lengths)} episodes, "
+                                  f"{sum(1 for v in episode_tasks.values() if v)} 条带 task 文本")
         else:
             frames_meta_status = f"NOT-MEASURED: {frames_meta_path} 不存在"
     print(f"[frames-meta] {frames_meta_status}", flush=True)
 
+    if args.task_text_source == "lerobot" and not episode_tasks:
+        print("CANNOT-ASSESS: --task-text-source lerobot 需要 meta/episodes.jsonl 的 tasks 字段，"
+              f"但没读到（{frames_meta_status}）。生产的 Task: 文本来自那里，用 annotation 的 "
+              "task_name 代替会把 prompt 预算低估（实测 max 161 vs 243），所以这里不静默降级。")
+        return 3
+
     opts = {
+        "episode_tasks": episode_tasks,
+        "task_text_source": args.task_text_source,
         "episode_lengths": episode_lengths,
         "chunk_size": args.chunk_size,
         "prompt_max_len": args.prompt_max_len,
@@ -1247,6 +1351,7 @@ def main(argv: list[str] | None = None) -> int:
     agg_prompt: list[int] = []
     agg_compact: list[int] = []
     agg_prod: list[int] = []
+    agg_prompt_other: list[int] = []
     path_deltas: Counter = Counter()
     len_by_tt: dict = {}
     overhang_by_tt: Counter = Counter()
@@ -1299,6 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
             agg_prompt.extend(res["prompt_lengths"])
             agg_compact.extend(res["compact_lengths"])
             agg_prod.extend(res.get("prod_lengths", []))
+            agg_prompt_other.extend(res.get("prompt_lengths_other_source", []))
             path_deltas.update(res.get("path_deltas", {}))
             for _tt, _b in (res.get("len_by_transition") or {}).items():
                 _cur = len_by_tt.setdefault(_tt, {"n": 0, "prod_max": 0, "doc_max": 0})
@@ -1367,6 +1473,29 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     ledger.add("READABLE_EPISODES", hard=True, passed=True,
                detail="全部 episode JSON 可读", measured=readable, threshold=n_files)
+
+    # --- 尺子必须是登记的那一把 ----------------------------------------------
+    # 之前只把 md5/vocab 记进报告、不断言 ⇒ 换了模型文件，整套数字会安静地变成
+    # 另一把尺子量出来的，而 gate 照样 PASS。
+    if args.expect_tokenizer_md5 or args.expect_vocab_size is not None:
+        bad_ruler = []
+        if args.expect_tokenizer_md5 and fp_tok["sentencepiece_model_md5"] != args.expect_tokenizer_md5:
+            bad_ruler.append(f"md5 {fp_tok['sentencepiece_model_md5']} != {args.expect_tokenizer_md5}")
+        if args.expect_vocab_size is not None and int(fp_tok["vocab_size"]) != args.expect_vocab_size:
+            bad_ruler.append(f"vocab_size {fp_tok['vocab_size']} != {args.expect_vocab_size}")
+        ledger.add("TOKENIZER_FINGERPRINT", hard=True, passed=not bad_ruler,
+                   detail="SentencePiece 模型文件 md5 与 vocab_size 必须等于登记值",
+                   measured={k: fp_tok[k] for k in
+                             ("sentencepiece_model_path", "sentencepiece_model_md5",
+                              "vocab_size", "sentencepiece_lib_version")},
+                   threshold={"md5": args.expect_tokenizer_md5, "vocab_size": args.expect_vocab_size},
+                   evidence=bad_ruler)
+    else:
+        ledger.add("TOKENIZER_FINGERPRINT", hard=False, passed=False,
+                   detail="NOT-MEASURED：未提供 --expect-tokenizer-md5 / --expect-vocab-size。"
+                          "没查到不等于通过，所以这里不渲染成 PASS",
+                   measured={k: fp_tok[k] for k in ("sentencepiece_model_md5", "vocab_size")},
+                   threshold="NOT-MEASURED")
 
     # --- 正/负对照 ----------------------------------------------------------
     ledger.add(
@@ -1548,6 +1677,18 @@ def main(argv: list[str] | None = None) -> int:
                          ("bos_supervised", "bos_missing", "loss_mask_contract", "ar_mask_contract")},
                threshold=0)
 
+    pmt_other = describe(agg_prompt_other)
+    ledger.add("PROMPT_TASK_TEXT_SOURCE", hard=False, passed=True,
+               detail=("`Task:` 段的两个文本来源并排量。生产走 prompt_from_task=True ⇒ 取 LeRobot "
+                       "meta/episodes.jsonl 的 tasks[0]；annotation 的 task_name 是另一个更短的串。"
+                       "两个数并排给出，读者不会把口径差异误读成数据变化"),
+               measured={"active_source": args.task_text_source,
+                         "active": {k: pmt.get(k) for k in ("p50", "p90", "p99", "max")},
+                         "other_source": ("annotation" if args.task_text_source == "lerobot"
+                                          else "lerobot"),
+                         "other": {k: pmt_other.get(k) for k in ("p50", "p90", "p99", "max")},
+                         "missing_lerobot_task_rows": violations.get("missing_lerobot_task_text", 0)},
+               threshold="report-only")
     ledger.add("PROMPT_TOKEN_BUDGET", hard=True,
                passed=(violations.get("prompt_over_max_len", 0) == 0
                        and pmt.get("max", 1 << 30) <= args.prompt_max_len),
@@ -1709,8 +1850,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ledger.add("CHUNK_STATS_AGREE_WITH_TRAINING_SIDE",
                        hard=bool(args.chunk_stats_json),
-                       passed=not bool(args.chunk_stats_json),
-                       detail=("未提供 --chunk-stats-json ⇒ 只报 gate 自己的数，没有跨实现对照"
+                       passed=False,
+                       detail=("NOT-MEASURED：未提供 --chunk-stats-json ⇒ 没有跨实现对照。"
+                               "没查到不等于通过，所以不渲染成 PASS"
                                if not args.chunk_stats_json
                                else f"提供了 --chunk-stats-json 但读不到有效字段 ⇒ NOT-MEASURED：{stats_err}"),
                        measured={"gate": {"total_chunks": n_chunks_total, "live": live_measured,
@@ -1865,10 +2007,16 @@ def main(argv: list[str] | None = None) -> int:
                     reg_unknown = True
                     reg_src = (f"manifest md5 {key} 未登记 ⇒ fail-closed，NOT-MEASURED。"
                                f"已登记版本: {sorted(v.get('label', k) for k, v in table.items())}")
+                elif str(reg_entry.get("status")) != "accepted":
+                    # status 此前只被打印、不参与判定 ⇒ 拿已被取代的版本跑也会 PASS。
+                    reg_unknown = True
+                    reg_src = (f"登记基线 [{reg_entry.get('label')}] 的 status="
+                               f"{reg_entry.get('status')!r}，不是 accepted ⇒ 拒绝用它放行")
+                    reg_entry = None
                 else:
                     reg_p99 = int(reg_entry["fixed_compact_memory_p99_max"])
                     reg_max = int(reg_entry["fixed_compact_memory_max_max"])
-                    reg_src = f"登记基线 [{reg_entry.get('label')}] status={reg_entry.get('status')}"
+                    reg_src = f"登记基线 [{reg_entry.get('label')}] status=accepted"
 
     ledger.add("COMPACT_MEMORY_DISTRIBUTION",
                hard=reg_unknown,
@@ -1884,6 +2032,11 @@ def main(argv: list[str] | None = None) -> int:
                threshold=({"p99": reg_p99, "max": reg_max} if not reg_unknown else "NOT-MEASURED"))
 
     # --- subtask_max_len 作用域守卫 ------------------------------------------
+    if not args.config_scope_expect:
+        ledger.add("SUBTASK_MAX_LEN_SCOPE", hard=False, passed=False,
+                   detail="NOT-MEASURED：未提供 --config-scope-expect ⇒ 作用域完全没查。"
+                          "此前这条在缺参时整条不加入报告，看起来像一切正常",
+                   measured="NOT-MEASURED", threshold="需要 --config-scope-expect")
     if args.config_scope_expect:
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1952,7 +2105,10 @@ def main(argv: list[str] | None = None) -> int:
                         return default
                 return cur
 
+            # 旧报告没有 task_text_source 字段，那时用的一律是 annotation 的 task_name
+            _base_task_src = (pick(base, "thresholds", "task_text_source") or "annotation")
             pairs = [
+                ("baseline_task_text_source", _base_task_src, args.task_text_source),
                 ("intervals", pick(base, "counts", "memory_intervals"), total_intervals),
                 ("planner_target_max_production", pick(base, "token_lengths",
                                                        "planner_target_text__production_tokenize_memory",
@@ -1961,8 +2117,15 @@ def main(argv: list[str] | None = None) -> int:
                                                      "planner_target_text__training_tokenizer", "max"), tgt_max),
                 ("planner_target_p99", pick(base, "token_lengths",
                                             "planner_target_text__training_tokenizer", "p99"), tgt.get("p99")),
-                ("prompt_max", pick(base, "token_lengths",
-                                    "prefix_prompt__training_tokenizer_worst_case_state", "max"), pmt.get("max")),
+                # prompt 只在**口径相同**时才比。旧报告用 annotation 的 task_name、
+                # 新默认用 LeRobot 的 tasks[0]，两者差最多 100 个 token；直接相减会把
+                # 口径变更渲染成数据变化 —— 这个坑本轮已经踩过一次（190 vs 161 的 -29）。
+                ("prompt_max" + ("" if _base_task_src == args.task_text_source
+                                 else f"__NOT-COMPARABLE(baseline={_base_task_src})"),
+                 (pick(base, "token_lengths", f"prefix_prompt__active_source_{args.task_text_source}", "max")
+                  or (pick(base, "token_lengths", "prefix_prompt__training_tokenizer_worst_case_state", "max")
+                      if _base_task_src == args.task_text_source else None)),
+                 pmt.get("max")),
                 ("compact_p99", pick(base, "token_lengths", "fixed_compact_memory_field", "p99"), cmp_.get("p99")),
                 ("compact_max", pick(base, "token_lengths", "fixed_compact_memory_field", "max"), cmp_.get("max")),
                 ("dead_chunks", pick(base, "frames_meta", "dead_chunks"), dead_chunks),
@@ -1975,8 +2138,10 @@ def main(argv: list[str] | None = None) -> int:
                 ("bridge_anomalies", pick(base, "violations", "intra_bridge_primitive_changed"), bridge_anomalies),
             ]
             for name, was, now in pairs:
-                baseline_diff[name] = {"was": was, "now": now,
-                                       "delta": (None if was is None or now is None else now - was)}
+                delta = None
+                if isinstance(was, (int, float)) and isinstance(now, (int, float)):
+                    delta = now - was
+                baseline_diff[name] = {"was": was, "now": now, "delta": delta}
             changed = {k: v for k, v in baseline_diff.items() if v["delta"] not in (None, 0)}
             ledger.add("BASELINE_DIFF", hard=False, passed=True,
                        detail=("与上一次报告的逐项差异。这里永远 PASS —— 它的作用是把变化摆出来，"
@@ -2017,6 +2182,10 @@ def main(argv: list[str] | None = None) -> int:
             "expect_episodes_per_task": args.expect_episodes_per_task,
             "expect_episodes": args.expect_episodes,
             "expect_intervals": args.expect_intervals,
+            "mode": args.mode,
+            "task_text_source": args.task_text_source,
+            "expect_tokenizer_md5": args.expect_tokenizer_md5,
+            "expect_vocab_size": args.expect_vocab_size,
             "expect_overhang_episodes": args.expect_overhang_episodes,
             "config_scope_expect": str(args.config_scope_expect) if args.config_scope_expect else None,
             "subtask_max_len": args.subtask_max_len,
@@ -2056,9 +2225,11 @@ def main(argv: list[str] | None = None) -> int:
             "planner_target_text__production_tokenize_memory": prod,
             "planner_target_text__training_tokenizer": tgt,
             "model_target_text__training_tokenizer": mtgt,
-            "prefix_prompt__training_tokenizer_worst_case_state": pmt,
+            "prefix_prompt__active_source_%s" % args.task_text_source: pmt,
+            "prefix_prompt__other_source": pmt_other,
             "fixed_compact_memory_field": cmp_,
         },
+        "filelist_audit": filelist_audit,
         "frames_meta": {
             "status": frames_meta_status,
             "sampled_probes_over_full_video_range": vr_probes,
@@ -2113,7 +2284,8 @@ def main(argv: list[str] | None = None) -> int:
     # --- 人读输出 -----------------------------------------------------------
     print()
     print("=" * 78)
-    print(f"MoMA-VLA PRETRAIN GATE  verdict={verdict}")
+    print(f"MoMA-VLA PRETRAIN GATE  verdict={verdict}  mode={args.mode}  "
+          f"task_text_source={args.task_text_source}")
     print("=" * 78)
     print(f"data_root      : {root}")
     print(f"frames_meta    : {frames_meta_status} (root={args.frames_meta_root!r})")
