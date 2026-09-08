@@ -59,6 +59,16 @@ def _add_conditioning_text_keys(repack_patterns: dict, model_type, subtask_sourc
         # memory run.  Asking for both is not a harmless superset.
         repack_patterns["memory_text"] = "memory_text"
         repack_patterns["previous_memory_text"] = "previous_memory_text"
+        # Training-only scalar telemetry. These fields never condition the model;
+        # they survive only so the trainer can report the realized MIX-C sample
+        # distribution rather than restating configured weights.
+        for key in (
+            "memory_selected_stride",
+            "memory_anchor_kind",
+            "memory_chunk_lag",
+            "memory_frame_lag",
+        ):
+            repack_patterns[key] = key
     else:
         repack_patterns["subtask_text"] = "subtask_text"
     return repack_patterns

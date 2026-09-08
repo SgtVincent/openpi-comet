@@ -184,6 +184,9 @@ _PARTIAL_HASH_WINDOW = 64 * 1024 * 1024  # 64 MiB head + 64 MiB tail
 REGISTERED_ALLOWLIST: dict[str, dict[str, str]] = {
     "pi05_moma_memory_b1k-k5": {},
     "pi05_moma_memory_b1k-k5_smoke": {},
+    "pi05_moma_memory_b1k-k1-short": {},
+    "pi05_moma_memory_b1k-mix-c-short": {},
+    "pi05_moma_memory_b1k-mix-c": {},
 }
 
 

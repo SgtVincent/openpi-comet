@@ -515,6 +515,9 @@ def test_registered_allowlist_is_empty_and_not_settable_from_cli():
     assert gate.REGISTERED_ALLOWLIST == {
         "pi05_moma_memory_b1k-k5": {},
         "pi05_moma_memory_b1k-k5_smoke": {},
+        "pi05_moma_memory_b1k-k1-short": {},
+        "pi05_moma_memory_b1k-mix-c-short": {},
+        "pi05_moma_memory_b1k-mix-c": {},
     }, gate.REGISTERED_ALLOWLIST
     assert gate.allowlist_for("pi05_moma_memory_b1k-k5") == ()
     assert gate.allowlist_for("anything") == ()

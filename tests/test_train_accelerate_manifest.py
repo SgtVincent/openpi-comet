@@ -186,6 +186,54 @@ def test_mix_c_manifest_reads_exact_data_config_values(monkeypatch):
         assert mod._build_data_fingerprint(cfg, changed)["sha256"] != baseline_sha
 
 
+def test_k1_short_manifest_is_stable_and_distinct_from_mix_c():
+    mod = _get_module()
+    cfg = MockConfig()
+    k1 = MockDataConfig(
+        subtask_source="annotations_memory",
+        memory_planner_stride_weights=((1, 1.0),),
+        memory_planner_stride_seed=42,
+        memory_frames_per_chunk=32,
+    )
+    mix = MockDataConfig(
+        subtask_source="annotations_memory",
+        memory_planner_stride_weights=((1, 0.4), (2, 0.3), (5, 0.2), (10, 0.1)),
+        memory_planner_stride_seed=42,
+        memory_frames_per_chunk=32,
+    )
+    first = mod._build_data_fingerprint(cfg, k1)
+    second = mod._build_data_fingerprint(cfg, k1)
+    assert first["memory_mix_c"]["weights"] == [[1, 1.0]]
+    assert first["sha256"] == second["sha256"]
+    assert first["sha256"] != mod._build_data_fingerprint(cfg, mix)["sha256"]
+
+
+def test_memory_telemetry_is_detached_before_model_forward():
+    mod = _get_module()
+    import openpi.models.model as model
+    import torch
+
+    obs = model.Observation(
+        images={}, image_masks={}, state=torch.zeros(2, 3),
+        memory_selected_stride=torch.tensor([0, 5]),
+        memory_anchor_kind=torch.tensor([0, 1]),
+        memory_chunk_lag=torch.tensor([0, 3]),
+        memory_frame_lag=torch.tensor([0, 96]),
+    )
+    metrics, clean = mod._memory_telemetry_from_observation(obs)
+    assert metrics["memory_k0_count"] == 1
+    assert metrics["memory_k5_count"] == 1
+    assert metrics["memory_anchor_initial_count"] == 1
+    assert metrics["memory_anchor_periodic_count"] == 1
+    assert metrics["memory_chunk_lag_sum"] == 3
+    assert metrics["memory_frame_lag_sum"] == 96
+    assert clean.memory_selected_stride is None
+    assert clean.memory_anchor_kind is None
+    assert clean.memory_chunk_lag is None
+    assert clean.memory_frame_lag is None
+    assert clean.state is obs.state
+
+
 def test_non_memory_manifest_has_no_mix_c_spec():
     mod = _get_module()
     cfg = MockConfig()

@@ -142,6 +142,15 @@ class Observation(Generic[ArrayT]):
     # Autoregressive mask for the action-token segment (causal within it).
     action_token_ar_mask: at.Int[ArrayT, "*b al"] | None = None
 
+    # Training-only held-memory telemetry. The model never reads these fields;
+    # the trainer consumes them after collation to report the realized selector
+    # distribution. Keeping them on Observation prevents transform/collation
+    # layers from silently dropping them before the trainer can measure them.
+    memory_selected_stride: ArrayT | None = None
+    memory_anchor_kind: ArrayT | None = None
+    memory_chunk_lag: ArrayT | None = None
+    memory_frame_lag: ArrayT | None = None
+
     # Point cloud.
     pcd_xyz: at.Float[ArrayT, "*b pc_s n 3"] | None = None
 
@@ -173,7 +182,20 @@ class Observation(Generic[ArrayT]):
             action_token_mask=data.get("action_token_mask"),
             action_token_loss_mask=data.get("action_token_loss_mask"),
             action_token_ar_mask=data.get("action_token_ar_mask"),
+            memory_selected_stride=data.get("memory_selected_stride"),
+            memory_anchor_kind=data.get("memory_anchor_kind"),
+            memory_chunk_lag=data.get("memory_chunk_lag"),
+            memory_frame_lag=data.get("memory_frame_lag"),
             pcd_xyz=data.get("pcd_xyz"),
+        )
+
+    def without_memory_telemetry(self) -> "Observation[ArrayT]":
+        """Remove diagnostics before model forward; no model input may depend on them."""
+        return self.replace(
+            memory_selected_stride=None,
+            memory_anchor_kind=None,
+            memory_chunk_lag=None,
+            memory_frame_lag=None,
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

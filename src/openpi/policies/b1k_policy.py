@@ -182,9 +182,21 @@ class B1kInputs(transforms.DataTransformFn):
         # these two lines the dataset produces memory, the repack passes it, and
         # this transform silently discards it one step before tokenization.
         if self.model_type == _model.ModelType.PI05_SUBTASK:
-            for _memory_key in ("memory_text", "previous_memory_text"):
+            for _memory_key in (
+                "memory_text",
+                "previous_memory_text",
+                "memory_selected_stride",
+                "memory_chunk_lag",
+                "memory_frame_lag",
+            ):
                 if _memory_key in data:
                     inputs[_memory_key] = data[_memory_key]
+            if "memory_anchor_kind" in data:
+                anchor_kind = str(data["memory_anchor_kind"])
+                anchor_codes = {"initial": 0, "periodic": 1, "annotation_previous": 2}
+                if anchor_kind not in anchor_codes:
+                    raise ValueError(f"unknown memory_anchor_kind: {anchor_kind!r}")
+                inputs["memory_anchor_kind"] = np.int32(anchor_codes[anchor_kind])
 
         if self.depth_as_pcd:
             inputs["pcd_xyz"] = pcd_xyz
