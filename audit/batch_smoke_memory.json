@@ -1,0 +1,259 @@
+{
+  "verdict": "ok",
+  "passed": 50,
+  "failed": 0,
+  "ran": 50,
+  "expected": 50,
+  "results": [
+    {
+      "name": "numpy resolves to a numba-compatible build (2.3.x)",
+      "ok": true,
+      "detail": "__version__=2.3.5"
+    },
+    {
+      "name": "numpy is served from the overlay, not the env",
+      "ok": true,
+      "detail": "__file__=/mnt/bn/navigation-hl/mlx/users/chenjunting/h20_fastce/pyoverlay/numpy/__init__.py"
+    },
+    {
+      "name": "numba imports",
+      "ok": true,
+      "detail": "version=0.63.1"
+    },
+    {
+      "name": "dataset constructed with subtask_source='annotations_memory'",
+      "ok": true,
+      "detail": "episodes=[0, 1, 2]"
+    },
+    {
+      "name": "memory source is actually enabled on the instance",
+      "ok": true,
+      "detail": "memory_source_enabled=True"
+    },
+    {
+      "name": "dataset retained chunks after Memory-coverage restriction",
+      "ok": true,
+      "detail": "chunks=7256"
+    },
+    {
+      "name": "pulled at least one item",
+      "ok": true,
+      "detail": "items=4"
+    },
+    {
+      "name": "every item carries memory_text",
+      "ok": true,
+      "detail": "4/4"
+    },
+    {
+      "name": "every item carries previous_memory_text",
+      "ok": true,
+      "detail": "4/4"
+    },
+    {
+      "name": "memory subsumes the subtask channel (no second writer into subtask_text)",
+      "ok": true,
+      "detail": "subtask_text absent on all memory items"
+    },
+    {
+      "name": "registered config pins the decided budgets",
+      "ok": true,
+      "detail": "name=pi05_moma_memory_b1k-k5_smoke subtask_max_len=192 max_token_len=320"
+    },
+    {
+      "name": "registered config selects the memory source",
+      "ok": true,
+      "detail": "subtask_source='annotations_memory'"
+    },
+    {
+      "name": "production helper turns the memory flags ON for this config",
+      "ok": true,
+      "detail": "include=True require=True"
+    },
+    {
+      "name": "NEGATIVE CONTROL: non-memory source leaves the flags OFF",
+      "ok": true,
+      "detail": "include=False require=False"
+    },
+    {
+      "name": "production config yields a TokenizeSubtaskInputs",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "production config set require_memory=True",
+      "ok": true,
+      "detail": "require_memory=True"
+    },
+    {
+      "name": "tokenizer budget matches the config (not a re-derived guess)",
+      "ok": true,
+      "detail": "tokenizer._subtask_max_len=192"
+    },
+    {
+      "name": "memory_text survives the prompt transform",
+      "ok": true,
+      "detail": "present after PromptFromLeRobotItem"
+    },
+    {
+      "name": "previous_memory_text survives the prompt transform",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "repack keeps memory_text (break 4)",
+      "ok": true,
+      "detail": "memory keys=['memory_text', 'previous_memory_text']"
+    },
+    {
+      "name": "repack keeps previous_memory_text (break 4)",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B1kInputs forwards memory_text (break 5)",
+      "ok": true,
+      "detail": "memory keys=['memory_text', 'previous_memory_text']"
+    },
+    {
+      "name": "B1kInputs forwards previous_memory_text (break 5)",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "state survives the data transforms",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "state reaching the tokenizer is 23 wide, not the padded 32",
+      "ok": true,
+      "detail": "dim=23; PadStatesAndActions runs after tokenize so its 9 slots never reach State:"
+    },
+    {
+      "name": "Normalize applied with real stats",
+      "ok": true,
+      "detail": "keys=['actions', 'state']"
+    },
+    {
+      "name": "tokenized output has tokenized_prompt",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "tokenized output has subtask_tokens",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "tokenized output has subtask_mask",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "tokenized output has subtask_ar_mask",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "tokenized output has subtask_loss_mask",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "first token is BOS",
+      "ok": true,
+      "detail": "tokens[0]=2 bos=2"
+    },
+    {
+      "name": "BOS is NOT supervised",
+      "ok": true,
+      "detail": "loss_mask[0]=False"
+    },
+    {
+      "name": "EOS present in the sequence",
+      "ok": true,
+      "detail": "positions=[61]"
+    },
+    {
+      "name": "EOS is inside the attention mask",
+      "ok": true,
+      "detail": "mask[61]=True"
+    },
+    {
+      "name": "EOS is inside the loss mask",
+      "ok": true,
+      "detail": "loss_mask[61]=True"
+    },
+    {
+      "name": "padding after EOS is neither attended nor supervised",
+      "ok": true,
+      "detail": "any_mask_after=False any_loss_after=False"
+    },
+    {
+      "name": "supervised positions are a strict subset of attended positions",
+      "ok": true,
+      "detail": "supervised_but_unattended=0"
+    },
+    {
+      "name": "POSITIVE CONTROL: something is actually supervised",
+      "ok": true,
+      "detail": "supervised_tokens=61"
+    },
+    {
+      "name": "no 'Frame N of M' oracle leak in State:",
+      "ok": true,
+      "detail": "no match"
+    },
+    {
+      "name": "POSITIVE CONTROL: the leak regex can fire at all",
+      "ok": true,
+      "detail": "matches a synthetic leaky string"
+    },
+    {
+      "name": "State: carries multiple numeric buckets (discretised joints)",
+      "ok": true,
+      "detail": "numeric_tokens=23 sample=['130', '125', '125', '116', '131', '167', '132', '209']"
+    },
+    {
+      "name": "all State: buckets are within the 256-bucket range",
+      "ok": true,
+      "detail": "min=36 max=255"
+    },
+    {
+      "name": "Action Query is absent from the tokenized memory target",
+      "ok": true,
+      "detail": "decoded_head='Memory: No steps completed; currently picking up the radio from the co'"
+    },
+    {
+      "name": "Action Query is absent from the dataset's memory_text too",
+      "ok": true,
+      "detail": "checked the raw field, not just the tokens"
+    },
+    {
+      "name": "no item exceeds subtask_max_len",
+      "ok": true,
+      "detail": "max=62 budget=192 n=4"
+    },
+    {
+      "name": "non-memory chain carries no memory fields",
+      "ok": true,
+      "detail": "memory keys=[]"
+    },
+    {
+      "name": "POSITIVE CONTROL: non-memory chain still carries subtask_text",
+      "ok": true,
+      "detail": "the control arm is live, not simply empty"
+    },
+    {
+      "name": "non-memory tokenizer supervises its subtask",
+      "ok": true,
+      "detail": "supervised_tokens=7"
+    },
+    {
+      "name": "memory tokenizer rejects the same non-memory item",
+      "ok": true,
+      "detail": "require_memory=True raises rather than silently unconditioning"
+    }
+  ]
+}
