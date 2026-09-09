@@ -24,6 +24,12 @@ from openpi.policies.b1k_policy import B1kInputs
 from openpi.training.memory_annotation import MEMORY_SUBTASK_SOURCE
 
 MEMORY_KEYS = ("memory_text", "previous_memory_text")
+MEMORY_TELEMETRY_KEYS = (
+    "memory_selected_stride",
+    "memory_anchor_kind",
+    "memory_chunk_lag",
+    "memory_frame_lag",
+)
 
 
 def _item() -> dict:
@@ -39,6 +45,10 @@ def _item() -> dict:
         "subtask_text": "SUBTASK-SENTINEL",
         "memory_text": "MEMORY-SENTINEL",
         "previous_memory_text": "PREV-SENTINEL",
+        "memory_selected_stride": 5,
+        "memory_anchor_kind": "periodic",
+        "memory_chunk_lag": 3,
+        "memory_frame_lag": 96,
     }
 
 
@@ -48,14 +58,14 @@ class TestRepackAllowlist:
     def test_memory_source_adds_the_memory_keys(self):
         pats: dict = {}
         dc._add_conditioning_text_keys(pats, _model.ModelType.PI05_SUBTASK, MEMORY_SUBTASK_SOURCE)
-        for k in MEMORY_KEYS:
+        for k in (*MEMORY_KEYS, *MEMORY_TELEMETRY_KEYS):
             assert k in pats, f"{k} missing from the repack allowlist for the memory source"
 
     def test_non_memory_source_does_not_add_them(self):
         # Without this the first test passes on an unconditional insertion.
         pats: dict = {}
         dc._add_conditioning_text_keys(pats, _model.ModelType.PI05_SUBTASK, "annotations_skill")
-        for k in MEMORY_KEYS:
+        for k in (*MEMORY_KEYS, *MEMORY_TELEMETRY_KEYS):
             assert k not in pats, f"{k} leaked into a non-memory run"
 
     @pytest.mark.parametrize("source", ["annotations_skill", "orchestrator"])
@@ -115,6 +125,10 @@ class TestB1kInputsForwarding:
         out = self._run(_model.ModelType.PI05_SUBTASK)
         assert out.get("memory_text") == "MEMORY-SENTINEL"
         assert out.get("previous_memory_text") == "PREV-SENTINEL"
+        assert out["memory_selected_stride"] == 5
+        assert out["memory_anchor_kind"] == 1
+        assert out["memory_chunk_lag"] == 3
+        assert out["memory_frame_lag"] == 96
 
     def test_subtask_text_still_survives(self):
         """Positive control: proves the transform runs and forwards at all."""
@@ -208,6 +222,29 @@ class TestMemoryTrainConfig:
         assert base.memory_planner_stride_seed == mm.MIX_C_SEED
         assert base.memory_frames_per_chunk == cfg.model.action_horizon == 32
 
+    def test_registered_k1_short_is_a_single_variable_derivation(self):
+        import openpi.training.moma_memory_config as mm
+        from openpi.training.train_config import get_config
+
+        k1 = get_config("pi05_moma_memory_b1k-k1-short")
+        mix = get_config("pi05_moma_memory_b1k-mix-c-short")
+        assert k1.name == "pi05_moma_memory_b1k-k1-short"
+        assert k1.data[0].base_config.memory_planner_stride_weights == ((1, 1.0),)
+        assert k1.data[0].base_config.memory_planner_stride_seed == mm.MIX_C_SEED
+        assert k1.data[0].base_config.memory_frames_per_chunk == 32
+        assert mix.data[0].base_config.memory_planner_stride_weights == mm.MIX_C_WEIGHTS
+        assert k1.num_train_steps == mix.num_train_steps == 200
+        assert k1.lr_schedule == mix.lr_schedule
+        assert k1.lr_schedule.warmup_steps == 20
+        assert k1.lr_schedule.decay_steps == 200
+        schedule = k1.lr_schedule.create()
+        assert float(schedule(0)) < float(schedule(20))
+        assert float(schedule(199)) < float(schedule(20))
+        assert k1.model == mix.model
+        assert k1.optimizer == mix.optimizer
+        assert k1.pytorch_weight_path == mix.pytorch_weight_path
+        assert k1.data[0].base_config.behavior_dataset_root == mix.data[0].base_config.behavior_dataset_root
+
     @pytest.mark.parametrize("k", [1, 2, 5, 10])
     def test_valid_strides_are_accepted(self, k):
         """Positive control: the guards are specific, not a blanket refusal."""
@@ -259,6 +296,51 @@ def test_real_mix_c_sample_and_memory_provenance_share_one_decision():
         assert sample["memory_anchor_kind"] == kind
         assert sample["memory_anchor_frame"] == anchor_frame
         assert sample["memory_chunk_lag"] == chunk_lag
+
+        # Drive the exact post-Dataset production transform sequence without
+        # decoding video pixels. The three image placeholders already have the
+        # real shape/dtype expected by B1kInputs; all text/provenance comes from
+        # the real Dataset row above.
+        item = _item()
+        item["action"] = item.pop("actions")
+        item["task"] = item["prompt"]
+        item["observation.images.rgb.head"] = item.pop("observation/egocentric_camera")
+        item["observation.images.rgb.left_wrist"] = item.pop("observation/wrist_image_left")
+        item["observation.images.rgb.right_wrist"] = item.pop("observation/wrist_image_right")
+        item["observation.state"] = item.pop("observation/state")
+        for key in ("memory_text", "previous_memory_text", *MEMORY_TELEMETRY_KEYS):
+            item[key] = sample[key]
+        repack = data_config.repack_transforms.inputs[0](item)
+        transformed = data_config.data_transforms.inputs[0](repack)
+        tokenized = data_config.model_transforms.inputs[-2](transformed)
+        from openpi.training.data_loader import _collate_fn
+        import torch
+
+        batch = _collate_fn([tokenized])
+        batch = {key: torch.as_tensor(value) if isinstance(value, np.ndarray) else value for key, value in batch.items()}
+        observation = _model.Observation.from_dict(batch)
+        assert int(observation.memory_selected_stride) == stride
+        assert int(observation.memory_chunk_lag) == chunk_lag
+
+        import importlib.util
+        script = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "train_accelerate.py"
+        spec = importlib.util.spec_from_file_location("mixc_e2e_train_accelerate", script)
+        trainer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(trainer)
+        metrics, model_observation = trainer._memory_telemetry_from_observation(observation)
+        assert metrics[f"memory_k{stride}_count"] == 1
+        expected_model_observation = observation.without_memory_telemetry()
+        assert torch.equal(model_observation.state, expected_model_observation.state)
+        assert model_observation.images.keys() == expected_model_observation.images.keys()
+        for image_key in model_observation.images:
+            assert np.array_equal(
+                np.asarray(model_observation.images[image_key]),
+                np.asarray(expected_model_observation.images[image_key]),
+            )
+        assert model_observation.memory_selected_stride is None
+        assert model_observation.memory_anchor_kind is None
+        assert model_observation.memory_chunk_lag is None
+        assert model_observation.memory_frame_lag is None
 
 
 class TestFactoryCreateEndToEnd:

@@ -272,6 +272,63 @@ class _TwoPhaseUpdateController:
         optimizer.zero_grad(set_to_none=True)
 
 
+def _memory_telemetry_from_observation(observation) -> tuple[dict[str, float], object]:
+    """Detach realized selector diagnostics and return a model-equivalent observation."""
+    stride = getattr(observation, "memory_selected_stride", None)
+    if stride is None:
+        return {}, observation
+
+    def _flat_ints(value) -> list[int]:
+        if isinstance(value, torch.Tensor):
+            return [int(v) for v in value.detach().cpu().reshape(-1).tolist()]
+        return [int(v) for v in np.asarray(value).reshape(-1).tolist()]
+
+    strides = _flat_ints(stride)
+    anchor_kinds = _flat_ints(getattr(observation, "memory_anchor_kind", []))
+    chunk_lags = _flat_ints(getattr(observation, "memory_chunk_lag", []))
+    frame_lags = _flat_ints(getattr(observation, "memory_frame_lag", []))
+    if not (len(strides) == len(anchor_kinds) == len(chunk_lags) == len(frame_lags)):
+        raise ValueError("memory telemetry fields have inconsistent batch lengths")
+    if any(k not in {0, 1, 2, 5, 10} for k in strides):
+        raise ValueError(f"memory_selected_stride outside registered set: {strides}")
+    metrics = {f"memory_k{k}_count": float(strides.count(k)) for k in (0, 1, 2, 5, 10)}
+    metrics.update(
+        {
+            "memory_anchor_initial_count": float(anchor_kinds.count(0)),
+            "memory_anchor_periodic_count": float(anchor_kinds.count(1)),
+            "memory_anchor_annotation_previous_count": float(anchor_kinds.count(2)),
+            "memory_chunk_lag_sum": float(sum(chunk_lags)),
+            "memory_frame_lag_sum": float(sum(frame_lags)),
+            "memory_telemetry_samples": float(len(strides)),
+        }
+    )
+    return metrics, observation.without_memory_telemetry()
+
+
+def _merge_memory_telemetry(total: dict[str, float], batch: dict[str, float]) -> None:
+    for key, value in batch.items():
+        total[key] = total.get(key, 0.0) + float(value)
+
+
+def _discard_pending_memory_telemetry(total: dict[str, float]) -> None:
+    total.clear()
+
+
+def _commit_pending_memory_telemetry(total: dict[str, float], accelerator) -> dict[str, float]:
+    committed = _reduce_memory_telemetry(total, accelerator)
+    total.clear()
+    return committed
+
+
+def _reduce_memory_telemetry(metrics: dict[str, float], accelerator) -> dict[str, float]:
+    if not metrics:
+        return {}
+    keys = sorted(metrics)
+    values = torch.tensor([metrics[key] for key in keys], dtype=torch.float64, device=accelerator.device)
+    reduced = accelerator.reduce(values, reduction="sum")
+    return {key: float(value) for key, value in zip(keys, reduced.detach().cpu().tolist(), strict=True)}
+
+
 def _grad_norm_to_float(grad_norm) -> float:
     """Convert a reported norm for logging without ever calling ``float(None)``."""
 
@@ -5220,6 +5277,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
     start_time = time.time()
     infos: list[dict[str, float]] = []
+    pending_memory_metrics: dict[str, float] = {}
     consecutive_skipped_updates = 0
     consecutive_nonfinite_losses = 0
     total_nonfinite_loss_batches = 0
@@ -5296,6 +5354,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                 break
 
             profile_memory = is_main and _should_profile_memory_step(global_step)
+            memory_metrics, observation = _memory_telemetry_from_observation(observation)
+            _merge_memory_telemetry(pending_memory_metrics, memory_metrics)
 
             # Move data to device.
             # NOTE: Observation is a flax.struct.dataclass, which is *not* a dm-tree container.
@@ -5437,6 +5497,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 consecutive_nonfinite_losses,
                                 max_consecutive_nonfinite_losses,
                             )
+                        _discard_pending_memory_telemetry(pending_memory_metrics)
                         continue
 
                     # The measured no-optimizer-offload policy requires the
@@ -5531,6 +5592,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 consecutive_nonfinite_losses,
                                 max_consecutive_nonfinite_losses,
                             )
+                        _discard_pending_memory_telemetry(pending_memory_metrics)
                         continue
 
                     # Expert backward accumulates expert gradients (and
@@ -5800,6 +5862,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                 consecutive_nonfinite_losses,
                                 max_consecutive_nonfinite_losses,
                             )
+                        _discard_pending_memory_telemetry(pending_memory_metrics)
                         continue
 
                     consecutive_nonfinite_losses = 0
@@ -5885,6 +5948,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                                     "Too many consecutive optimizer updates were skipped due to non-finite gradients. "
                                     f"Reached {consecutive_skipped_updates} skipped updates."
                                 )
+                            _discard_pending_memory_telemetry(pending_memory_metrics)
                             continue
 
                     if _debug_overflow_enabled(config) and not deepspeed_two_phase_update:
@@ -5965,6 +6029,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                         optimizer.zero_grad(set_to_none=True)
 
                     if step_was_skipped:
+                        _discard_pending_memory_telemetry(pending_memory_metrics)
                         consecutive_skipped_updates += 1
                         total_ds_overflow_skipped_updates += 1
                         if is_main:
@@ -5990,6 +6055,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
 
                     consecutive_skipped_updates = 0
                     sample_progress.record_update(committed=True)
+                    committed_memory_metrics = _commit_pending_memory_telemetry(
+                        pending_memory_metrics, accelerator
+                    )
 
                     # stats/logging use optimizer-step granularity
                     if is_main:
@@ -6000,6 +6068,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter) -> 
                             "grad_norm_total": grad_norm_value,
                             **sample_progress.metrics(),
                             **extra_metrics,
+                            **committed_memory_metrics,
                         }
                         # Per-param-group LRs for π0.5-KI joint query model.
                         if is_pi05_ki_joint:
