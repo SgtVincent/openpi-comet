@@ -14,6 +14,7 @@ import torch
 from typing_extensions import override
 
 from openpi import transforms as _transforms
+from openpi.models import memory_cache as _memory_cache
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
@@ -54,9 +55,10 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        # MoMA-VLA held state (design section 2.2 / 4.4). Cache token IDs only;
+        # persisting a prefix KV would also persist stale image and state.
+        self._memory_cache = _memory_cache.MemoryTokenCache()
         self._cached_subtask_prompt: str | None = None
-        self._cached_subtask_tokens = None
-        self._cached_subtask_text: str | None = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -66,6 +68,26 @@ class Policy(BasePolicy):
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
+
+    @property
+    def memory_cache(self) -> "_memory_cache.MemoryTokenCache":
+        """The held memory for this policy instance."""
+        return self._memory_cache
+
+    @property
+    def _cached_subtask_tokens(self):
+        """Back-compat alias for the held memory token ids (None when cold)."""
+        return self._memory_cache.tokens
+
+    @property
+    def _cached_subtask_text(self) -> str | None:
+        """Back-compat alias for the held memory text (None when cold)."""
+        return self._memory_cache.text
+
+    def reset(self, reason: str = "episode boundary") -> None:
+        """Drop held memory at an explicit episode boundary."""
+        self._memory_cache.invalidate(reason)
+        self._cached_subtask_prompt = None
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -151,6 +173,11 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_dir = pathlib.Path(record_dir)
         self._record_dir.mkdir(parents=True, exist_ok=True)
         self._record_step = 0
+
+    @override
+    def reset(self) -> None:
+        """Forward episode reset so held Memory cannot leak across episodes."""
+        self._policy.reset()
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]

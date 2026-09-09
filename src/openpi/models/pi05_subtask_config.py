@@ -38,6 +38,10 @@ class Pi05SubtaskConfig(_model.BaseModelConfig):
     # Subtask token sequence max length.
     subtask_max_len: int = 128
 
+    # MoMA-VLA HeldMemory-K: number of action chunks per Planner refresh.
+    # A config field keeps the K=1/2/5/10 serving arms launchable without edits.
+    planner_stride: int = 5
+
     # Combined loss trade-off parameter (alpha in Eq. 1).
     alpha: float = 10.0
 
