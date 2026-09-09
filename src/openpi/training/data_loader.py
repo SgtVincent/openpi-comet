@@ -25,6 +25,39 @@ def _include_subtask_text(model_config: _model.BaseModelConfig) -> bool:
     return model_config.model_type == _model.ModelType.PI05_SUBTASK
 
 
+def _memory_source_active(data_config) -> bool:
+    """True when the CE target is Memory text rather than skill text.
+
+    Both flags below default to False, and with them off `memory_text` is
+    dropped before it reaches the tokenizer, the subtask segment is fabricated
+    all-zero, `encode_prefix` discards it, and the run trains with no memory
+    conditioning and no planner CE while still reporting a loss.  So the
+    branch has to be driven off the data config, not left to the default.
+    """
+    from openpi.training.memory_annotation import MEMORY_SUBTASK_SOURCE
+
+    return getattr(data_config, "subtask_source", None) == MEMORY_SUBTASK_SOURCE
+
+
+def prompt_transform_for(data_config, model_config) -> "_transforms.PromptFromLeRobotItem":
+    """Build the prompt transform for a run. Extracted so it can be *executed*.
+
+    Both call sites below construct this immediately after the dataset, which on
+    this stack cannot be built without the full lerobot import chain. The result
+    was that the only checks on this wiring were source-level assertions -- and a
+    source assertion cannot notice that the code it matched would raise when run.
+    That is not hypothetical: the sibling wiring in ``data_config.py`` read a field
+    its class did not have, the string was present so the source assertion passed,
+    and the call raised AttributeError the first time it was actually invoked.
+    """
+    active = _memory_source_active(data_config)
+    return _transforms.PromptFromLeRobotItem(
+        include_subtask_text=_include_subtask_text(model_config),
+        include_memory_text=active,
+        require_memory_text=active,
+    )
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -138,7 +171,7 @@ def create_torch_dataset(
         dataset = _behavior_dataset.create_behavior_dataset(data_config, action_horizon=action_horizon)
         dataset = TransformedDataset(
             dataset,
-            [_transforms.PromptFromLeRobotItem(include_subtask_text=_include_subtask_text(model_config))],
+            [prompt_transform_for(data_config, model_config)],
         )
         return dataset
 
@@ -250,7 +283,7 @@ def create_data_loader(
         data_config = data_configs[0]
         dataset = TransformedDataset(
             dataset,
-            [_transforms.PromptFromLeRobotItem(include_subtask_text=_include_subtask_text(config.model))],
+            [prompt_transform_for(data_config, config.model)],
         )
         dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 

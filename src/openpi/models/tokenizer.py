@@ -495,15 +495,43 @@ class SubtaskTokenizer:
     def vocab_size(self) -> int:
         return self._tokenizer.vocab_size()
 
-    def tokenize_prompt(self, prompt: str, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize_prompt(
+        self, prompt: str, state: np.ndarray, previous_memory: str | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Tokenize the task prompt + discretized state (same as PI05 PaligemmaTokenizer).
 
         Returns (tokens, mask) for the prefix.
+
+        MoMA-VLA: when ``previous_memory`` is given, the prefix instead ends with
+        ``;\\nPrevious memory: {previous_memory}`` per design doc §3.4.3, replacing
+        the ``Subtask: `` cue.  The Memory target supplies its own ``Memory:``
+        label, so no trailing generation cue is needed.
+
+        ``previous_memory=None`` reproduces the historical prefix byte for byte;
+        the existing ``annotations_skill`` runs share this method, so the default
+        path is locked by a regression test rather than by inspection.
+
+        Truncation policy differs between the two, deliberately.  The legacy path
+        keeps its warning so existing runs behave identically.  The memory path
+        raises: the previous-memory text sits at the *end* of the prefix, so a
+        right-truncation eats exactly the conditioning it was added to provide,
+        and the run would continue reporting a healthy loss while the model saw
+        no memory at all.
         """
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         state_str = " ".join(map(str, discretized_state))
-        full_prompt = f"Task: {cleaned_text}, State: {state_str};\nSubtask: "
+        if previous_memory is None:
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nSubtask: "
+        else:
+            cleaned_memory = str(previous_memory).strip().replace("_", " ").replace("\n", " ")
+            if not cleaned_memory:
+                raise ValueError(
+                    "previous_memory was provided but is empty after cleaning. An empty "
+                    "memory would train the model on a 'Previous memory:' label with no "
+                    "content, which is not the same as an unconditioned run."
+                )
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nPrevious memory: {cleaned_memory}"
         tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         tokens_len = len(tokens)
 
@@ -513,6 +541,14 @@ class SubtaskTokenizer:
             tokens = tokens + padding
         else:
             if tokens_len > self._prompt_max_len:
+                if previous_memory is not None:
+                    raise ValueError(
+                        f"Prefix token length ({tokens_len}) exceeds prompt_max_len "
+                        f"({self._prompt_max_len}) on a memory-conditioned sample. The "
+                        "previous-memory text is at the end of the prefix, so truncating "
+                        "here would silently drop the memory conditioning. Refusing to "
+                        "truncate; shorten the memory text or raise prompt_max_len."
+                    )
                 logging.warning(
                     f"Prompt token length ({tokens_len}) exceeds max ({self._prompt_max_len}), truncating."
                 )
@@ -522,13 +558,22 @@ class SubtaskTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
     def tokenize_subtask(
-        self, subtask_text: str
+        self, subtask_text: str, *, strict_length: bool = False
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Tokenize the subtask text for CE loss supervision.
 
         The subtask tokens form a causal sequence: the model predicts each next token.
 
         Returns (tokens, mask, ar_mask, loss_mask).
+
+        ``strict_length`` raises instead of truncating.  It defaults to False
+        because live ``annotations_skill`` runs share this method and their
+        targets are short phrases that never approach the limit -- flipping the
+        default would change behaviour for experiments already in flight.  The
+        MoMA-VLA training path does not rely on that default: memory text is
+        routed through :meth:`tokenize_memory`, which raises unconditionally.
+        Pass ``strict_length=True`` when measuring the admission gate, so that an
+        over-length target is reported rather than silently clipped.
         """
         cleaned = subtask_text.strip().replace("_", " ").replace("\n", " ")
         # Prepend BOS so the first real subtask token is supervised by next-token CE.
@@ -548,6 +593,14 @@ class SubtaskTokenizer:
             loss_mask = loss_mask + [False] * padding_len
         else:
             if subtask_len > self._subtask_max_len:
+                if strict_length:
+                    # Right-truncation drops EOS first, then the trailing text.
+                    raise ValueError(
+                        f"Subtask token length ({subtask_len}) exceeds subtask_max_len "
+                        f"({self._subtask_max_len}) by {subtask_len - self._subtask_max_len}. "
+                        f"Truncating would drop EOS and the trailing fields. "
+                        f"{self._longest_field_report(subtask_text)}"
+                    )
                 logging.warning(
                     f"Subtask token length ({subtask_len}) exceeds max ({self._subtask_max_len}), truncating."
                 )
@@ -562,3 +615,157 @@ class SubtaskTokenizer:
             np.asarray(ar_mask, dtype=np.int32),
             np.asarray(loss_mask, dtype=np.bool_),
         )
+
+
+    # ------------------------------------------------------------------
+    # MoMA-VLA memory conditioning (design P1)
+    # ------------------------------------------------------------------
+    # Memory SUBSUMES the subtask segment rather than forming a third parallel
+    # conditioning channel.  This codebase already has two mutually disconnected
+    # GT-plan channels (`subtask_tokens` and the prompt text), and a previous
+    # investigation found the golden-rule path touched `subtask_tokens` zero times
+    # while it was believed to be conditioning the model.  A third channel would
+    # compound exactly that defect, so memory text is emitted into the existing
+    # `subtask_*` slots: one channel, one owner.
+    #
+    # Compatibility: a plain subtask string still tokenises exactly as before via
+    # `tokenize_subtask`.  The label scheme is owned entirely by MemoryTextCodec,
+    # because the choice between plain-text and reserved-slot labels is still open.
+
+    def memory_codec(self, scheme=None):
+        """Codec for the memory label representation.
+
+        `scheme` defaults to `memory_text.DEFAULT_LABEL_SCHEME`, which is the
+        plain-text labels the design specifies.  Cached per scheme so that
+        switching schemes in a test does not silently reuse the wrong codec.
+        """
+        from openpi.models import memory_text as _mem
+
+        scheme = scheme or _mem.DEFAULT_LABEL_SCHEME
+        cache = getattr(self, "_memory_codecs", None)
+        if cache is None:
+            cache = {}
+            self._memory_codecs = cache
+        if scheme not in cache:
+            cache[scheme] = _mem.MemoryTextCodec(tokenizer=self._tokenizer, scheme=scheme)
+        return cache[scheme]
+
+    def _longest_field_report(self, text: str) -> str:
+        """Name the longest field so the error says WHICH field to shorten.
+
+        "Over budget by 6" does not tell you where to look; the Memory field and
+        the four plan fields have very different owners and fixes.
+        """
+        try:
+            parts = [p for p in str(text).split("\n") if p.strip()]
+            if not parts:
+                return ""
+            sized = sorted(
+                ((len(self._tokenizer.encode(p)), p) for p in parts), reverse=True
+            )
+            n, worst = sized[0]
+            label = worst.split(":", 1)[0] if ":" in worst else "<unlabelled>"
+            per_field = ", ".join(f"{p.split(':', 1)[0]}={k}" for k, p in sized)
+            return f"Longest field is {label!r} at {n} tokens (per-field: {per_field})."
+        except Exception:  # never let diagnostics mask the real error
+            return ""
+
+    def tokenize_memory(
+        self, memory_text: str, *, validate: bool = True, scheme=None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Tokenize canonical memory text into the subtask token slots.
+
+        Mirrors `tokenize_subtask` (BOS, causal ar_mask, loss on everything after
+        BOS, pad/truncate to `subtask_max_len`) so the downstream prefix assembly
+        and CE loss are unchanged.
+
+        Returns (tokens, mask, ar_mask, loss_mask).
+        """
+        if memory_text is None:
+            raise ValueError("tokenize_memory() requires text; pass the canonical memory string")
+        codec = self.memory_codec(scheme)
+        # Deliberately no `.replace("\n", " ")` here: build_memory_text uses
+        # newlines as the only field separator and already collapsed whitespace
+        # inside each field, so stripping them would erase the field boundaries.
+        body_ids = codec.encode(memory_text.strip(), validate=validate)
+        memory_tokens = [self._tokenizer.bos_id(), *body_ids, self._tokenizer.eos_id()]
+        memory_len = len(memory_tokens)
+
+        tokens = memory_tokens
+        mask = [True] * memory_len
+        ar_mask = [1] * memory_len
+        loss_mask = [False] + [True] * (memory_len - 1)
+
+        if memory_len < self._subtask_max_len:
+            padding_len = self._subtask_max_len - memory_len
+            tokens = tokens + [0] * padding_len
+            mask = mask + [False] * padding_len
+            ar_mask = ar_mask + [0] * padding_len
+            loss_mask = loss_mask + [False] * padding_len
+        else:
+            if memory_len > self._subtask_max_len:
+                # Raise, not warn.  Truncation is right-to-left over
+                # `[BOS] + body + [EOS]`, so it drops EOS FIRST and then eats
+                # back through `Next primitive:` / `Next skill:`.  Losing EOS
+                # means the model is never taught to stop; losing the trailing
+                # fields looks like "the model is bad at predicting next-skill".
+                # Both render as a mediocre metric rather than as a defect, and
+                # design doc 3.4.5 requires this to be a hard error.
+                #
+                # Headroom is thin enough that this is not hypothetical: the
+                # measured max over all 261,353 rows is 101 of 128, i.e. 27
+                # tokens, and the phrase-template backfill in progress lengthens
+                # the Memory field.
+                raise ValueError(
+                    f"Memory token length ({memory_len}) exceeds subtask_max_len "
+                    f"({self._subtask_max_len}) by {memory_len - self._subtask_max_len}. "
+                    f"Truncating would drop EOS and the trailing fields, corrupting the CE "
+                    f"target while still reporting a loss. {self._longest_field_report(memory_text)} "
+                    f"Shorten the Memory text or raise subtask_max_len."
+                )
+            tokens = tokens[: self._subtask_max_len]
+            mask = mask[: self._subtask_max_len]
+            ar_mask = ar_mask[: self._subtask_max_len]
+            loss_mask = loss_mask[: self._subtask_max_len]
+
+        # EOS must land inside the supervised region (design doc 3.4.4).
+        #
+        # Honest note on coverage: given the raise above, this post-condition is
+        # unreachable by construction -- `memory_len > max` raises, and
+        # `memory_len == max` keeps EOS at index max-1 where loss_mask is True.
+        # A mutation that deletes only this block therefore CANNOT be killed by
+        # any test, and it is not claimed as covered.  It is kept as the second
+        # layer for exactly one regression: softening the raise back to a warning
+        # re-arms it, which is why the raise-to-warning mutation still fails
+        # loudly instead of silently shipping an unterminated model.
+        eos_positions = [i for i, t in enumerate(tokens) if t == self._tokenizer.eos_id()]
+        if not eos_positions or not loss_mask[eos_positions[-1]]:
+            raise ValueError(
+                f"EOS is not inside the valid loss mask (memory_len={memory_len}, "
+                f"subtask_max_len={self._subtask_max_len}); the model would never be "
+                "supervised to terminate."
+            )
+
+        return (
+            np.asarray(tokens, dtype=np.int32),
+            np.asarray(mask, dtype=np.bool_),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask, dtype=np.bool_),
+        )
+
+    def memory_token_length(self, memory_text: str, *, validate: bool = True, scheme=None) -> int:
+        """Token length of `memory_text` including BOS/EOS, WITHOUT padding or truncation.
+
+        Exists so the P50/P90/P99 budget statistics the design asks for measure the
+        true length rather than the padded/clipped one -- `tokenize_memory` would
+        report `subtask_max_len` for everything that overflows, hiding the overflow.
+        """
+        codec = self.memory_codec(scheme)
+        return len(codec.encode(memory_text.strip(), validate=validate)) + 2
+
+    def decode_memory(self, tokens, *, scheme=None) -> str:
+        """Decode memory token ids back to readable label text (for logging/eval)."""
+        ids = [int(t) for t in np.asarray(tokens).reshape(-1).tolist()]
+        specials = {self._tokenizer.bos_id(), self._tokenizer.eos_id(), self._tokenizer.pad_id()}
+        ids = [i for i in ids if i not in specials and i >= 0]
+        return self.memory_codec(scheme).decode(ids)

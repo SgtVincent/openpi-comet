@@ -189,6 +189,12 @@ class ModelTransformFactory(GroupFactory):
 
     model_delta_action_mask: Sequence[int] | None = None
 
+    #: Mirrors ``DataConfig.subtask_source``. Needed because the PI05_SUBTASK
+    #: branch has to fail closed on memory runs, and this factory does not
+    #: otherwise see the data config. Defaults to the non-memory value so every
+    #: existing caller keeps its behaviour byte for byte.
+    subtask_source: str = "orchestrator"
+
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         meta_input_transforms = []
         meta_output_transforms = []
@@ -285,8 +291,17 @@ class ModelTransformFactory(GroupFactory):
                         ),
                     )
                 else:
+                    from openpi.training.memory_annotation import (
+                        MEMORY_SUBTASK_SOURCE as _MEMORY_SUBTASK_SOURCE,
+                    )
+
                     tokenize_transform = _transforms.TokenizeSubtaskInputs(
                         tokenizer=subtask_tokenizer,
+                        # Without this a missing memory_text is silently turned into
+                        # an all-zero, mask-False segment that encode_prefix drops,
+                        # so the run serves an unconditioned model and still reports
+                        # a loss.  Fail closed on the runs that depend on memory.
+                        require_memory=self.subtask_source == _MEMORY_SUBTASK_SOURCE,
                     )
                 return _transforms.Group(
                     inputs=[
@@ -410,6 +425,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # Without this the PI05_SUBTASK branch cannot tell a memory run from a
+            # skill run, and its fail-closed switch would be keyed on nothing.
+            subtask_source=getattr(self.base_config, "subtask_source", "orchestrator"),
         )(model_config)
 
         return dataclasses.replace(
@@ -489,6 +507,9 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # Without this the PI05_SUBTASK branch cannot tell a memory run from a
+            # skill run, and its fail-closed switch would be keyed on nothing.
+            subtask_source=getattr(self.base_config, "subtask_source", "orchestrator"),
         )(model_config)
 
         return dataclasses.replace(
@@ -568,6 +589,9 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # Without this the PI05_SUBTASK branch cannot tell a memory run from a
+            # skill run, and its fail-closed switch would be keyed on nothing.
+            subtask_source=getattr(self.base_config, "subtask_source", "orchestrator"),
         )(model_config)
 
         return dataclasses.replace(

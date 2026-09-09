@@ -31,6 +31,7 @@ class PI05SubtaskPytorch(PI0Pytorch):
         config,
         *,
         alpha: float = 10.0,
+        ce_weight: float = 1.0,
         action_expert_name: str = "subtask",
         action_expert_kwargs: dict[str, Any] | None = None,
     ):
@@ -40,6 +41,7 @@ class PI05SubtaskPytorch(PI0Pytorch):
             action_expert_kwargs=action_expert_kwargs,
         )
         self.alpha = alpha
+        self.ce_weight = ce_weight
         self._text_tokenizer: sentencepiece.SentencePieceProcessor | None = None
         self._last_predicted_subtasks: list[str] = []
 
@@ -202,8 +204,10 @@ class PI05SubtaskPytorch(PI0Pytorch):
             # Compute flow loss in fp32 for numerical stability under fp16 training.
             flow_loss = F.mse_loss(u_t.float(), v_t.float(), reduction="mean")
 
-            # Combined loss: CE + alpha * flow_matching (Equation 1)
-            combined_loss = ce_loss + self.alpha * flow_loss
+            # Combined loss: ce_weight * CE + alpha * flow_matching (Equation 1).
+            # ce_weight defaults to 1.0, so this is byte-identical to the previous
+            # `ce_loss + alpha * flow_loss` unless it is explicitly configured.
+            combined_loss = self.ce_weight * ce_loss + self.alpha * flow_loss
 
             return {
                 "loss": combined_loss,

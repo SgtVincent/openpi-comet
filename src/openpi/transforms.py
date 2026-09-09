@@ -385,15 +385,56 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotItem(DataTransformFn):
-    """Extracts a prompt from the current LeRobot dataset task."""
+    """Extracts a prompt from the current LeRobot dataset task.
+
+    Note on ``include_subtask_text``: when it is False this transform *silently*
+    drops ``subtask_text``.  Downstream, ``TokenizeSubtaskInputs`` then fabricates
+    an all-zero / mask-False subtask, and ``SubtaskActionExpert.encode_prefix``
+    short-circuits on ``not torch.any(subtask_mask)`` -- so the whole conditioning
+    segment disappears from the prefix with no error anywhere.  Memory text
+    travels the same path, which is why it gets an explicit ``require_*`` switch
+    rather than inheriting that silence.
+    """
 
     include_subtask_text: bool = False
+    include_memory_text: bool = False
+    #: When True, memory text must survive this transform.  A missing field or
+    #: a contradictory ``include_memory_text=False`` raises instead of silently
+    #: degrading to an unconditioned model.
+    require_memory_text: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         result = {**data}
         result["prompt"] = result.pop("task")
         if not self.include_subtask_text:
             result.pop("subtask_text", None)
+
+        if self.require_memory_text and not self.include_memory_text:
+            raise ValueError(
+                "PromptFromLeRobotItem is configured with require_memory_text=True but "
+                "include_memory_text=False, which would drop the field it is required to keep. "
+                "Set include_memory_text=True."
+            )
+        if not self.include_memory_text:
+            result.pop("memory_text", None)
+            # Travels with memory_text: leaving it behind as an unconsumed
+            # passenger key is how a broken wiring looks like a working one.
+            result.pop("previous_memory_text", None)
+        elif result.get("memory_text") is None and self.require_memory_text:
+            raise ValueError(
+                "memory_text is required but missing from this dataset item. "
+                "Without it the memory segment silently vanishes from the prefix "
+                "(see this class's docstring). Regenerate the dataset with memory "
+                "annotations, or set require_memory_text=False to accept an "
+                "unconditioned run."
+            )
+        elif result.get("previous_memory_text") is None and self.require_memory_text:
+            raise ValueError(
+                "previous_memory_text is required but missing from this dataset item. "
+                "Without it the prefix silently falls back to the legacy "
+                "'Subtask: ' cue and carries no previous memory at all, which is "
+                "indistinguishable from a healthy run in the loss."
+            )
         return result
 
 
@@ -405,9 +446,20 @@ class TokenizeSubtaskInputs(DataTransformFn):
     - tokenized_prompt + tokenized_prompt_mask: prefix tokens (task + state)
     - subtask_tokens + subtask_mask + subtask_ar_mask + subtask_loss_mask: subtask CE targets
     - actions: continuous actions preserved for flow matching loss
+
+    MoMA-VLA: when ``memory_text`` is present it is tokenized
+    into the same ``subtask_*`` slots.  Memory subsumes the subtask
+    segment rather than adding a third conditioning channel alongside
+    ``subtask_tokens`` and the prompt text.
     """
 
     tokenizer: _tokenizer.SubtaskTokenizer
+    #: Fail-closed switch.  With the default False, an absent conditioning field
+    #: still degrades to the historical all-zero / mask-False subtask.  Set True
+    #: for memory runs so that a missing field raises here instead of
+    #: vanishing inside ``encode_prefix``'s ``not torch.any(subtask_mask)``
+    #: short-circuit.
+    require_memory: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -419,12 +471,48 @@ class TokenizeSubtaskInputs(DataTransformFn):
         if state is None:
             raise ValueError("State is required for subtask tokenization.")
 
-        # Tokenize the task prompt + state for the prefix
-        prompt_tokens, prompt_mask = self.tokenizer.tokenize_prompt(prompt, state)
-
-        # Tokenize the subtask text for CE loss
+        memory_text = data.pop("memory_text", None)
         subtask_text = data.pop("subtask_text", None)
-        if subtask_text is not None:
+        previous_memory_text = data.pop("previous_memory_text", None)
+
+        # The prefix must carry Previous memory whenever this is a memory item.
+        # Calling tokenize_prompt(prompt, state) unconditionally is what made the
+        # prefix byte-identical to an unconditioned one while previous_memory_text
+        # sat unused on the item -- present, and therefore easy to believe wired.
+        if memory_text is not None and previous_memory_text is None:
+            raise ValueError(
+                "this item carries memory_text but no previous_memory_text, so the "
+                "prefix would fall back to the legacy 'Subtask: ' cue and condition "
+                "on no memory at all. Fix the dataset or the "
+                "PromptFromLeRobotItem(include_memory_text=...) wiring."
+            )
+        if self.require_memory and previous_memory_text is None:
+            raise ValueError(
+                "require_memory=True but this item carries no previous_memory_text; "
+                "the prefix would silently carry no memory."
+            )
+        prompt_tokens, prompt_mask = self.tokenizer.tokenize_prompt(
+            prompt, state, previous_memory=previous_memory_text
+        )
+
+        if memory_text is not None:
+            if not isinstance(memory_text, str):
+                memory_text = memory_text.item()
+            st_tokens, st_mask, st_ar_mask, st_loss_mask = self.tokenizer.tokenize_memory(memory_text)
+        elif self.require_memory:
+            # Do NOT fall through to the zero fabrication below.  That path
+            # produces mask=False everywhere, encode_prefix then drops the whole
+            # segment, and the run silently becomes unconditioned while still
+            # reporting a loss.  Same philosophy as the strict-load verification:
+            # a missing required input is an error, not a default.
+            raise ValueError(
+                "require_memory=True but this item carries no 'memory_text'. "
+                "Continuing would fabricate an all-zero, mask-False segment which "
+                "encode_prefix drops entirely, silently training/serving an "
+                "unconditioned model. Fix the dataset or the upstream "
+                "PromptFromLeRobotItem(include_memory_text=...) wiring."
+            )
+        elif subtask_text is not None:
             if not isinstance(subtask_text, str):
                 subtask_text = subtask_text.item()
             st_tokens, st_mask, st_ar_mask, st_loss_mask = self.tokenizer.tokenize_subtask(subtask_text)

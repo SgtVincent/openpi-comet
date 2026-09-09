@@ -1,4 +1,5 @@
 import bisect
+from collections import OrderedDict
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 import json
@@ -66,6 +67,11 @@ from behavior.learning.datas.hf_cache_sync import wait_for_global_cache_readines
 
 ANNOTATIONS_PATH = "annotations"
 ORCHESTRATORS_PATH = "orchestrators"
+#: MoMA-VLA fixed-compact-Memory annotations, relative to the dataset root.
+MEMORY_ANNOTATIONS_PATH = "derived/fixed_compact_memory_annotations"
+# Re-exported from openpi.training.memory_annotation, which owns the name, so
+# the literal exists in exactly one place.
+from openpi.training.memory_annotation import MEMORY_SUBTASK_SOURCE  # noqa: E402
 logger = create_module_logger("BehaviorLeRobotDataset")
 
 _B1K_ANCHOR_STRIDE_ENV = "OPENPI_B1K_ANCHOR_STRIDE"
@@ -151,11 +157,13 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         resample_group_by: str | None = None,  # None | task_skill | skill_type | skill_description
         resample_weights: dict[str, float] | None = None,
         resample_default_weight: float = 1.0,
-        subtask_source: str = "orchestrator",  # orchestrator | annotations_primitive | annotations_skill
+        subtask_source: str = "orchestrator",  # orchestrator | annotations_primitive | annotations_skill | annotations_memory
         subtask_template_path: str | Path | None = None,
         subtask_object_name_mapping_path: str | Path | None = None,
         subtask_joiner: str = " then ",
         skill_bridge_config=None,  # SkillBridgeConfig or None (disabled)
+        memory_annotation_root: str | Path | None = None,
+        memory_index_cache_size: int = 16,
     ):
         """
         Custom args:
@@ -226,6 +234,20 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self._resample_skill_segments = {}
         self._resample_skill_segment_ends = {}
         self._accept_rng = None
+
+        # MoMA-VLA memory conditioning.  Lazily populated so that the
+        # non-memory sources pay nothing for this.
+        self._memory_annotation_root = (
+            Path(memory_annotation_root) if memory_annotation_root is not None else None
+        )
+        self._memory_episode_paths = None  # ep_idx -> Path, built once
+        # Bounded rather than unbounded: an index holds every interval's text, so
+        # caching all 10,000 episodes would cost order-100MB per dataloader
+        # worker.  Chunk streaming walks one episode at a time, so a small cache
+        # already gets the hit rate; the cap is what keeps 8 workers x 32 ranks
+        # from turning that into a memory incident.
+        self._memory_index_cache_size = max(1, int(memory_index_cache_size))
+        self._memory_indices = OrderedDict()
 
         # Unused attributes
         self.image_writer = None
@@ -343,6 +365,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
     def _init_subtask_assets(self):
         self._subtask_phrase_converter = None
         if self.subtask_source == "orchestrator":
+            return
+        if self.subtask_source == MEMORY_SUBTASK_SOURCE:
+            # Memory text is pre-generated offline, so there is no phrase
+            # template or object-name mapping to load.  Demanding them here
+            # would force callers to pass assets this source never reads --
+            # paths that then look configured while being ignored.
             return
         if self.subtask_template_path is None:
             raise ValueError("subtask_template_path is required when subtask_source is not orchestrator")
@@ -497,6 +525,267 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             if s <= frame_index <= e:
                 return t
         return self._get_task_at_level(item, 1)
+
+    # ------------------------------------------------------------------
+    # MoMA-VLA fixed-compact-Memory conditioning
+    # ------------------------------------------------------------------
+    # Deliberately NOT routed through _get_subtask_text.  That resolver uses
+    # bisect_left over segment *ends* plus a CLOSED containment test, while this
+    # dataset declares half-open [start, end) intervals.  Running the closed
+    # lookup over half-open data shifts every interval one frame late, which
+    # lands on the 16,915 one-frame bridge intervals this feature exists to
+    # model.  Two conventions, two lookups, each stated explicitly.
+
+    @property
+    def memory_source_enabled(self) -> bool:
+        return self.subtask_source == MEMORY_SUBTASK_SOURCE
+
+    def _resolved_memory_root(self) -> Path:
+        if self._memory_annotation_root is not None:
+            return self._memory_annotation_root
+        return Path(self.root) / MEMORY_ANNOTATIONS_PATH
+
+    def _memory_path_for_episode(self, ep_idx: int) -> Path:
+        """Locate one episode's memory JSON.
+
+        The directory is indexed once rather than globbed per access.  Episode
+        ids are globally unique across the 50 task directories (verified: 10,000
+        filenames, 10,000 distinct ids, 0 duplicates, and a bijection onto
+        ``meta/episodes.jsonl``), so a flat ep_idx -> path map is well defined.
+        """
+        if self._memory_episode_paths is None:
+            root = self._resolved_memory_root()
+            if not root.is_dir():
+                raise FileNotFoundError(
+                    f"subtask_source={MEMORY_SUBTASK_SOURCE!r} needs the memory annotations at "
+                    f"{root}, which does not exist. Pass memory_annotation_root explicitly."
+                )
+            paths: dict[int, Path] = {}
+            for task_dir in sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("task-")):
+                for episode in sorted(task_dir.glob("episode_*.json")):
+                    key = int(episode.stem[len("episode_"):])
+                    if key in paths:
+                        # Would make the flat map ambiguous; fail rather than pick.
+                        raise ValueError(
+                            f"episode id {key} appears in both {paths[key]} and {episode}; "
+                            "the ep_idx -> path map assumes globally unique episode ids"
+                        )
+                    paths[key] = episode
+            if not paths:
+                raise FileNotFoundError(f"no episode_*.json found under {root}")
+            self._memory_episode_paths = paths
+            logger.info(f"indexed {len(paths)} memory-annotation episodes under {root}")
+        try:
+            return self._memory_episode_paths[ep_idx]
+        except KeyError:
+            raise KeyError(
+                f"episode {ep_idx} has no memory annotation under {self._resolved_memory_root()}; "
+                f"{len(self._memory_episode_paths)} episodes are indexed. Restrict `tasks`/`episodes` "
+                "to the annotated subset instead of training on partially annotated data."
+            ) from None
+
+    def _memory_index_for_episode(self, ep_idx: int):
+        from openpi.training import memory_annotation as _mem
+
+        cached = self._memory_indices.get(ep_idx)
+        if cached is not None:
+            self._memory_indices.move_to_end(ep_idx)
+            return cached
+        path = self._memory_path_for_episode(ep_idx)
+        with open(path, "r", encoding="utf-8") as f:
+            episode_json = json.load(f)
+        index = _mem.build_index_from_episode(episode_json, episode_id=str(path))
+        self._memory_indices[ep_idx] = index
+        while len(self._memory_indices) > self._memory_index_cache_size:
+            self._memory_indices.popitem(last=False)
+        return index
+
+    def _memory_sampling_range(self, ep_idx: int) -> tuple[int, int]:
+        """Frames of this episode that carry Memory supervision.
+
+        Intersected with the real episode length because the annotation of 83
+        episodes runs past the end of the video (worst case by 784 frames).
+        """
+        index = self._memory_index_for_episode(ep_idx)
+        episode = self.meta.episodes.get(ep_idx) or {}
+        return index.sampling_range(episode_length=episode.get("length"))
+
+    def _get_memory_texts(self, item: dict) -> tuple[str, str] | None:
+        """``(memory_text, previous_memory_text)``, or None if the frame is
+        outside the annotated range.
+
+        The None result means "this frame is not a valid training sample", which
+        the caller turns into an anchor advance -- the same treatment an
+        incomplete action horizon already gets.  It does NOT mean "train without
+        memory": annotations cover 98.87% of frames, so the remaining 1.13% are
+        skipped rather than silently trained unconditioned.  A miss *inside* the
+        range is a different thing entirely and raises, because intervals tile
+        their range exactly (0 gaps / 0 overlaps over 251,353 adjacent pairs).
+        """
+        ep_idx = item["episode_index"].item()
+        frame_index = round(item["timestamp"].item() * self.fps)
+        lo, hi = self._memory_sampling_range(ep_idx)
+        if not (lo <= frame_index < hi):
+            return None
+        row = self._memory_index_for_episode(ep_idx).lookup(frame_index)
+        return row.planner_target_text, row.previous_memory_text
+
+    # ------------------------------------------------------------------
+    # Shared item assembly (training and viewer MUST go through this)
+    # ------------------------------------------------------------------
+
+    def _attach_text_fields(
+        self,
+        item: dict,
+        *,
+        memory_texts: tuple[str, str] | None,
+        query_indices: dict | None = None,
+        padding: dict | None = None,
+    ) -> dict:
+        """Attach the text conditioning fields. Single owner of this decision.
+
+        Both ``__getitem__`` paths and ``sample_for_frame`` call this, so an
+        inspector cannot show something different from what training consumes.
+        Writing a second copy of this assembly is the specific failure this
+        exists to prevent: a parallel version does not fail, it drifts, and then
+        the inspector keeps reporting on code that no longer runs.
+
+        Memory subsumes the subtask segment -- one conditioning channel, one
+        owner -- so when memory text is present the skill/bridge text is
+        deliberately NOT also attached. Two writers into ``subtask_*`` would
+        silently pick a winner further downstream.
+        """
+        item["task"] = self._get_fine_grained_task(item)
+        if memory_texts is not None:
+            item["memory_text"], item["previous_memory_text"] = memory_texts
+            # Provenance, R2: plain ints so collate cannot choke on them. These
+            # exist so a byte-for-byte comparison against training does not have
+            # to reconstruct the streaming sampling order -- reconstructing it
+            # would itself be a second implementation of the thing under test.
+            item["memory_episode_index"] = int(item["episode_index"].item())
+            item["memory_frame_idx"] = int(round(item["timestamp"].item() * self.fps))
+            return item
+        subtask_text = self._get_bridge_subtask_text(item, query_indices=query_indices, padding=padding)
+        if subtask_text is not None:
+            item["subtask_text"] = subtask_text
+        return item
+
+    def _global_frame_index(self, episode_index: int, frame_idx: int) -> int:
+        """Row offset of (episode, local frame) in the flat hf_dataset.
+
+        Uses the same cumulative-offset walk over ``self.episodes`` as
+        ``_get_keyframe_chunk_indices``, so the two cannot disagree about where
+        an episode starts.
+        """
+        lengths = {ep: d["length"] for ep, d in self.meta.episodes.items()}
+        offset = 0
+        for ep in self.episodes:
+            L = lengths[ep]
+            if ep == episode_index:
+                if not (0 <= frame_idx < L):
+                    raise IndexError(
+                        f"frame {frame_idx} is outside episode {episode_index} which has {L} frames"
+                    )
+                return offset + frame_idx
+            offset += L
+        raise KeyError(f"episode {episode_index} is not in this dataset's episode selection")
+
+    def sample_for_frame(
+        self, episode_index: int, frame_idx: int, *, decode_observations: bool = True
+    ) -> dict:
+        """The item training would produce if sampling landed on this frame.
+
+        Deliberately side-effect free: it does not touch the streaming cursor and
+        does not draw from ``_accept_rng``, so calling it cannot perturb a run.
+        Out-of-range frames raise and carry the valid range; returning a degraded
+        sample would make the inspector disagree with training exactly where the
+        disagreement matters.
+        """
+        if isinstance(episode_index, bool) or isinstance(frame_idx, bool):
+            raise TypeError("episode_index and frame_idx must be ints, not bool")
+        episode_index, frame_idx = int(episode_index), int(frame_idx)
+        if self.memory_source_enabled:
+            lo, hi = self._memory_sampling_range(episode_index)
+            if not (lo <= frame_idx < hi):
+                raise IndexError(
+                    f"episode {episode_index} frame {frame_idx} is outside the "
+                    f"Memory-annotated sampling range [{lo}, {hi})"
+                )
+        row = self._global_frame_index(episode_index, frame_idx)
+        query_indices = padding = None
+        if decode_observations:
+            # Reuse LeRobotDataset.__getitem__, which already decodes video and
+            # applies delta_timestamps. Writing a second decoder here is exactly
+            # the parallel implementation this method exists to avoid, and it
+            # knows nothing of our streaming cursor, so it stays side-effect free.
+            item = super(BehaviorLeRobotDataset, self).__getitem__(row)
+            item.pop("observation.task_info", None)
+            if self.delta_indices is not None:
+                query_indices, padding = self._get_query_indices(row, episode_index)
+        else:
+            item = self.hf_dataset[row]
+            item.pop("observation.task_info", None)
+            if self.delta_indices is not None:
+                query_indices, padding = self._get_query_indices(row, episode_index)
+                item = {**item, **padding, **self._query_hf_dataset(query_indices)}
+        memory_texts = self._get_memory_texts(item) if self.memory_source_enabled else None
+        return self._attach_text_fields(
+            item, memory_texts=memory_texts, query_indices=query_indices, padding=padding
+        )
+
+    def memory_provenance(self, episode_index: int, frame_idx: int) -> dict:
+        """Flat scalars describing how this frame maps to Memory supervision.
+
+        Reuses ``_memory_sampling_range`` and the chunk counters produced by
+        ``_restrict_chunks_to_memory_coverage``, so what an inspector displays is
+        computed by the same code that decides what training sees. Recomputing
+        ``range(0, L, chunk_size)`` separately would let the displayed exclusions
+        and the real ones diverge silently.
+        """
+        if not self.memory_source_enabled:
+            raise RuntimeError(
+                f"memory_provenance requires subtask_source={MEMORY_SUBTASK_SOURCE!r}, "
+                f"got {self.subtask_source!r}"
+            )
+        index = self._memory_index_for_episode(episode_index)
+        episode_length = int((self.meta.episodes.get(episode_index) or {}).get("length", -1))
+        lo, hi = self._memory_sampling_range(episode_index)
+        row = index.lookup(frame_idx)
+        chunk = getattr(self, "_chunk_size_used", None)
+        if chunk is None:
+            raise RuntimeError(
+                "chunk size is unknown because the chunk list has not been built yet; "
+                "memory_provenance must not guess it, since a wrong size silently "
+                "reports the wrong chunk boundaries"
+            )
+        cs = (frame_idx // chunk) * chunk
+        ce = min(cs + chunk, episode_length) if episode_length > 0 else cs + chunk
+        stats = self.memory_chunk_stats() or {}
+        return {
+            "episode_index": int(episode_index),
+            "frame_idx": int(frame_idx),
+            "episode_length": episode_length,
+            "interval_idx": int(row.memory_idx),
+            "interval_start": int(row.start),
+            "interval_end": int(row.end),
+            "interval_len": int(row.end - row.start),
+            "is_one_frame_bridge": bool(row.end - row.start == 1),
+            "transition_type": row.transition_type,
+            "annotated_first_start": int(index.first_start),
+            "annotated_last_end": int(index.last_end),
+            "sampling_lo": int(lo),
+            "sampling_hi": int(hi),
+            "clipped_by_episode_length": bool(index.last_end > episode_length > 0),
+            "chunk_start": int(cs),
+            "chunk_end": int(ce),
+            "chunk_is_dead": bool(ce <= index.first_start or cs >= hi),
+            "chunk_anchor_lo": int(max(cs, lo)),
+            "chunk_anchor_hi": int(min(ce, hi)),
+            "chunk_is_clipped": bool((max(cs, lo), min(ce, hi)) != (cs, ce)),
+            "dataset_chunks_kept": int(stats.get("memory_chunks_kept", -1)),
+            "dataset_dead_chunks_dropped": int(stats.get("memory_dead_chunks_dropped", -1)),
+            "dataset_chunks_clipped": int(stats.get("memory_chunks_clipped", -1)),
+        }
 
     def _get_bridge_subtask_text(
         self,
@@ -1116,13 +1405,26 @@ class BehaviorLeRobotDataset(LeRobotDataset):
     def __getitem__(self, idx) -> dict:
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
-            item["task"] = self._get_fine_grained_task(item)
+            if self.memory_source_enabled:
+                texts = self._get_memory_texts(item)
+                if texts is None:
+                    # This path cannot advance to another anchor, so it cannot
+                    # skip.  Returning the item without memory would let
+                    # TokenizeSubtaskInputs fabricate an all-zero segment that
+                    # encode_prefix drops, training an unconditioned model that
+                    # still reports a loss -- so raise instead.
+                    ep_idx = item["episode_index"].item()
+                    lo, hi = self._memory_sampling_range(ep_idx)
+                    raise IndexError(
+                        f"episode {ep_idx} frame {round(item['timestamp'].item() * self.fps)} is "
+                        f"outside the Memory-annotated range [{lo}, {hi}). The non-streaming path "
+                        "cannot skip a frame, so it cannot be used with "
+                        f"subtask_source={MEMORY_SUBTASK_SOURCE!r}; enable chunk_streaming_using_keyframe."
+                    )
+                return self._attach_text_fields(item, memory_texts=texts)
             # Non-streaming path: no per-step query indices available,
             # so bridge uses anchor_frame + chunk_size fallback.
-            subtask_text = self._get_bridge_subtask_text(item)
-            if subtask_text is not None:
-                item["subtask_text"] = subtask_text
-            return item
+            return self._attach_text_fields(item, memory_texts=None)
 
         # Rejections and incomplete horizons advance iteratively; recursion here
         # could overflow when a long tail or low resampling weight is encountered.
@@ -1155,6 +1457,20 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 self._advance_streaming_anchor(observation_consumed=False, context="rejecting a resampled anchor")
                 continue
 
+            # Memory supervision is resolved before any frame is decoded: an
+            # unannotated frame is not a valid sample, and skipping it here costs
+            # nothing, whereas discovering it after decoding would waste the
+            # decode.  Annotations cover 98.87% of frames, so this rejects ~1.1%.
+            memory_texts = None
+            if self.memory_source_enabled:
+                memory_texts = self._get_memory_texts(item)
+                if memory_texts is None:
+                    self._advance_streaming_anchor(
+                        observation_consumed=False,
+                        context="skipping a frame outside the Memory-annotated range",
+                    )
+                    continue
+
             # The current observation consumes one decoded frame per modality.
             for key in self.meta.video_keys:
                 item[key] = self._next_streaming_observation(key, context="returning an aligned anchor")
@@ -1186,16 +1502,14 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 for cam in self.meta.camera_keys:
                     item[cam] = self.image_transforms(item[cam])
 
-            item["task"] = self._get_fine_grained_task(item)
-            # Streaming path: pass actual query indices + pad mask for
-            # accurate bridge boundary detection.
-            subtask_text = self._get_bridge_subtask_text(
+            self._attach_text_fields(
                 item,
+                memory_texts=memory_texts,
+                # Streaming path: pass actual query indices + pad mask for
+                # accurate bridge boundary detection.
                 query_indices=query_indices if self.delta_indices is not None else None,
                 padding=padding if self.delta_indices is not None else None,
             )
-            if subtask_text is not None:
-                item["subtask_text"] = subtask_text
             self._advance_streaming_anchor(observation_consumed=True, context="advancing after an aligned anchor")
             return item
 
@@ -1339,6 +1653,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         Returns:
             List of tuples, where each tuple contains (start_index, end_index, local_start_index) for each chunk.
         """
+        # Recorded so memory_provenance reports the size actually used rather
+        # than re-deriving it from a default. A hardcoded fallback here is how a
+        # renamed parameter quietly reverts to 250 while callers assume otherwise.
+        self._chunk_size_used = int(chunk_size)
         episode_lengths = {ep_idx: ep_dict["length"] for ep_idx, ep_dict in self.meta.episodes.items()}
         episode_lengths = [episode_lengths[ep_idx] for ep_idx in self.episodes]
         chunks = []
@@ -1349,7 +1667,92 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             for ls, le in zip(local_starts, local_ends):
                 chunks.append((offset + ls, offset + le, ls))
             offset += L
+        if self.memory_source_enabled:
+            chunks = self._restrict_chunks_to_memory_coverage(chunks, episode_lengths)
         return chunks
+
+    def _restrict_chunks_to_memory_coverage(
+        self, chunks: list[tuple[int, int, int]], episode_lengths: list[int]
+    ) -> list[tuple[int, int, int]]:
+        """Drop chunks with no Memory coverage and clip the ones that straddle it.
+
+        Chunks are cut with ``range(0, L, chunk_size)`` over the *whole video*,
+        while Memory annotations cover only the valid range.  Measured: 1.133% of
+        frames (1,349,597) have no coverage, across 85.0% of episodes, and 4,494
+        of 481,383 chunks (0.934%) fall entirely outside it, in 2,849 episodes.
+
+        A dead chunk is not an occasional miss -- *every* anchor in it misses.
+        Left in place it would either abort training on a hard error or be
+        swallowed by some silent skip with no counter, so we would not know how
+        much data was dropped.  Both counters below therefore go into the run
+        manifest: how many chunks a run actually trained on has to be readable
+        from the artefact, not recomputed from defaults.
+
+        The alternative -- extending annotations to the whole video -- is
+        rejected: the hierarchy text IS the supervision target, so inventing it
+        for unannotated frames is teaching the model something untrue.
+        """
+        by_episode: dict[int, tuple[int, int]] = {}
+        offsets: dict[int, int] = {}
+        offset = 0
+        for ep_idx, L in zip(self.episodes, episode_lengths):
+            offsets[ep_idx] = offset
+            try:
+                by_episode[ep_idx] = self._memory_sampling_range(ep_idx)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"cannot determine the Memory coverage of episode {ep_idx}; refusing to "
+                    f"build a chunk list that would silently mis-sample it ({exc})"
+                ) from exc
+            offset += L
+
+        offset_to_episode = sorted(((off, ep) for ep, off in offsets.items()))
+        # Build the bisect key once. The full dataset has roughly 481k chunks
+        # and 10k episodes; rebuilding this 10k-element list inside the chunk
+        # loop would perform about 4.8 billion element visits during dataset
+        # construction before training could start.
+        episode_offsets = [off for off, _ in offset_to_episode]
+        kept: list[tuple[int, int, int]] = []
+        dead = clipped = 0
+        for g_start, g_end, ls in chunks:
+            i = bisect.bisect_right(episode_offsets, g_start) - 1
+            ep_idx = offset_to_episode[i][1]
+            base = offsets[ep_idx]
+            lo, hi = by_episode[ep_idx]
+            le = ls + (g_end - g_start)
+            new_ls, new_le = max(ls, lo), min(le, hi)
+            if new_le <= new_ls:
+                dead += 1
+                continue
+            if (new_ls, new_le) != (ls, le):
+                clipped += 1
+            kept.append((base + new_ls, base + new_le, new_ls))
+
+        self._memory_dead_chunks = dead
+        self._memory_clipped_chunks = clipped
+        self._memory_chunks_kept = len(kept)
+        logger.info(
+            f"Memory coverage filter: kept {len(kept)} chunks, dropped {dead} dead chunks "
+            f"(no Memory coverage), clipped {clipped} chunks that straddle the coverage "
+            f"boundary, from {len(chunks)} raw chunks over {len(episode_lengths)} episodes"
+        )
+        if not kept:
+            raise RuntimeError(
+                f"every one of the {len(chunks)} chunks was dropped as having no Memory "
+                "coverage; check memory_annotation_root and the task/episode selection"
+            )
+        return kept
+
+    def memory_chunk_stats(self) -> dict[str, int] | None:
+        """Coverage-filter counters for the run manifest, or None if unused."""
+        if not self.memory_source_enabled:
+            return None
+        return {
+            "memory_chunks_kept": getattr(self, "_memory_chunks_kept", -1),
+            "memory_dead_chunks_dropped": getattr(self, "_memory_dead_chunks", -1),
+            "memory_chunks_clipped": getattr(self, "_memory_clipped_chunks", -1),
+        }
+
 
 
 class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
