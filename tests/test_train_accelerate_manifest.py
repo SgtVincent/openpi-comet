@@ -52,7 +52,9 @@ class MockDataConfig:
 
     def __init__(self, repo_id="test/repo", tasks=None, modalities=None,
                  episodes_index=None, fine_grained_level=0, subtask_source=None,
-                 prompt_from_task=False, fps=30, norm_stats=None):
+                 prompt_from_task=False, fps=30, norm_stats=None,
+                 memory_planner_stride_weights=None, memory_planner_stride_seed=None,
+                 memory_frames_per_chunk=None):
         self.repo_id = repo_id
         self.tasks = tasks or ["turning_on_radio"]
         self.modalities = modalities or ["image"]
@@ -62,6 +64,9 @@ class MockDataConfig:
         self.prompt_from_task = prompt_from_task
         self.fps = fps
         self.norm_stats = norm_stats
+        self.memory_planner_stride_weights = memory_planner_stride_weights
+        self.memory_planner_stride_seed = memory_planner_stride_seed
+        self.memory_frames_per_chunk = memory_frames_per_chunk
 
 
 class MockConfig:
@@ -133,6 +138,61 @@ class CountingIterableLoader:
 # ---------------------------------------------------------------------------
 # Tests: probe_batches=0 (metadata-only mode)
 # ---------------------------------------------------------------------------
+def test_mix_c_manifest_reads_exact_data_config_values(monkeypatch):
+    mod = _get_module()
+    cfg = MockConfig()
+    weights = ((1, 0.4), (2, 0.3), (5, 0.2), (10, 0.1))
+    dcfg = MockDataConfig(
+        subtask_source="annotations_memory",
+        memory_planner_stride_weights=weights,
+        memory_planner_stride_seed=42,
+        memory_frames_per_chunk=32,
+    )
+    manifest = mod._compute_data_manifest(
+        config=cfg,
+        data_config=dcfg,
+        train_loader=CountingIterableLoader(length=4, batch_size=1),
+        steps_per_epoch=4,
+        world_size=1,
+        grad_accum_steps=1,
+        seed=42,
+        num_probe_batches=0,
+    )
+    expected = {
+        "schema_version": 1,
+        "algorithm": "blake2b_u64_weighted_cdf",
+        "digest": "blake2b-64-big-endian",
+        "key_fields": ["seed", "episode_index", "episode_local_chunk_index"],
+        "weights": [[1, 0.4], [2, 0.3], [5, 0.2], [10, 0.1]],
+        "seed": 42,
+        "frames_per_chunk": 32,
+    }
+    assert manifest["memory_mix_c"] == expected
+    fingerprint = mod._build_data_fingerprint(cfg, dcfg)
+    assert fingerprint["memory_mix_c"] == expected
+    baseline_sha = fingerprint["sha256"]
+    for field, value in (
+        ("memory_planner_stride_seed", 43),
+        ("memory_planner_stride_weights", ((1, 0.5), (2, 0.2), (5, 0.2), (10, 0.1))),
+        ("memory_frames_per_chunk", 64),
+    ):
+        changed = MockDataConfig(
+            subtask_source="annotations_memory",
+            memory_planner_stride_weights=weights,
+            memory_planner_stride_seed=42,
+            memory_frames_per_chunk=32,
+        )
+        setattr(changed, field, value)
+        assert mod._build_data_fingerprint(cfg, changed)["sha256"] != baseline_sha
+
+
+def test_non_memory_manifest_has_no_mix_c_spec():
+    mod = _get_module()
+    cfg = MockConfig()
+    dcfg = MockDataConfig(subtask_source="annotations_skill")
+    assert mod._build_data_fingerprint(cfg, dcfg).get("memory_mix_c") is None
+
+
 class TestProbeBatchesZero:
     """Verify that probe_batches=0 skips all loader iteration."""
 

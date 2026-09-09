@@ -305,12 +305,20 @@ def eps_index_fn(*indexs):
 
 
 from openpi.training.pi05_ki_joint_query_config import _PI05_KI_JOINT_QUERY_CONFIGS
+from openpi.training.moma_memory_config import memory_configs as _memory_configs
 from openpi.training.pretrain_config import _PRETRAIN_CONFIGS
 from openpi.training.rft_config import _RFT_CONFIGS
 from openpi.training.sft_config import _SFT_CONFIGS
 from openpi.training.test_config import _TEST_CONFIGS
 
-_CONFIGS = [*_PRETRAIN_CONFIGS, *_SFT_CONFIGS, *_RFT_CONFIGS, *_TEST_CONFIGS, *_PI05_KI_JOINT_QUERY_CONFIGS]
+_CONFIGS = [
+    *_PRETRAIN_CONFIGS,
+    *_SFT_CONFIGS,
+    *_RFT_CONFIGS,
+    *_TEST_CONFIGS,
+    *_PI05_KI_JOINT_QUERY_CONFIGS,
+    *_memory_configs(),
+]
 
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

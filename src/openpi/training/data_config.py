@@ -30,6 +30,23 @@ def _uses_subtask_text(model_type: _model.ModelType) -> bool:
     return model_type == _model.ModelType.PI05_SUBTASK
 
 
+def _add_conditioning_text_keys(repack_patterns: dict, model_type, subtask_source: str) -> dict:
+    """Add the mutually exclusive text-conditioning keys to a repack allowlist."""
+    from openpi.training.memory_annotation import MEMORY_SUBTASK_SOURCE
+
+    if not _uses_subtask_text(model_type):
+        return repack_patterns
+
+    if subtask_source == MEMORY_SUBTASK_SOURCE:
+        # Memory subsumes subtask_text. RepackTransform is strict, so requesting
+        # both would raise on every memory item rather than form a harmless superset.
+        repack_patterns["memory_text"] = "memory_text"
+        repack_patterns["previous_memory_text"] = "previous_memory_text"
+    else:
+        repack_patterns["subtask_text"] = "subtask_text"
+    return repack_patterns
+
+
 class DroidActionSpace(Enum):
     """Action space for DROID dataset."""
 
@@ -144,6 +161,11 @@ class DataConfig:
     subtask_template_path: str | None = None
     subtask_object_name_mapping_path: str | None = None
     subtask_joiner: str = " then "
+
+    # MoMA-VLA MIX-C. None preserves every non-Memory and fixed-K dataset path.
+    memory_planner_stride_weights: tuple[tuple[int, float], ...] | None = None
+    memory_planner_stride_seed: int | None = None
+    memory_frames_per_chunk: int | None = None
 
     # Skill bridge baseline config (default-off, zero behavioral change)
     skill_bridge: "SkillBridgeConfig" = dataclasses.field(
@@ -393,8 +415,11 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             "actions": "action",
             "prompt": "prompt",
         }
-        if _uses_subtask_text(model_config.model_type):
-            repack_patterns["subtask_text"] = "subtask_text"
+        _add_conditioning_text_keys(
+            repack_patterns,
+            model_config.model_type,
+            getattr(self.base_config, "subtask_source", "orchestrator"),
+        )
 
         repack_transform = _transforms.Group(
             inputs=[
@@ -467,8 +492,11 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
             "actions": "action",
             "prompt": "prompt",
         }
-        if _uses_subtask_text(model_config.model_type):
-            repack_patterns["subtask_text"] = "subtask_text"
+        _add_conditioning_text_keys(
+            repack_patterns,
+            model_config.model_type,
+            getattr(self.base_config, "subtask_source", "orchestrator"),
+        )
 
         repack_transform = _transforms.Group(
             inputs=[
@@ -549,8 +577,11 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
             "actions": "action",
             "prompt": "prompt",
         }
-        if _uses_subtask_text(model_config.model_type):
-            repack_patterns["subtask_text"] = "subtask_text"
+        _add_conditioning_text_keys(
+            repack_patterns,
+            model_config.model_type,
+            getattr(self.base_config, "subtask_source", "orchestrator"),
+        )
 
         repack_transform = _transforms.Group(
             inputs=[

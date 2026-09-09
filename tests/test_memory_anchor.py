@@ -14,7 +14,9 @@ from openpi.training.memory_anchor import (
     REQUIRED_CONTROL_MODE,
     AnchorSchedule,
     AnchorScheduleError,
+    MixedStrideSelector,
     check_chunk_consumption_assumptions,
+    mixed_stride_spec,
 )
 
 
@@ -206,6 +208,59 @@ def test_origin_shifts_the_whole_schedule():
     assert s.anchor_frame_for(100) == 100
     assert s.anchor_frame_for(259) == 100     # 100 + 160 - 1
     assert s.anchor_frame_for(260) == 260
+
+
+def test_mixed_stride_is_stable_per_episode_local_action_chunk():
+    selector = MixedStrideSelector(((1, 0.4), (2, 0.3), (5, 0.2), (10, 0.1)), seed=42)
+    first = selector.select(episode_index=10, chunk_index=7)
+    assert first in {1, 2, 5, 10}
+    assert selector.select(episode_index=10, chunk_index=7) == first
+    # Same action chunk, different frames: one fixed K and one fixed anchor.
+    d0 = selector.decision_for(episode_index=10, frame_idx=224, origin=0, frames_per_chunk=32)
+    d1 = selector.decision_for(episode_index=10, frame_idx=255, origin=0, frames_per_chunk=32)
+    assert (d0.selected_stride, d0.anchor_frame, d0.chunk_lag) == (
+        d1.selected_stride,
+        d1.anchor_frame,
+        d1.chunk_lag,
+    )
+    assert (d0.frame_lag, d1.frame_lag) == (32, 63)
+
+
+def test_mixed_stride_golden_vectors_cover_k5_and_k10():
+    selector = MixedStrideSelector(((1, 0.4), (2, 0.3), (5, 0.2), (10, 0.1)), seed=42)
+    assert selector.select(episode_index=0, chunk_index=12) == 5
+    assert selector.select(episode_index=0, chunk_index=3) == 10
+    assert selector.decision_for(
+        episode_index=0, frame_idx=384, origin=0, frames_per_chunk=32
+    ).anchor_frame == 320
+    assert selector.decision_for(
+        episode_index=0, frame_idx=96, origin=0, frames_per_chunk=32
+    ).anchor_frame == 0
+
+
+def test_mixed_stride_spec_is_complete_and_canonical():
+    assert mixed_stride_spec(((1, 0.4), (10, 0.6)), 42, 32) == {
+        "schema_version": 1,
+        "algorithm": "blake2b_u64_weighted_cdf",
+        "digest": "blake2b-64-big-endian",
+        "key_fields": ["seed", "episode_index", "episode_local_chunk_index"],
+        "weights": [[1, 0.4], [10, 0.6]],
+        "seed": 42,
+        "frames_per_chunk": 32,
+    }
+
+
+def test_mixed_stride_uses_episode_local_origin_and_separates_initial():
+    selector = MixedStrideSelector(((1, 1.0),), seed=9)
+    initial = selector.decision_for(episode_index=4, frame_idx=100, origin=100, frames_per_chunk=32)
+    assert initial.anchor_kind == "initial"
+    assert initial.selected_stride == 0
+    assert initial.chunk_lag == 0 and initial.frame_lag == 0
+    periodic = selector.decision_for(episode_index=4, frame_idx=132, origin=100, frames_per_chunk=32)
+    assert periodic.anchor_kind == "periodic"
+    assert periodic.target_chunk_index == 1
+    assert periodic.anchor_frame == 100
+    assert periodic.chunk_lag == 1 and periodic.frame_lag == 32
 
 
 def test_manifest_description_records_the_dependency_not_just_the_number():

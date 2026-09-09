@@ -164,6 +164,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         skill_bridge_config=None,  # SkillBridgeConfig or None (disabled)
         memory_annotation_root: str | Path | None = None,
         memory_index_cache_size: int = 16,
+        memory_planner_stride_weights: tuple[tuple[int, float], ...] | None = None,
+        memory_planner_stride_seed: int | None = None,
+        memory_frames_per_chunk: int | None = None,
     ):
         """
         Custom args:
@@ -248,6 +251,23 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         # from turning that into a memory incident.
         self._memory_index_cache_size = max(1, int(memory_index_cache_size))
         self._memory_indices = OrderedDict()
+        self._memory_mixed_stride_selector = None
+        self._memory_frames_per_chunk = None
+        if memory_planner_stride_weights is not None:
+            if self.subtask_source != MEMORY_SUBTASK_SOURCE:
+                raise ValueError("MIX-C stride weights are valid only for annotations_memory")
+            if memory_planner_stride_seed is None or memory_frames_per_chunk is None:
+                raise ValueError(
+                    "MIX-C requires memory_planner_stride_seed and memory_frames_per_chunk"
+                )
+            from openpi.training.memory_anchor import MixedStrideSelector, _require_positive_int
+
+            self._memory_mixed_stride_selector = MixedStrideSelector(
+                tuple(memory_planner_stride_weights), memory_planner_stride_seed
+            )
+            self._memory_frames_per_chunk = _require_positive_int(
+                memory_frames_per_chunk, "memory_frames_per_chunk"
+            )
 
         # Unused attributes
         self.image_writer = None
@@ -610,8 +630,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         episode = self.meta.episodes.get(ep_idx) or {}
         return index.sampling_range(episode_length=episode.get("length"))
 
-    def _get_memory_texts(self, item: dict) -> tuple[str, str] | None:
-        """``(memory_text, previous_memory_text)``, or None if the frame is
+    def _resolve_memory_training_fields(self, ep_idx: int, frame_index: int) -> tuple[str, str, dict] | None:
+        """``(memory_text, previous_memory_text, provenance)``, or None if the frame is
         outside the annotated range.
 
         The None result means "this frame is not a valid training sample", which
@@ -622,13 +642,52 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         range is a different thing entirely and raises, because intervals tile
         their range exactly (0 gaps / 0 overlaps over 251,353 adjacent pairs).
         """
-        ep_idx = item["episode_index"].item()
-        frame_index = round(item["timestamp"].item() * self.fps)
         lo, hi = self._memory_sampling_range(ep_idx)
         if not (lo <= frame_index < hi):
             return None
-        row = self._memory_index_for_episode(ep_idx).lookup(frame_index)
-        return row.planner_target_text, row.previous_memory_text
+        index = self._memory_index_for_episode(ep_idx)
+        row = index.lookup(frame_index)
+        provenance = {
+            "memory_selected_stride": 0,
+            "memory_anchor_kind": "annotation_previous",
+            "memory_anchor_frame": int(row.start),
+            "memory_anchor_interval_idx": int(max(row.memory_idx - 1, -1)),
+            "memory_target_interval_idx": int(row.memory_idx),
+            "memory_chunk_lag": 0,
+            "memory_frame_lag": 0,
+        }
+        previous_memory_text = row.previous_memory_text
+        if self._memory_mixed_stride_selector is not None:
+            decision = self._memory_mixed_stride_selector.decision_for(
+                episode_index=int(ep_idx),
+                frame_idx=int(frame_index),
+                origin=int(index.first_start),
+                frames_per_chunk=int(self._memory_frames_per_chunk),
+            )
+            if decision.anchor_kind == "initial":
+                from openpi.models.memory_text import INITIAL_PREVIOUS_MEMORY
+
+                previous_memory_text = INITIAL_PREVIOUS_MEMORY
+                anchor_interval_idx = -1
+            else:
+                anchor_row = index.lookup(decision.anchor_frame)
+                previous_memory_text = anchor_row.current_memory_text
+                anchor_interval_idx = anchor_row.memory_idx
+            provenance = {
+                "memory_selected_stride": int(decision.selected_stride),
+                "memory_anchor_kind": decision.anchor_kind,
+                "memory_anchor_frame": int(decision.anchor_frame),
+                "memory_anchor_interval_idx": int(anchor_interval_idx),
+                "memory_target_interval_idx": int(row.memory_idx),
+                "memory_chunk_lag": int(decision.chunk_lag),
+                "memory_frame_lag": int(decision.frame_lag),
+            }
+        return row.planner_target_text, previous_memory_text, provenance
+
+    def _get_memory_texts(self, item: dict) -> tuple[str, str, dict] | None:
+        ep_idx = int(item["episode_index"].item())
+        frame_index = int(round(item["timestamp"].item() * self.fps))
+        return self._resolve_memory_training_fields(ep_idx, frame_index)
 
     # ------------------------------------------------------------------
     # Shared item assembly (training and viewer MUST go through this)
@@ -638,7 +697,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self,
         item: dict,
         *,
-        memory_texts: tuple[str, str] | None,
+        memory_texts: tuple[str, str, dict] | None,
         query_indices: dict | None = None,
         padding: dict | None = None,
     ) -> dict:
@@ -657,7 +716,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         """
         item["task"] = self._get_fine_grained_task(item)
         if memory_texts is not None:
-            item["memory_text"], item["previous_memory_text"] = memory_texts
+            item["memory_text"], item["previous_memory_text"], provenance = memory_texts
+            item.update(provenance)
             # Provenance, R2: plain ints so collate cannot choke on them. These
             # exist so a byte-for-byte comparison against training does not have
             # to reconstruct the streaming sampling order -- reconstructing it
@@ -751,6 +811,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         episode_length = int((self.meta.episodes.get(episode_index) or {}).get("length", -1))
         lo, hi = self._memory_sampling_range(episode_index)
         row = index.lookup(frame_idx)
+        resolved = self._resolve_memory_training_fields(int(episode_index), int(frame_idx))
+        if resolved is None:
+            raise IndexError(
+                f"episode {episode_index} frame {frame_idx} is outside the Memory-annotated range [{lo}, {hi})"
+            )
+        _, _, training_provenance = resolved
         chunk = getattr(self, "_chunk_size_used", None)
         if chunk is None:
             raise RuntimeError(
@@ -762,6 +828,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         ce = min(cs + chunk, episode_length) if episode_length > 0 else cs + chunk
         stats = self.memory_chunk_stats() or {}
         return {
+            **training_provenance,
             "episode_index": int(episode_index),
             "frame_idx": int(frame_idx),
             "episode_length": episode_length,
