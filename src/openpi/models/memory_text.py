@@ -87,6 +87,10 @@ FIELD_NAMES: Final[tuple[str, ...]] = tuple(f.name for f in MEMORY_FIELDS)
 CURRENT_MEMORY_CUE: Final[str] = "Current memory:"
 PREVIOUS_MEMORY_CUE: Final[str] = "Previous memory:"
 
+#: Canonical previous-memory text at the start of an episode. Offline data and
+#: MIX-C training must use one string for chunk-zero conditioning.
+INITIAL_PREVIOUS_MEMORY: Final[str] = "No task steps have been completed; prepare to begin the task."
+
 # Longest-first, so "Next skill:" can never be matched as "Skill:" and
 # "Next primitive:" never as "Primitive:".
 _LABEL_RE: Final[re.Pattern[str]] = re.compile(
@@ -136,6 +140,45 @@ def build_memory_text(**fields: str) -> str:
             )
         lines.append(f"{field.label} {body}" if body else field.label)
     return "\n".join(lines)
+
+
+def parse_memory_text(text: str, *, strict: bool = True) -> dict[str, str]:
+    """Split canonical Memory text into its five newline-delimited fields."""
+    if text is None:
+        raise MemoryTextError("parse_memory_text() requires text, got None")
+    lines = [line for line in str(text).strip().split("\n") if line.strip()]
+    if len(lines) != len(MEMORY_FIELDS):
+        if strict:
+            raise MemoryTextError(
+                f"expected {len(MEMORY_FIELDS)} newline-separated fields, got {len(lines)}; "
+                f"lines were: {lines!r}"
+            )
+        hits = list(_LABEL_RE.finditer(str(text)))
+        if hits:
+            lines = [
+                str(text)[match.start() : hits[i + 1].start() if i + 1 < len(hits) else None].strip()
+                for i, match in enumerate(hits)
+            ]
+
+    out: dict[str, str] = {}
+    for field, line in zip(MEMORY_FIELDS, lines):
+        if not line.startswith(field.label):
+            if strict:
+                raise MemoryTextError(
+                    f"field {field.name!r} should start with {field.label!r}, got {line!r}"
+                )
+            value = line
+        else:
+            value = line[len(field.label) :]
+        out[field.name] = value.strip()
+
+    if strict:
+        if tuple(out) != FIELD_NAMES:
+            raise MemoryTextError(f"parsed fields {tuple(out)} do not match {FIELD_NAMES}")
+        empty = [name for name, value in out.items() if not value]
+        if empty:
+            raise MemoryTextError(f"fields parsed but empty: {empty}; text was {text!r}")
+    return out
 
 
 def validate_field_structure(text: str) -> None:

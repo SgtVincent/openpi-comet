@@ -38,6 +38,11 @@ class Pi05SubtaskConfig(_model.BaseModelConfig):
     # Subtask token sequence max length.
     subtask_max_len: int = 128
 
+    # Number of action chunks between planner refreshes for fixed-K configs.
+    # MIX-C uses this as the registered fixed-K fallback while selecting its
+    # per-chunk stride through the dataset-side weighted selector.
+    planner_stride: int = 5
+
     # Combined loss trade-off parameter (alpha in Eq. 1).
     alpha: float = 10.0
 

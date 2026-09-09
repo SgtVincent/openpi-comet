@@ -176,6 +176,13 @@ class B1kInputs(transforms.DataTransformFn):
         if self.model_type == _model.ModelType.PI05_SUBTASK and "subtask_text" in data:
             inputs["subtask_text"] = data["subtask_text"]
 
+        # This transform rebuilds the item, so text fields must be forwarded
+        # explicitly or they disappear immediately before tokenization.
+        if self.model_type == _model.ModelType.PI05_SUBTASK:
+            for memory_key in ("memory_text", "previous_memory_text"):
+                if memory_key in data:
+                    inputs[memory_key] = data[memory_key]
+
         if self.depth_as_pcd:
             inputs["pcd_xyz"] = pcd_xyz
         return inputs
