@@ -169,6 +169,28 @@ def make_memory_train_config(
     )
 
 
+def _short_config(mix_c: "TrainConfig", *, name: str, weights) -> "TrainConfig":
+    """Derive paired short arms without duplicating the training recipe."""
+    if len(mix_c.data) != 1:
+        raise ValueError("MoMA short controls require exactly one data factory")
+    mix_factory = mix_c.data[0]
+    short_base = dataclasses.replace(
+        mix_factory.base_config,
+        memory_planner_stride_weights=weights,
+        memory_planner_stride_seed=MIX_C_SEED,
+        memory_frames_per_chunk=mix_c.model.action_horizon,
+    )
+    short_factory = dataclasses.replace(mix_factory, base_config=short_base)
+    return dataclasses.replace(
+        mix_c,
+        name=name,
+        exp_name=name,
+        data=[short_factory],
+        num_train_steps=200,
+        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=1e-4, warmup_steps=20, decay_steps=200),
+    )
+
+
 def memory_configs() -> "tuple[TrainConfig, ...]":
     """Build the registered MoMA memory configs.
 
@@ -177,6 +199,12 @@ def memory_configs() -> "tuple[TrainConfig, ...]":
     exists so the wiring can be exercised on a couple of episodes without
     committing a full run.
     """
+    mix_c = make_memory_train_config(
+        name="pi05_moma_memory_b1k-mix-c",
+        planner_stride=5,
+        planner_stride_weights=MIX_C_WEIGHTS,
+        planner_stride_seed=MIX_C_SEED,
+    )
     return (
         make_memory_train_config(
             name="pi05_moma_memory_b1k-k5_smoke",
@@ -188,10 +216,7 @@ def memory_configs() -> "tuple[TrainConfig, ...]":
             name="pi05_moma_memory_b1k-k5",
             planner_stride=5,
         ),
-        make_memory_train_config(
-            name="pi05_moma_memory_b1k-mix-c",
-            planner_stride=5,
-            planner_stride_weights=MIX_C_WEIGHTS,
-            planner_stride_seed=MIX_C_SEED,
-        ),
+        _short_config(mix_c, name="pi05_moma_memory_b1k-k1-short", weights=((1, 1.0),)),
+        _short_config(mix_c, name="pi05_moma_memory_b1k-mix-c-short", weights=MIX_C_WEIGHTS),
+        mix_c,
     )
